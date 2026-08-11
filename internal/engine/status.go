@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+
+	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
 // txLoc points back from a txid to the cell that produced it.
@@ -104,35 +106,25 @@ func (e *Engine) reconcile(ctx context.Context) {
 		case <-tick.C:
 		}
 
-		for txid, loc := range e.unsettled() {
+		// The store is the authority on what is still in flight, so a restart
+		// resumes reconciling transactions this process never broadcast.
+		pending, err := e.store.Unsettled(ctx)
+		if err != nil {
+			e.logger.ErrorContext(ctx, "load unsettled", "err", err)
+			continue
+		}
+		for _, c := range pending {
+			txid := c.TxID
+			if txid == "" {
+				continue
+			}
 			rec, err := e.chain.Oracle.GetTx(ctx, txid)
 			if err != nil || rec == nil {
 				continue // not known to arcade yet; the stream may still deliver it
 			}
 			e.applyStatus(rec.TxID, rec.Status, rec.ExtraInfo)
-			_ = loc
 		}
 	}
-}
-
-// unsettled returns the transactions whose cells have not reached a terminal
-// state, so reconciliation only asks about what it does not already know.
-func (e *Engine) unsettled() map[string]txLoc {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	out := make(map[string]txLoc)
-	for txid, loc := range e.txIndex {
-		if loc.genIdx >= len(e.history) {
-			continue
-		}
-		switch e.history[loc.genIdx].Cells[loc.cell].State {
-		case TxMined, TxFailed:
-			continue // terminal; arcade cannot tell us anything new
-		}
-		out[txid] = loc
-	}
-	return out
 }
 
 // applyStatus records a status update against whichever cell owns the txid.
@@ -155,6 +147,26 @@ func (e *Engine) applyStatus(txid string, status arcade.Status, extra string) {
 	}
 
 	cell.State = next
+
+	// Persist before anything else: this status is the fact worth keeping.
+	st := history.Status(next)
+	errMsg := ""
+	if next == TxFailed {
+		errMsg = "arcade: " + string(status)
+		if extra != "" {
+			errMsg += ": " + extra
+		}
+	}
+	if err := e.store.UpdateStatus(context.Background(), txid, st, errMsg); err != nil {
+		e.logger.Error("persist status", "txid", txid, "err", err)
+	}
+
+	// Terminal: arcade has nothing further to say, so stop tracking it. The
+	// record stays in the store; only the live index shrinks.
+	if st.IsTerminal() {
+		delete(e.txIndex, txid)
+	}
+
 	if next == TxFailed {
 		cell.Err = "arcade: " + string(status)
 		if extra != "" {

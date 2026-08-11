@@ -28,6 +28,7 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
 	"github.com/dymurray/rule-110-arcade/internal/engine"
+	"github.com/dymurray/rule-110-arcade/internal/history"
 	"github.com/dymurray/rule-110-arcade/internal/web"
 )
 
@@ -369,9 +370,20 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	eng, err := engine.New(c, compiled, state, logger)
+	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir)
 	if err != nil {
 		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	eng, err := engine.New(ctx, c, compiled, state, store, logger)
+	if err != nil {
+		return err
+	}
+
+	if st, err := store.Stats(ctx); err == nil {
+		fmt.Printf("history: %d generations, %d transactions recorded (%d still settling)\n",
+			st.Generations, st.Txs, st.Unsettled)
 	}
 	eng.SetRate(*rate)
 	if *start {

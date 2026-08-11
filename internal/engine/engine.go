@@ -17,6 +17,7 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/ca"
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
+	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
 // TxState is how far one cell's transaction has got.
@@ -116,6 +117,10 @@ type Engine struct {
 	// stop trying to spend outputs that do not exist.
 	halted map[int]bool
 
+	// store is the durable record. Memory holds a window for the UI; the store
+	// holds everything.
+	store *history.Store
+
 	// stepReq carries manual single-step requests.
 	stepReq chan struct{}
 	// changed is closed and replaced whenever the snapshot changes, so
@@ -124,8 +129,14 @@ type Engine struct {
 }
 
 // New creates an engine positioned at the chain's recorded state.
-func New(c *chain.Chain, compiled *cellscript.Compiled, state *chain.State, logger *slog.Logger) (*Engine, error) {
-	row, err := state.Row()
+func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, state *chain.State,
+	store *history.Store, logger *slog.Logger) (*Engine, error) {
+
+	seedHex := state.SeedHex
+	if seedHex == "" {
+		seedHex = state.RowHex
+	}
+	seed, err := ca.SeedHex(state.Cells, seedHex)
 	if err != nil {
 		return nil, err
 	}
@@ -140,13 +151,45 @@ func New(c *chain.Chain, compiled *cellscript.Compiled, state *chain.State, logg
 		changed:  make(chan struct{}),
 		txIndex:  make(map[string]txLoc),
 		halted:   make(map[int]bool),
+		store:    store,
 	}
-	history, err := rebuildHistory(state)
+	loaded, err := loadHistory(ctx, store, state)
 	if err != nil {
 		return nil, err
 	}
-	_ = row
-	e.history = history
+	if len(loaded) == 0 {
+		// Nothing recorded yet: seed generation 0 from the genesis transaction
+		// and persist it, so the very first row is durable too.
+		g := genesisGeneration(state, seed)
+		if err := store.RecordGeneration(ctx, 0, g.RowHex); err != nil {
+			return nil, err
+		}
+		for _, c := range g.Cells {
+			if err := store.RecordTx(ctx, history.CellTx{
+				Generation: 0, Cell: c.Cell, TxID: c.TxID, Status: history.StatusSeen,
+			}); err != nil {
+				return nil, err
+			}
+		}
+		loaded = []Generation{g}
+	}
+	e.history = loaded
+
+	// Re-index whatever is still in flight so the status stream can find it.
+	unsettled, err := store.Unsettled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range unsettled {
+		for i := range e.history {
+			if e.history[i].Number == c.Generation {
+				e.indexTx(c.TxID, i, c.Cell)
+				break
+			}
+		}
+	}
+	e.logger.Info("history loaded", "generations", len(e.history), "unsettled", len(unsettled))
+
 	return e, nil
 }
 
@@ -160,36 +203,39 @@ func genesisGeneration(state *chain.State, row ca.Row) Generation {
 	return Generation{Number: 0, RowHex: row.Hex(), Cells: cells}
 }
 
-// rebuildHistory reproduces every generation from the seed.
+// loadHistory restores the recorded history: real rows with the real
+// transactions that proved them.
 //
-// History is held in memory, so a restart would otherwise show a blank diagram
-// beside a generation counter in the hundreds. The automaton is deterministic:
-// the seed and the rule regenerate every row exactly. The transaction ids of
-// those older generations are not retained, so their cells are marked historic
-// rather than claiming a confirmation status we cannot evidence.
-func rebuildHistory(state *chain.State) ([]Generation, error) {
-	seedHex := state.SeedHex
-	if seedHex == "" {
-		seedHex = state.RowHex // pre-dates the seed field; show what we can
+// Rows could be recomputed from the seed, but the transaction ids could not —
+// they exist only in the store, and they are the evidence the automaton ran on
+// chain at all. Recomputing rows and discarding txids was the wrong trade.
+func loadHistory(ctx context.Context, store *history.Store, state *chain.State) ([]Generation, error) {
+	from := uint64(0)
+	if state.Generation > maxHistory {
+		from = state.Generation - maxHistory
 	}
-	row, err := ca.SeedHex(state.Cells, seedHex)
+	recorded, err := store.Load(ctx, from, maxHistory+1)
 	if err != nil {
 		return nil, err
 	}
 
-	history := []Generation{genesisGeneration(state, row)}
-	for gen := uint64(1); gen <= state.Generation; gen++ {
-		row = state.Rule.Step(row)
+	out := make([]Generation, 0, len(recorded))
+	for _, g := range recorded {
 		cells := make([]CellTx, state.Cells)
 		for i := range state.Cells {
-			cells[i] = CellTx{Cell: i, State: TxHistoric}
+			cells[i] = CellTx{Cell: i, State: TxPending}
 		}
-		history = append(history, Generation{Number: gen, RowHex: row.Hex(), Cells: cells})
+		for _, c := range g.Cells {
+			if c.Cell < 0 || c.Cell >= state.Cells {
+				continue
+			}
+			cells[c.Cell] = CellTx{
+				Cell: c.Cell, TxID: c.TxID, State: TxState(c.Status), Err: c.Err,
+			}
+		}
+		out = append(out, Generation{Number: g.Number, RowHex: g.RowHex, Cells: cells})
 	}
-	if len(history) > maxHistory {
-		history = history[len(history)-maxHistory:]
-	}
-	return history, nil
+	return out, nil
 }
 
 // SnapshotTail is Snapshot with the history trimmed to the most recent
@@ -341,6 +387,10 @@ func (e *Engine) advance(ctx context.Context) {
 	e.notify()
 	e.mu.Unlock()
 
+	if err := e.store.RecordGeneration(ctx, gen.Number, gen.RowHex); err != nil {
+		e.logger.ErrorContext(ctx, "persist generation", "generation", gen.Number, "err", err)
+	}
+
 	// Bound the fan-out. Releasing all N cells at once does not make a
 	// single-writer store faster — the writers just queue on a lock, and the
 	// whole generation stalls behind the resulting contention.
@@ -402,12 +452,20 @@ func (e *Engine) recordCell(genIdx, cell int, res *chain.StepResult, err error) 
 	}
 	if err != nil {
 		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, State: TxFailed, Err: err.Error()}
+		e.persist(history.CellTx{
+			Generation: e.history[genIdx].Number, Cell: cell,
+			Status: history.StatusFailed, Err: err.Error(),
+		})
 		e.notify()
 		return
 	}
 
 	e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
 	e.indexTx(res.TxID, genIdx, cell)
+	e.persist(history.CellTx{
+		Generation: e.history[genIdx].Number, Cell: cell,
+		TxID: res.TxID, Status: history.StatusBroadcast,
+	})
 	e.state.Chains[cell] = chain.CellChain{
 		Cell:       cell,
 		TxID:       res.TxID,
@@ -436,5 +494,16 @@ func (e *Engine) trackBalance(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
+	}
+}
+
+// persist writes a cell transaction to the durable store.
+//
+// Failures are logged rather than propagated: losing a history row must not
+// stop the automaton, and the reconciler will re-record the status later.
+func (e *Engine) persist(c history.CellTx) {
+	if err := e.store.RecordTx(context.Background(), c); err != nil {
+		e.logger.Error("persist cell transaction",
+			"generation", c.Generation, "cell", c.Cell, "err", err)
 	}
 }

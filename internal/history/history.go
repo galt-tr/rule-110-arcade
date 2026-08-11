@@ -1,0 +1,282 @@
+// Package history is the durable record of the automaton: every generation's
+// row, and every transaction that proved a cell of it.
+//
+// This is the point of the project, not a cache. The rows can be recomputed
+// from the seed at any time — the automaton is deterministic — but the
+// transaction ids cannot. They are the evidence that each bit was proved on
+// chain, and they only exist here.
+//
+// The volume is modest: 128 txids per generation is roughly 10 KB, so tens of
+// thousands of generations fit comfortably in the database the wallet is
+// already using.
+package history
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"path/filepath"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib" // postgres driver
+	_ "modernc.org/sqlite"             // sqlite driver
+)
+
+// Status is a transaction's lifecycle state as recorded here.
+type Status string
+
+const (
+	StatusBroadcast Status = "broadcast"
+	StatusSeen      Status = "seen"
+	StatusMined     Status = "mined"
+	StatusFailed    Status = "failed"
+)
+
+// IsTerminal reports whether a status can still change.
+//
+// Terminal transactions are dropped from the live tracking set: arcade has
+// nothing further to say about them, so continuing to poll or index them is
+// pure overhead. Their record stays in the database forever.
+func (s Status) IsTerminal() bool { return s == StatusMined || s == StatusFailed }
+
+// CellTx is one cell's transaction in one generation.
+type CellTx struct {
+	Generation uint64
+	Cell       int
+	TxID       string
+	Status     Status
+	Err        string
+}
+
+// Generation is one row of the automaton with the transactions that proved it.
+type Generation struct {
+	Number uint64
+	RowHex string
+	Cells  []CellTx
+}
+
+// Store persists the automaton's history.
+type Store struct {
+	db       *sql.DB
+	postgres bool
+}
+
+// Open connects to the history store, creating its schema on first use.
+//
+// dsn selects PostgreSQL; empty falls back to a SQLite file beside the wallet,
+// so a small deployment needs no extra service.
+func Open(ctx context.Context, dsn, dataDir string) (*Store, error) {
+	driver, target, postgres := "sqlite", filepath.Join(dataDir, "history.db"), false
+	if dsn != "" {
+		driver, target, postgres = "pgx", dsn, true
+	}
+
+	db, err := sql.Open(driver, target)
+	if err != nil {
+		return nil, fmt.Errorf("history: open %s: %w", driver, err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("history: connect: %w", err)
+	}
+
+	s := &Store{db: db, postgres: postgres}
+	if err := s.migrate(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// Close releases the connection.
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) migrate(ctx context.Context) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS generations (
+			number     BIGINT PRIMARY KEY,
+			row_hex    TEXT   NOT NULL,
+			created_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS cell_txs (
+			generation BIGINT NOT NULL,
+			cell       INTEGER NOT NULL,
+			txid       TEXT   NOT NULL,
+			status     TEXT   NOT NULL,
+			err        TEXT   NOT NULL DEFAULT '',
+			updated_at TIMESTAMP NOT NULL,
+			PRIMARY KEY (generation, cell)
+		)`,
+		// The hot query is "which transactions are still in flight", so index
+		// the non-terminal set rather than scanning the whole history.
+		`CREATE INDEX IF NOT EXISTS cell_txs_status ON cell_txs (status)`,
+		`CREATE INDEX IF NOT EXISTS cell_txs_txid ON cell_txs (txid)`,
+	}
+	for _, q := range stmts {
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("history: migrate: %w", err)
+		}
+	}
+	return nil
+}
+
+// rebind converts ? placeholders to $N for PostgreSQL.
+func (s *Store) rebind(q string) string {
+	if !s.postgres {
+		return q
+	}
+	out := make([]byte, 0, len(q)+8)
+	n := 0
+	for i := range len(q) {
+		if q[i] == '?' {
+			n++
+			out = append(out, '$')
+			out = append(out, []byte(fmt.Sprint(n))...)
+			continue
+		}
+		out = append(out, q[i])
+	}
+	return string(out)
+}
+
+// RecordGeneration stores a generation's row. Idempotent.
+func (s *Store) RecordGeneration(ctx context.Context, number uint64, rowHex string) error {
+	q := `INSERT INTO generations (number, row_hex, created_at) VALUES (?, ?, ?)
+	      ON CONFLICT (number) DO NOTHING`
+	_, err := s.db.ExecContext(ctx, s.rebind(q), number, rowHex, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("history: record generation %d: %w", number, err)
+	}
+	return nil
+}
+
+// RecordTx stores a cell's transaction, replacing any previous row for that
+// (generation, cell) — a retried cell supersedes its earlier attempt.
+func (s *Store) RecordTx(ctx context.Context, tx CellTx) error {
+	q := `INSERT INTO cell_txs (generation, cell, txid, status, err, updated_at)
+	      VALUES (?, ?, ?, ?, ?, ?)
+	      ON CONFLICT (generation, cell) DO UPDATE
+	        SET txid = EXCLUDED.txid, status = EXCLUDED.status,
+	            err = EXCLUDED.err, updated_at = EXCLUDED.updated_at`
+	_, err := s.db.ExecContext(ctx, s.rebind(q),
+		tx.Generation, tx.Cell, tx.TxID, string(tx.Status), tx.Err, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("history: record cell %d generation %d: %w", tx.Cell, tx.Generation, err)
+	}
+	return nil
+}
+
+// UpdateStatus advances a transaction's status by txid.
+func (s *Store) UpdateStatus(ctx context.Context, txid string, status Status, errMsg string) error {
+	q := `UPDATE cell_txs SET status = ?, err = ?, updated_at = ? WHERE txid = ?`
+	_, err := s.db.ExecContext(ctx, s.rebind(q), string(status), errMsg, time.Now().UTC(), txid)
+	if err != nil {
+		return fmt.Errorf("history: update %s: %w", txid, err)
+	}
+	return nil
+}
+
+// Unsettled returns the transactions that have not reached a terminal status.
+//
+// This is the live tracking set. Everything else is settled history and needs
+// no further attention from the status stream or the reconciler.
+func (s *Store) Unsettled(ctx context.Context) ([]CellTx, error) {
+	q := `SELECT generation, cell, txid, status, err FROM cell_txs
+	      WHERE status NOT IN (?, ?) ORDER BY generation, cell`
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), string(StatusMined), string(StatusFailed))
+	if err != nil {
+		return nil, fmt.Errorf("history: query unsettled: %w", err)
+	}
+	defer rows.Close()
+	return scanCells(rows)
+}
+
+// Load returns generations in [from, from+limit), newest-inclusive, with their
+// transactions attached.
+func (s *Store) Load(ctx context.Context, from uint64, limit int) ([]Generation, error) {
+	q := `SELECT number, row_hex FROM generations
+	      WHERE number >= ? ORDER BY number LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), from, limit)
+	if err != nil {
+		return nil, fmt.Errorf("history: load generations: %w", err)
+	}
+	defer rows.Close()
+
+	var gens []Generation
+	index := map[uint64]int{}
+	for rows.Next() {
+		var g Generation
+		if err := rows.Scan(&g.Number, &g.RowHex); err != nil {
+			return nil, fmt.Errorf("history: scan generation: %w", err)
+		}
+		index[g.Number] = len(gens)
+		gens = append(gens, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history: load generations: %w", err)
+	}
+	if len(gens) == 0 {
+		return nil, nil
+	}
+
+	last := gens[len(gens)-1].Number
+	cq := `SELECT generation, cell, txid, status, err FROM cell_txs
+	       WHERE generation >= ? AND generation <= ? ORDER BY generation, cell`
+	crows, err := s.db.QueryContext(ctx, s.rebind(cq), gens[0].Number, last)
+	if err != nil {
+		return nil, fmt.Errorf("history: load cells: %w", err)
+	}
+	defer crows.Close()
+
+	cells, err := scanCells(crows)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cells {
+		if i, ok := index[c.Generation]; ok {
+			gens[i].Cells = append(gens[i].Cells, c)
+		}
+	}
+	return gens, nil
+}
+
+// Stats summarises what has been recorded.
+type Stats struct {
+	Generations uint64
+	Txs         uint64
+	Unsettled   uint64
+	Latest      uint64
+}
+
+// Stats returns totals for the UI.
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	var st Stats
+	q := `SELECT
+	        (SELECT COUNT(*) FROM generations),
+	        (SELECT COALESCE(MAX(number), 0) FROM generations),
+	        (SELECT COUNT(*) FROM cell_txs),
+	        (SELECT COUNT(*) FROM cell_txs WHERE status NOT IN (?, ?))`
+	err := s.db.QueryRowContext(ctx, s.rebind(q), string(StatusMined), string(StatusFailed)).
+		Scan(&st.Generations, &st.Latest, &st.Txs, &st.Unsettled)
+	if err != nil {
+		return st, fmt.Errorf("history: stats: %w", err)
+	}
+	return st, nil
+}
+
+func scanCells(rows *sql.Rows) ([]CellTx, error) {
+	var out []CellTx
+	for rows.Next() {
+		var c CellTx
+		var status string
+		if err := rows.Scan(&c.Generation, &c.Cell, &c.TxID, &status, &c.Err); err != nil {
+			return nil, fmt.Errorf("history: scan cell: %w", err)
+		}
+		c.Status = Status(status)
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history: scan cells: %w", err)
+	}
+	return out, nil
+}
