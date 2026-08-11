@@ -268,7 +268,10 @@ func retryUntilFunded(ctx context.Context, create func() (*sdk.CreateActionResul
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(10 * time.Second):
+		// Short: a coin usually becomes claimable as soon as the monitor
+		// applies its status, and a whole generation waits behind the slowest
+		// cell here.
+		case <-time.After(2 * time.Second):
 		}
 	}
 }

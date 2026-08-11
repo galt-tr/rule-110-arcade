@@ -48,10 +48,25 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		return nil, err
 	}
 
+	// The callback token is what ties our broadcasts to our event stream.
+	// arcade only sends X-CallbackToken when this is non-empty, and only scopes
+	// GET /events with ?callbackToken= under the same condition — so leaving it
+	// blank means broadcasting untagged and subscribing unscoped, and status
+	// updates never come back. It must be stable across restarts, so it is
+	// derived from the wallet key rather than generated.
+	callbackToken, err := id.CallbackToken()
+	if err != nil {
+		return nil, err
+	}
+
 	oracle := arcade.New(logger, nil, defs.Arcade{
-		Enabled:   true,
-		URL:       cfg.ArcadeURL,
-		EventsURL: cfg.ArcadeURL,
+		Enabled:       true,
+		URL:           cfg.ArcadeURL,
+		EventsURL:     cfg.ArcadeURL,
+		CallbackToken: callbackToken,
+		// Ask for every transition, not just terminal ones: the diagram is
+		// showing the lifecycle, so the intermediate states are the point.
+		FullStatusUpdates: true,
 	})
 
 	hdrs, err := headers.New(logger, defs.ChainTracks{
@@ -78,6 +93,16 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		// the cellscript package docs.
 		storage.WithChronicleOpcodes(),
 		storage.WithChangeBasket(changeBasket),
+
+		// Bound BEEF assembly to the directly-spent coin instead of walking the
+		// whole ancestry. Each cell is an unbroken self-spending chain that
+		// grows by one transaction per generation, so without this every step
+		// costs more than the last and the automaton visibly slows as it runs.
+		storage.WithDirectInputBEEF(),
+
+		// The delayed-broadcast drainer is single-threaded by default, which
+		// serialises a generation that is otherwise fully parallel.
+		storage.WithSendConcurrency(64),
 	}
 	if !cfg.Chronicle {
 		extra = []storage.Option{storage.WithChangeBasket(changeBasket)}

@@ -2,6 +2,7 @@ package chain
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -9,8 +10,8 @@ import (
 	"os"
 	"path/filepath"
 
-	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
+	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 )
 
 // keyFile is the on-disk name of the wallet's key material.
@@ -148,4 +149,21 @@ func randomB64(n int) (string, error) {
 		return "", fmt.Errorf("chain: read randomness: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// CallbackToken returns the stable token that scopes this deployment's arcade
+// event stream.
+//
+// It is derived from the wallet key rather than randomly generated so that it
+// survives a restart: a changed token would silently orphan the status stream
+// from transactions broadcast under the previous one.
+func (i *Identity) CallbackToken() (string, error) {
+	pub, err := i.WalletPublicKeyHex()
+	if err != nil {
+		return "", err
+	}
+	// Hash rather than using the key directly: the token travels in a URL query
+	// string and ends up in server logs.
+	sum := sha256.Sum256([]byte("rule110-callback:" + pub))
+	return hex.EncodeToString(sum[:16]), nil
 }
