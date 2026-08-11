@@ -12,8 +12,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -38,6 +40,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "address":
 		return cmdAddress(args[1:])
+	case "fund":
+		return cmdFund(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -51,6 +55,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `rule110 — Rule 110 as a Bitcoin Script covenant
 
   rule110 address [flags]   print the funding address for this deployment
+  rule110 fund [flags]      internalize a mined funding transaction
   rule110 help              show this message
 
 Common flags:
@@ -122,6 +127,55 @@ func cmdAddress(args []string) error {
 	fmt.Println("The funding transaction must be MINED before it can be internalized:")
 	fmt.Println("the wallet verifies its merkle proof against the headers service.")
 
+	return nil
+}
+
+func cmdFund(args []string) error {
+	cfg := chain.DefaultConfig()
+	fs := flag.NewFlagSet("fund", flag.ContinueOnError)
+	network := bindCommon(fs, &cfg)
+	txHex := fs.String("tx", "", "funding transaction hex (raw or Extended Format)")
+	bumpHex := fs.String("bump", "", "BUMP merkle path hex proving the transaction was mined")
+	vout := fs.Uint("vout", 0, "index of the output paying this wallet")
+	desc := fs.String("description", "rule110 deployment funding", "description recorded on the action")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *txHex == "" || *bumpHex == "" {
+		return fmt.Errorf("both -tx and -bump are required (the payment must be mined to be internalized)")
+	}
+
+	net, err := parseNetwork(*network)
+	if err != nil {
+		return err
+	}
+	cfg.Network = net
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	c, err := chain.Open(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(ctx) }()
+
+	fmt.Printf("wallet identity: %s\n", c.IdentityKey)
+
+	before, err := c.Balance(ctx)
+	if err != nil {
+		return fmt.Errorf("read balance: %w", err)
+	}
+
+	if err := c.Internalize(ctx, *txHex, *bumpHex, uint32(*vout), *desc); err != nil {
+		return err
+	}
+
+	after, err := c.Balance(ctx)
+	if err != nil {
+		return fmt.Errorf("read balance: %w", err)
+	}
+	fmt.Printf("balance: %d -> %d sat (+%d)\n", before, after, after-before)
 	return nil
 }
 
