@@ -17,7 +17,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
@@ -25,6 +27,8 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/ca"
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
+	"github.com/dymurray/rule-110-arcade/internal/engine"
+	"github.com/dymurray/rule-110-arcade/internal/web"
 )
 
 func main() {
@@ -48,6 +52,8 @@ func run(args []string) error {
 		return cmdGenesis(args[1:])
 	case "step":
 		return cmdStep(args[1:])
+	case "run":
+		return cmdRun(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -64,6 +70,7 @@ func usage() {
   rule110 fund [flags]      internalize a mined funding transaction
   rule110 genesis [flags]   create generation 0: one UTXO per cell
   rule110 step [flags]      advance one cell by one generation
+  rule110 run [flags]       start the automaton and its web UI
   rule110 help              show this message
 
 Common flags:
@@ -314,6 +321,60 @@ func cmdStep(args []string) error {
 	fmt.Printf("STEP TXID: %s\n", res.TxID)
 	fmt.Printf("size:      %d bytes\n", res.SizeBytes)
 	return nil
+}
+
+func cmdRun(args []string) error {
+	cfg := chain.DefaultConfig()
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	network := bindCommon(fs, &cfg)
+	addr := fs.String("addr", envOr("RULE110_ADDR", ":8110"), "web UI listen address")
+	rate := fs.Float64("rate", 1, "generations per second when running")
+	start := fs.Bool("start", false, "begin advancing immediately instead of waiting for the UI")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	net, err := parseNetwork(*network)
+	if err != nil {
+		return err
+	}
+	cfg.Network = net
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	c, err := chain.Open(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(context.Background()) }()
+
+	state, err := c.LoadState()
+	if err != nil {
+		return fmt.Errorf("%w\n(run \"rule110 genesis\" first to create generation 0)", err)
+	}
+	compiled, err := cellscript.Compile(state.Cells, state.Rule)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.New(c, compiled, state, logger)
+	if err != nil {
+		return err
+	}
+	eng.SetRate(*rate)
+	if *start {
+		eng.SetMode(engine.ModeRunning)
+	}
+	go eng.Run(ctx)
+
+	fmt.Printf("rule 110 · %d cells · generation %d\n", state.Cells, state.Generation)
+	fmt.Printf("arcade:  %s\n", cfg.ArcadeURL)
+	fmt.Printf("genesis: %s\n", state.GenesisTxID)
+	fmt.Printf("\n  UI ready at http://localhost%s\n\n", *addr)
+
+	return web.New(eng, logger).Serve(ctx, *addr)
 }
 
 func seedRow(cells int, hexSeed string) (ca.Row, error) {

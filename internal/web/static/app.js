@@ -1,0 +1,149 @@
+// Rule 110 space-time diagram.
+//
+// Generations run down the page, cells across. A live cell is drawn in the
+// colour of ITS OWN transaction's progress, so confirmation visibly washes down
+// the pattern behind the leading edge — the automaton and the chain are the
+// same picture.
+
+const CSS = getComputedStyle(document.documentElement);
+const COLOR = {
+  dead:      CSS.getPropertyValue('--dead').trim(),
+  pending:   CSS.getPropertyValue('--pending').trim(),
+  broadcast: CSS.getPropertyValue('--broadcast').trim(),
+  seen:      CSS.getPropertyValue('--seen').trim(),
+  mined:     CSS.getPropertyValue('--mined').trim(),
+  failed:    CSS.getPropertyValue('--failed').trim(),
+};
+
+const canvas = document.getElementById('grid');
+const ctx = canvas.getContext('2d');
+const tip = document.getElementById('tip');
+
+let snapshot = null;
+let cellPx = 8;
+
+/** Unpack a hex row into a bit array, cell 0 first (matches the contract). */
+function bitsOf(hex, cells) {
+  const bits = new Uint8Array(cells);
+  for (let i = 0; i < cells; i++) {
+    const byte = parseInt(hex.substr((i >> 3) * 2, 2), 16);
+    bits[i] = (byte >> (i % 8)) & 1;
+  }
+  return bits;
+}
+
+function sizeCanvas(s) {
+  const wrap = document.getElementById('canvas-wrap');
+  const avail = wrap.clientWidth - 36;
+  cellPx = Math.max(2, Math.min(14, Math.floor(avail / s.cells)));
+  canvas.width = s.cells * cellPx;
+  canvas.height = Math.max(1, s.history.length) * cellPx;
+  canvas.style.width = canvas.width + 'px';
+  canvas.style.height = canvas.height + 'px';
+}
+
+function draw(s) {
+  document.getElementById('empty').hidden = s.history.length > 0;
+  sizeCanvas(s);
+  ctx.fillStyle = COLOR.dead;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  for (let g = 0; g < s.history.length; g++) {
+    const gen = s.history[g];
+    const bits = bitsOf(gen.row, s.cells);
+    for (let c = 0; c < s.cells; c++) {
+      // A dead cell is background regardless of its transaction: the pattern
+      // has to stay readable as a pattern first.
+      if (!bits[c]) continue;
+      const state = gen.cells[c] ? gen.cells[c].state : 'pending';
+      ctx.fillStyle = COLOR[state] || COLOR.pending;
+      // Cell 0 is drawn rightmost so the row reads like the printed form,
+      // highest index leftmost.
+      const x = (s.cells - 1 - c) * cellPx;
+      ctx.fillRect(x, g * cellPx, cellPx, cellPx);
+    }
+  }
+
+  // Keep the leading edge in view while running.
+  if (s.mode === 'running') {
+    const wrap = document.getElementById('canvas-wrap');
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+}
+
+function renderStats(s) {
+  const sat = s.balance.toLocaleString();
+  const rows = [
+    ['cells', s.cells],
+    ['rule', s.rule],
+    ['generation', s.generation],
+    ['transactions', s.totalTx.toLocaleString()],
+    ['balance', sat + ' sat'],
+    ['chains', s.consensus ? `${s.cells}/${s.cells} agree` : `${s.failedCells} halted`],
+  ];
+  document.getElementById('stats').innerHTML = rows
+    .map(([k, v]) => `<span class="stat"><span>${k}</span> <b>${v}</b></span>`)
+    .join('');
+
+  document.getElementById('play').setAttribute('aria-pressed', s.mode === 'running');
+  document.getElementById('pause').setAttribute('aria-pressed', s.mode === 'paused');
+
+  const err = document.getElementById('err');
+  err.hidden = !s.lastError;
+  err.textContent = s.lastError || '';
+}
+
+function apply(s) {
+  snapshot = s;
+  renderStats(s);
+  draw(s);
+}
+
+async function control(action, extra = {}) {
+  const res = await fetch('/api/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, ...extra }),
+  });
+  if (res.ok) apply(await res.json());
+}
+
+document.getElementById('play').onclick = () => control('play');
+document.getElementById('pause').onclick = () => control('pause');
+document.getElementById('step').onclick = () => control('step');
+
+const rate = document.getElementById('rate');
+const rateOut = document.getElementById('rateOut');
+rate.oninput = () => { rateOut.textContent = (+rate.value).toFixed(2) + ' gen/s'; };
+rate.onchange = () => control('rate', { rate: +rate.value });
+
+// Hover a cell to see which transaction proved it.
+canvas.onmousemove = (ev) => {
+  if (!snapshot) return;
+  const r = canvas.getBoundingClientRect();
+  const g = Math.floor((ev.clientY - r.top) / cellPx);
+  const col = Math.floor((ev.clientX - r.left) / cellPx);
+  const c = snapshot.cells - 1 - col;
+  const gen = snapshot.history[g];
+  if (!gen || c < 0 || c >= snapshot.cells) { tip.hidden = true; return; }
+
+  const cell = gen.cells[c] || {};
+  const bits = bitsOf(gen.row, snapshot.cells);
+  tip.innerHTML =
+    `<b>cell ${c}</b> · generation ${gen.number}<br>` +
+    `state: ${bits[c] ? 'alive' : 'dead'} · tx: ${cell.state || 'pending'}<br>` +
+    (cell.txid ? `${cell.txid}` : '') +
+    (cell.err ? `<br><span style="color:var(--failed)">${cell.err}</span>` : '');
+  tip.hidden = false;
+  tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 440) + 'px';
+  tip.style.top = (ev.clientY + 14) + 'px';
+};
+canvas.onmouseleave = () => { tip.hidden = true; };
+window.addEventListener('resize', () => { if (snapshot) draw(snapshot); });
+
+// Live updates. EventSource reconnects on its own, so a server restart or a
+// dropped proxy connection recovers without a page reload.
+const events = new EventSource('/api/events');
+events.onmessage = (ev) => apply(JSON.parse(ev.data));
+
+fetch('/api/state').then(r => r.json()).then(apply).catch(() => {});

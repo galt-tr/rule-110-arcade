@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rule 110 on BSV</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1>Rule&nbsp;110</h1>
+    <span class="sub">a cellular automaton proved in Bitcoin Script</span>
+  </div>
+  <div class="stats" id="stats"></div>
+</header>
+
+<main>
+  <div id="canvas-wrap">
+    <canvas id="grid"></canvas>
+    <div id="empty">waiting for the first generation…</div>
+  </div>
+</main>
+
+<footer>
+  <div class="controls">
+    <button id="play"  title="Run continuously">▶︎ Play</button>
+    <button id="pause" title="Stop the clock">❚❚ Pause</button>
+    <button id="step"  title="Advance exactly one generation">▶| Step</button>
+    <label class="rate">
+      <span>rate</span>
+      <input id="rate" type="range" min="0.05" max="10" step="0.05" value="1">
+      <output id="rateOut">1.00 gen/s</output>
+    </label>
+  </div>
+
+  <div class="legend">
+    <span class="key"><i class="sw dead"></i>dead</span>
+    <span class="key"><i class="sw pending"></i>pending</span>
+    <span class="key"><i class="sw broadcast"></i>broadcast</span>
+    <span class="key"><i class="sw seen"></i>seen</span>
+    <span class="key"><i class="sw mined"></i>mined</span>
+    <span class="key"><i class="sw failed"></i>failed</span>
+  </div>
+</footer>
+
+<div id="err" hidden></div>
+<div id="tip" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
