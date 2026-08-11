@@ -54,6 +54,8 @@ func run(args []string) error {
 		return cmdStep(args[1:])
 	case "run":
 		return cmdRun(args[1:])
+	case "fuel":
+		return cmdFuel(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -71,6 +73,7 @@ func usage() {
   rule110 genesis [flags]   create generation 0: one UTXO per cell
   rule110 step [flags]      advance one cell by one generation
   rule110 run [flags]       start the automaton and its web UI
+  rule110 fuel [flags]      mint coins so a whole generation can fan out
   rule110 help              show this message
 
 Common flags:
@@ -375,6 +378,55 @@ func cmdRun(args []string) error {
 	fmt.Printf("\n  UI ready at http://localhost%s\n\n", *addr)
 
 	return web.New(eng, logger).Serve(ctx, *addr)
+}
+
+func cmdFuel(args []string) error {
+	cfg := chain.DefaultConfig()
+	fs := flag.NewFlagSet("fuel", flag.ContinueOnError)
+	network := bindCommon(fs, &cfg)
+	count := fs.Uint64("count", 300, "how many coins to mint")
+	sats := fs.Uint64("sats", 20000, "value of each coin (must cover one cell transition's fee)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	net, err := parseNetwork(*network)
+	if err != nil {
+		return err
+	}
+	cfg.Network = net
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	c, err := chain.Open(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(ctx) }()
+
+	before, err := c.ClaimableCoins(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("claimable coins before: %d\n", before)
+	fmt.Printf("minting %d coins of %d sat (%d sat total)...\n", *count, *sats, *count**sats)
+
+	results, err := c.FanOutFuel(ctx, *count, *sats)
+	for _, r := range results {
+		fmt.Printf("  %s  %d coins\n", r.TxID, r.Coins)
+	}
+	if err != nil {
+		return err
+	}
+
+	after, err := c.ClaimableCoins(ctx)
+	if err != nil {
+		return err
+	}
+	balance, _ := c.Balance(ctx)
+	fmt.Printf("\nclaimable coins after: %d\n", after)
+	fmt.Printf("balance: %d sat\n", balance)
+	return nil
 }
 
 func seedRow(cells int, hexSeed string) (ca.Row, error) {
