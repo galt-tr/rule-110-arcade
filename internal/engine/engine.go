@@ -177,12 +177,13 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, sta
 	if err != nil {
 		return nil, err
 	}
+	// Indexing by generation number means no search: the previous version
+	// scanned the whole 2048-entry window per unsettled transaction, which is
+	// ~26 seconds of startup at 12.8M unsettled rows, single-threaded, before
+	// the HTTP server comes up.
 	for _, c := range unsettled {
-		for i := range e.history {
-			if e.history[i].Number == c.Generation {
-				e.indexTx(c.TxID, i, c.Cell)
-				break
-			}
+		if c.TxID != "" {
+			e.indexTx(c.TxID, c.Generation, c.Cell)
 		}
 	}
 	e.logger.Info("history loaded", "generations", len(e.history), "unsettled", len(unsettled))
@@ -250,8 +251,18 @@ func (e *Engine) Snapshot() Snapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	// Copy the CELLS, not just the generation headers. Generation.Cells is a
+	// slice, so copying the outer slice alone leaves every backing array shared
+	// with the live engine — and the caller marshals it after this lock is
+	// released, while recordCell and applyStatus are writing into those same
+	// arrays. That is a genuine data race on a string header, not a stale read.
 	history := make([]Generation, len(e.history))
-	copy(history, e.history)
+	for i, g := range e.history {
+		cells := make([]CellTx, len(g.Cells))
+		copy(cells, g.Cells)
+		g.Cells = cells
+		history[i] = g
+	}
 
 	failed := 0
 	if n := len(history); n > 0 {
@@ -437,7 +448,7 @@ func (e *Engine) advance(ctx context.Context) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			res, err := e.chain.AdvanceCell(ctx, e.compiled, state, cell, next)
-			e.recordCell(genIdx, cell, res, err)
+			e.recordCell(gen.Number, cell, res, err)
 		}(cell)
 	}
 	wg.Wait()
@@ -448,9 +459,11 @@ func (e *Engine) advance(ctx context.Context) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	failed := 0
-	for _, c := range e.history[genIdx].Cells {
-		if c.State == TxFailed {
-			failed++
+	if idx := indexOfGeneration(e.history, gen.Number); idx >= 0 {
+		for _, c := range e.history[idx].Cells {
+			if c.State == TxFailed {
+				failed++
+			}
 		}
 	}
 	if failed == 0 {
@@ -484,27 +497,37 @@ func indexOfGeneration(gens []Generation, number uint64) int {
 }
 
 // recordCell stores one cell's outcome and updates its chain tip.
-func (e *Engine) recordCell(genIdx, cell int, res *chain.StepResult, err error) {
+//
+// generation is the generation NUMBER, resolved to a slice index here under the
+// lock. A cell can finish long after its generation was appended, and the
+// history trim shifts every index, so an index captured at dispatch time would
+// address the wrong row by the time the result lands.
+func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if genIdx >= len(e.history) {
-		return // history was trimmed underneath us
-	}
+	// The store is the durable record and does not depend on the window, so it
+	// is written whether or not the generation is still displayable.
+	genIdx := indexOfGeneration(e.history, generation)
+
 	if err != nil {
-		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, State: TxFailed, Err: err.Error()}
+		if genIdx >= 0 {
+			e.history[genIdx].Cells[cell] = CellTx{Cell: cell, State: TxFailed, Err: err.Error()}
+		}
 		e.persist(history.CellTx{
-			Generation: e.history[genIdx].Number, Cell: cell,
+			Generation: generation, Cell: cell,
 			Status: history.StatusFailed, Err: err.Error(),
 		})
 		e.notify()
 		return
 	}
 
-	e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
-	e.indexTx(res.TxID, genIdx, cell)
+	if genIdx >= 0 {
+		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
+	}
+	e.indexTx(res.TxID, generation, cell)
 	e.persist(history.CellTx{
-		Generation: e.history[genIdx].Number, Cell: cell,
+		Generation: generation, Cell: cell,
 		TxID: res.TxID, Status: history.StatusBroadcast,
 	})
 	e.state.Chains[cell] = chain.CellChain{

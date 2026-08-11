@@ -10,9 +10,15 @@ import (
 )
 
 // txLoc points back from a txid to the cell that produced it.
+//
+// It carries the generation NUMBER, not an index into the history slice. The
+// slice is trimmed to maxHistory by dropping from the front, which shifts every
+// index down — so an index recorded when a transaction was broadcast addresses a
+// different generation by the time its status arrives, and the status lands on an
+// unrelated row. Numbers are stable; indexes are not.
 type txLoc struct {
-	genIdx int
-	cell   int
+	generation uint64
+	cell       int
 }
 
 // stateFor maps an arcade lifecycle status onto a cell's display state.
@@ -136,10 +142,17 @@ func (e *Engine) applyStatus(txid string, status arcade.Status, extra string) {
 	defer e.mu.Unlock()
 
 	loc, known := e.txIndex[txid]
-	if !known || loc.genIdx >= len(e.history) {
-		return // not one of ours, or trimmed out of history
+	if !known {
+		return // not one of ours
 	}
-	cell := &e.history[loc.genIdx].Cells[loc.cell]
+	genIdx := indexOfGeneration(e.history, loc.generation)
+	if genIdx < 0 || loc.cell >= len(e.history[genIdx].Cells) {
+		// Trimmed out of the in-memory window. The store still has it, so
+		// persist the status even though nothing is left to redraw.
+		e.persistStatus(txid, next, status, extra)
+		return
+	}
+	cell := &e.history[genIdx].Cells[loc.cell]
 	if rank(next) <= rank(cell.State) {
 		return
 	}
@@ -147,13 +160,26 @@ func (e *Engine) applyStatus(txid string, status arcade.Status, extra string) {
 	cell.State = next
 
 	// Persist before anything else: this status is the fact worth keeping.
+	e.persistStatus(txid, next, status, extra)
+
+	if next == TxFailed {
+		cell.Err = rejectionMessage(status, extra)
+		// Halt the cell. Its successor UTXO does not exist, so every later
+		// generation would try to spend a phantom output and fail with
+		// "utxo already spent" — noise that hides the original rejection.
+		e.halted[loc.cell] = true
+		e.logger.Warn("cell halted by rejection", "cell", loc.cell, "txid", txid, "status", string(status))
+	}
+	e.notify()
+}
+
+// persistStatus writes a status to the store and drops the transaction from the
+// live index once it can no longer change. Callers must hold the write lock.
+func (e *Engine) persistStatus(txid string, next TxState, status arcade.Status, extra string) {
 	st := history.Status(next)
 	errMsg := ""
 	if next == TxFailed {
-		errMsg = "arcade: " + string(status)
-		if extra != "" {
-			errMsg += ": " + extra
-		}
+		errMsg = rejectionMessage(status, extra)
 	}
 	if err := e.store.UpdateStatus(context.Background(), txid, st, errMsg); err != nil {
 		e.logger.Error("persist status", "txid", txid, "err", err)
@@ -164,25 +190,21 @@ func (e *Engine) applyStatus(txid string, status arcade.Status, extra string) {
 	if st.IsTerminal() {
 		delete(e.txIndex, txid)
 	}
+}
 
-	if next == TxFailed {
-		cell.Err = "arcade: " + string(status)
-		if extra != "" {
-			cell.Err += ": " + extra
-		}
-		// Halt the cell. Its successor UTXO does not exist, so every later
-		// generation would try to spend a phantom output and fail with
-		// "utxo already spent" — noise that hides the original rejection.
-		e.halted[loc.cell] = true
-		e.logger.Warn("cell halted by rejection", "cell", loc.cell, "txid", txid, "status", string(status))
+// rejectionMessage renders arcade's verdict for display and for the store.
+func rejectionMessage(status arcade.Status, extra string) string {
+	msg := "arcade: " + string(status)
+	if extra != "" {
+		msg += ": " + extra
 	}
-	e.notify()
+	return msg
 }
 
 // indexTx remembers which cell a txid belongs to. Callers must hold the lock.
-func (e *Engine) indexTx(txid string, genIdx, cell int) {
+func (e *Engine) indexTx(txid string, generation uint64, cell int) {
 	if e.txIndex == nil {
 		e.txIndex = make(map[string]txLoc)
 	}
-	e.txIndex[txid] = txLoc{genIdx: genIdx, cell: cell}
+	e.txIndex[txid] = txLoc{generation: generation, cell: cell}
 }
