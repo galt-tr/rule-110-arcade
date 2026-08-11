@@ -14,6 +14,9 @@
   --seen: #62a8e8;
   --mined: #b9e0ff;
   --failed: #e0575b;
+  /* replayed from the seed after a restart: the row is exact, the proving
+     transaction is not in memory */
+  --historic: #4a5570;
 }
 
 * { box-sizing: border-box; }
@@ -25,7 +28,12 @@ body {
   font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  /* Fixed viewport height, not min-height: the diagram scrolls INSIDE its own
+     pane. With min-height the page itself grew instead, and the pane never
+     became scrollable — which capped the visible history at roughly one
+     screenful. */
+  height: 100vh;
+  overflow: hidden;
 }
 
 header, footer {
@@ -63,7 +71,24 @@ main { flex: 1; display: flex; min-height: 0; }
   flex: 1;
   position: relative;
   overflow: auto;
-  padding: 12px 18px;
+  /* min-height:0 lets a flex child actually shrink below its content and
+     scroll; without it the pane stretches to fit the canvas instead. */
+  min-height: 0;
+  padding: 12px 0 12px 0;
+}
+#surface { display: flex; align-items: flex-start; }
+#gutter {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--bg);
+  padding-right: 8px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 10px;
+  user-select: none;
+  white-space: pre;
+  line-height: 1;
 }
 canvas { display: block; image-rendering: pixelated; }
 
@@ -90,6 +115,10 @@ button {
 button:hover { border-color: var(--accent); }
 button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-color: var(--accent); }
 
+.zoom { display: flex; gap: 8px; align-items: center; color: var(--muted); }
+.zoom input { width: 110px; }
+.follow { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+
 .rate { display: flex; gap: 8px; align-items: center; color: var(--muted); }
 .rate input { width: 160px; }
 .rate output { color: var(--text); min-width: 92px; }
@@ -103,6 +132,7 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 .sw.seen { background: var(--seen); }
 .sw.mined { background: var(--mined); }
 .sw.failed { background: var(--failed); }
+.sw.historic { background: var(--historic); }
 
 #err {
   background: #3a1c22;

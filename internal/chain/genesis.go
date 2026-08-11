@@ -44,6 +44,12 @@ type State struct {
 	// RowHex is the current row, hex-encoded.
 	RowHex string `json:"row"`
 
+	// SeedHex is generation 0's row. The automaton is deterministic, so the
+	// seed plus the rule reproduces every row that has ever existed — which is
+	// what lets the diagram be rebuilt after a restart instead of starting
+	// blank at whatever generation the chain had reached.
+	SeedHex string `json:"seed"`
+
 	// Chains is the per-cell tip, indexed by cell.
 	Chains []CellChain `json:"chains"`
 }
@@ -150,6 +156,7 @@ func (c *Chain) Genesis(ctx context.Context, compiled *cellscript.Compiled, seed
 		GenesisTxID: txid,
 		Generation:  0,
 		RowHex:      seed.Hex(),
+		SeedHex:     seed.Hex(),
 		Chains:      make([]CellChain, n),
 	}
 	for cell := range n {

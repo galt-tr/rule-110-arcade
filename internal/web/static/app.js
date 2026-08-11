@@ -20,6 +20,7 @@ const COLOR = {
   seen:      color('--seen', '#62a8e8'),
   mined:     color('--mined', '#b9e0ff'),
   failed:    color('--failed', '#e0575b'),
+  historic:  color('--historic', '#4a5570'),
 };
 
 const canvas = document.getElementById('grid');
@@ -27,7 +28,8 @@ const ctx = canvas.getContext('2d');
 const tip = document.getElementById('tip');
 
 let snapshot = null;
-let cellPx = 8;
+let cellPx = 8;       // driven by the zoom control, not the viewport
+let follow = true;    // auto-scroll only while pinned to the newest row
 
 /** Unpack a hex row into a bit array, cell 0 first (matches the contract). */
 function bitsOf(hex, cells) {
@@ -40,18 +42,32 @@ function bitsOf(hex, cells) {
 }
 
 function sizeCanvas(s) {
-  const wrap = document.getElementById('canvas-wrap');
-  const avail = wrap.clientWidth - 36;
-  cellPx = Math.max(2, Math.min(14, Math.floor(avail / s.cells)));
   canvas.width = s.cells * cellPx;
   canvas.height = Math.max(1, s.history.length) * cellPx;
   canvas.style.width = canvas.width + 'px';
   canvas.style.height = canvas.height + 'px';
 }
 
+/** Generation numbers beside the rows, thinned so they stay legible when zoomed out. */
+function drawGutter(s) {
+  const g = document.getElementById('gutter');
+  const every = Math.max(1, Math.ceil(14 / cellPx));
+  const lines = s.history.map((gen, i) =>
+    (i % every === 0 ? String(gen.number).padStart(6) : ''));
+  g.style.lineHeight = cellPx + 'px';
+  g.style.fontSize = Math.min(10, Math.max(6, cellPx)) + 'px';
+  g.textContent = lines.join('\n');
+}
+
 function draw(s) {
   document.getElementById('empty').hidden = s.history.length > 0;
+  const wrap = document.getElementById('canvas-wrap');
+  // Decide BEFORE resizing: once the canvas grows, the old scrollTop no longer
+  // describes where the viewer was.
+  const pinned = follow && atBottom(wrap);
+
   sizeCanvas(s);
+  drawGutter(s);
   ctx.fillStyle = COLOR.dead;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -71,11 +87,15 @@ function draw(s) {
     }
   }
 
-  // Keep the leading edge in view while running.
-  if (s.mode === 'running') {
-    const wrap = document.getElementById('canvas-wrap');
-    wrap.scrollTop = wrap.scrollHeight;
-  }
+  // Only chase the leading edge when the viewer is already there. Scrolling
+  // them back down while they are reading history is worse than losing the
+  // live edge, which the follow toggle restores in one click.
+  if (pinned) wrap.scrollTop = wrap.scrollHeight;
+}
+
+/** Within a row of the bottom — treated as "watching the live edge". */
+function atBottom(wrap) {
+  return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= cellPx * 2;
 }
 
 function renderStats(s) {
@@ -100,10 +120,23 @@ function renderStats(s) {
   err.textContent = s.lastError || '';
 }
 
+/** Merge a streamed update into the history we already hold.
+ *
+ * Updates carry only a recent tail, so replacing the array wholesale would
+ * throw away everything the viewer scrolled back to look at. Generations are
+ * keyed by their number and the incoming copy wins. */
+function merge(prev, next) {
+  if (!prev || !prev.history.length) return next;
+  const byNumber = new Map(prev.history.map(g => [g.number, g]));
+  for (const g of next.history) byNumber.set(g.number, g);
+  next.history = [...byNumber.values()].sort((a, b) => a.number - b.number);
+  return next;
+}
+
 function apply(s) {
-  snapshot = s;
-  renderStats(s);
-  draw(s);
+  snapshot = merge(snapshot, s);
+  renderStats(snapshot);
+  draw(snapshot);
 }
 
 async function control(action, extra = {}) {
@@ -118,6 +151,32 @@ async function control(action, extra = {}) {
 document.getElementById('play').onclick = () => control('play');
 document.getElementById('pause').onclick = () => control('pause');
 document.getElementById('step').onclick = () => control('step');
+
+const zoom = document.getElementById('zoom');
+const zoomOut = document.getElementById('zoomOut');
+zoom.value = String(cellPx);
+zoomOut.textContent = cellPx + 'px';
+zoom.oninput = () => {
+  cellPx = +zoom.value;
+  zoomOut.textContent = cellPx + 'px';
+  if (snapshot) draw(snapshot);
+};
+
+const followBox = document.getElementById('follow');
+followBox.onchange = () => {
+  follow = followBox.checked;
+  if (follow && snapshot) {
+    const wrap = document.getElementById('canvas-wrap');
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+};
+
+// Scrolling away from the bottom releases follow, so reading history is not a
+// fight with the renderer; scrolling back re-arms it.
+document.getElementById('canvas-wrap').addEventListener('scroll', () => {
+  if (!followBox.checked) return;
+  follow = atBottom(document.getElementById('canvas-wrap'));
+});
 
 const rate = document.getElementById('rate');
 const rateOut = document.getElementById('rateOut');

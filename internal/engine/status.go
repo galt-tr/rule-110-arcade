@@ -36,6 +36,8 @@ func rank(s TxState) int {
 	switch s {
 	case TxPending:
 		return 0
+	case TxHistoric:
+		return 1 // replayed rows are real, but weaker than any live status
 	case TxBroadcast:
 		return 1
 	case TxSeen:

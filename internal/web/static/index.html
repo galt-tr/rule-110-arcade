@@ -17,7 +17,10 @@
 
 <main>
   <div id="canvas-wrap">
-    <canvas id="grid"></canvas>
+    <div id="surface">
+      <div id="gutter"></div>
+      <canvas id="grid"></canvas>
+    </div>
     <div id="empty">waiting for the first generation…</div>
   </div>
 </main>
@@ -27,6 +30,15 @@
     <button id="play"  title="Run continuously">▶︎ Play</button>
     <button id="pause" title="Stop the clock">❚❚ Pause</button>
     <button id="step"  title="Advance exactly one generation">▶| Step</button>
+    <label class="zoom">
+      <span>zoom</span>
+      <input id="zoom" type="range" min="1" max="16" step="1" value="8">
+      <output id="zoomOut">8px</output>
+    </label>
+    <label class="follow">
+      <input id="follow" type="checkbox" checked>
+      <span>follow</span>
+    </label>
     <label class="rate">
       <span>rate</span>
       <input id="rate" type="range" min="0.05" max="10" step="0.05" value="1">
@@ -40,6 +52,7 @@
     <span class="key"><i class="sw broadcast"></i>broadcast</span>
     <span class="key"><i class="sw seen"></i>seen</span>
     <span class="key"><i class="sw mined"></i>mined</span>
+    <span class="key"><i class="sw historic"></i>historic</span>
     <span class="key"><i class="sw failed"></i>failed</span>
   </div>
 </footer>

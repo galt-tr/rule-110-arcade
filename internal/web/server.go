@@ -75,7 +75,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	const minInterval = 100 * time.Millisecond
 
 	send := func() error {
-		data, err := json.Marshal(s.engine.Snapshot())
+		// Stream the tail only; the client merges it into the full history it
+		// fetched from /api/state.
+		data, err := json.Marshal(s.engine.SnapshotTail())
 		if err != nil {
 			return err
 		}

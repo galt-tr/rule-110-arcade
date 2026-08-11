@@ -33,6 +33,10 @@ const (
 	TxMined TxState = "mined"
 	// TxFailed means it was rejected; that cell's chain has halted.
 	TxFailed TxState = "failed"
+	// TxHistoric means the generation was replayed from the seed after a
+	// restart: the row is exact, but the transaction that proved it is not in
+	// this process's memory.
+	TxHistoric TxState = "historic"
 )
 
 // Mode is the clock's behaviour.
@@ -78,7 +82,17 @@ type Snapshot struct {
 }
 
 // maxHistory bounds how many generations the UI keeps.
-const maxHistory = 512
+const maxHistory = 2048
+
+// TailGenerations is how many generations a streamed update carries.
+//
+// A snapshot holds every cell of every generation, so the full history grows
+// without bound as a payload: 128 cells with txids is roughly 10 KB per
+// generation, and re-sending all of it several times a second would reach
+// megabytes per message well before the diagram got interesting. Streamed
+// updates therefore carry only the recent tail and the client merges it into
+// the history it already has; older generations are terminal and do not change.
+const TailGenerations = 48
 
 // Engine owns the automaton's state and its clock.
 type Engine struct {
@@ -127,7 +141,12 @@ func New(c *chain.Chain, compiled *cellscript.Compiled, state *chain.State, logg
 		txIndex:  make(map[string]txLoc),
 		halted:   make(map[int]bool),
 	}
-	e.history = []Generation{genesisGeneration(state, row)}
+	history, err := rebuildHistory(state)
+	if err != nil {
+		return nil, err
+	}
+	_ = row
+	e.history = history
 	return e, nil
 }
 
@@ -139,6 +158,48 @@ func genesisGeneration(state *chain.State, row ca.Row) Generation {
 		cells[i] = CellTx{Cell: i, TxID: state.GenesisTxID, State: TxSeen}
 	}
 	return Generation{Number: 0, RowHex: row.Hex(), Cells: cells}
+}
+
+// rebuildHistory reproduces every generation from the seed.
+//
+// History is held in memory, so a restart would otherwise show a blank diagram
+// beside a generation counter in the hundreds. The automaton is deterministic:
+// the seed and the rule regenerate every row exactly. The transaction ids of
+// those older generations are not retained, so their cells are marked historic
+// rather than claiming a confirmation status we cannot evidence.
+func rebuildHistory(state *chain.State) ([]Generation, error) {
+	seedHex := state.SeedHex
+	if seedHex == "" {
+		seedHex = state.RowHex // pre-dates the seed field; show what we can
+	}
+	row, err := ca.SeedHex(state.Cells, seedHex)
+	if err != nil {
+		return nil, err
+	}
+
+	history := []Generation{genesisGeneration(state, row)}
+	for gen := uint64(1); gen <= state.Generation; gen++ {
+		row = state.Rule.Step(row)
+		cells := make([]CellTx, state.Cells)
+		for i := range state.Cells {
+			cells[i] = CellTx{Cell: i, State: TxHistoric}
+		}
+		history = append(history, Generation{Number: gen, RowHex: row.Hex(), Cells: cells})
+	}
+	if len(history) > maxHistory {
+		history = history[len(history)-maxHistory:]
+	}
+	return history, nil
+}
+
+// SnapshotTail is Snapshot with the history trimmed to the most recent
+// generations, for streaming.
+func (e *Engine) SnapshotTail() Snapshot {
+	s := e.Snapshot()
+	if len(s.History) > TailGenerations {
+		s.History = s.History[len(s.History)-TailGenerations:]
+	}
+	return s
 }
 
 // Snapshot returns the current view. Safe for concurrent use.
