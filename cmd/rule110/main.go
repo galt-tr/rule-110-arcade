@@ -295,13 +295,16 @@ func cmdStep(args []string) error {
 	if err != nil {
 		return err
 	}
-	row, err := state.Row()
+	// Report from THIS cell's tip, not the global row: cells can sit at
+	// different generations and the global row would describe the wrong one.
+	tip := state.Chains[*cell]
+	row, err := tip.Row(state.Cells)
 	if err != nil {
 		return err
 	}
 	next := state.Rule.Step(row)
 
-	fmt.Printf("cell %d, generation %d -> %d\n", *cell, state.Generation, state.Generation+1)
+	fmt.Printf("cell %d, generation %d -> %d\n", *cell, tip.Generation, tip.Generation+1)
 	fmt.Printf("row  %s -> %s\n", row.Hex(), next.Hex())
 	fmt.Printf("bit  %v -> %v\n", row.Get(*cell), next.Get(*cell))
 
@@ -314,7 +317,7 @@ func cmdStep(args []string) error {
 	state.Chains[*cell] = chain.CellChain{
 		Cell: *cell, TxID: res.TxID, Vout: 0,
 		Satoshis: state.Chains[*cell].Satoshis, Generation: res.Generation,
-		BEEFHex: res.BEEFHex,
+		RowHex: res.RowHex, BEEFHex: res.BEEFHex,
 	}
 	if err := c.SaveState(state); err != nil {
 		return err

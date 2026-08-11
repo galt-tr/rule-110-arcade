@@ -57,6 +57,13 @@ type CellChain struct {
 	Satoshis   uint64 `json:"satoshis"`
 	Generation uint64 `json:"generation"`
 
+	// RowHex is the row THIS cell's UTXO carries. Cells can sit at different
+	// generations, so the global State.RowHex is not a safe substitute: the
+	// locking script and the sighash preimage are both derived from the row the
+	// UTXO actually holds, and using the wrong one fails with a bare
+	// OP_CHECKSIGVERIFY that gives no hint why.
+	RowHex string `json:"row"`
+
 	// BEEFHex is the atomic BEEF of the transaction that created this UTXO.
 	// CreateAction needs it as InputBEEF when spending: the source transaction
 	// is NOT recovered automatically for caller-provided inputs.
@@ -152,6 +159,7 @@ func (c *Chain) Genesis(ctx context.Context, compiled *cellscript.Compiled, seed
 			Vout:       uint32(cell),
 			Satoshis:   c.Config.CellSatoshis,
 			Generation: 0,
+			RowHex:     seed.Hex(),
 			BEEFHex:    beefHex,
 		}
 	}
@@ -218,6 +226,22 @@ func (c *Chain) LoadState() (*State, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("chain: parse %s: %w", path, err)
 	}
+	// Backfill per-cell rows for state written before CellChain carried one.
+	// Only cells still at the global generation can be assumed to hold the
+	// global row; a cell that ran ahead has an unknown row and must be
+	// reported rather than guessed at.
+	for i := range s.Chains {
+		if s.Chains[i].RowHex != "" {
+			continue
+		}
+		if s.Chains[i].Generation != s.Generation {
+			return nil, fmt.Errorf(
+				"chain: cell %d is at generation %d but the automaton is at %d, and the "+
+					"state file predates per-cell rows so its row cannot be recovered; "+
+					"re-run genesis", i, s.Chains[i].Generation, s.Generation)
+		}
+		s.Chains[i].RowHex = s.RowHex
+	}
 	return &s, nil
 }
 
@@ -248,3 +272,6 @@ func retryUntilFunded(ctx context.Context, create func() (*sdk.CreateActionResul
 		}
 	}
 }
+
+// Row returns the row this cell's UTXO carries.
+func (c CellChain) Row(cells int) (ca.Row, error) { return ca.SeedHex(cells, c.RowHex) }

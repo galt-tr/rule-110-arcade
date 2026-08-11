@@ -20,6 +20,7 @@ type StepResult struct {
 	Cell       int
 	Generation uint64
 	TxID       string
+	RowHex     string
 	BEEFHex    string
 	SizeBytes  int
 	FeePaid    uint64
@@ -38,17 +39,24 @@ func (c *Chain) AdvanceCell(
 	compiled *cellscript.Compiled,
 	chainState *State,
 	cell int,
-	nextRow ca.Row,
+	_ ca.Row,
 ) (*StepResult, error) {
 	if cell < 0 || cell >= len(chainState.Chains) {
 		return nil, fmt.Errorf("chain: cell %d out of range", cell)
 	}
 	tip := chainState.Chains[cell]
 
-	currentRow, err := chainState.Row()
+	// Use the row THIS cell's UTXO carries, not the global row. They diverge
+	// whenever cells sit at different generations, and the mismatch surfaces
+	// only as OP_CHECKSIGVERIFY failing on a script that looks correct.
+	currentRow, err := tip.Row(chainState.Cells)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("chain: cell %d: %w", cell, err)
 	}
+
+	// Derive the successor from this cell's own row so a skewed cell still
+	// advances correctly rather than being dragged to another generation's row.
+	nextRow := chainState.Rule.Step(currentRow)
 
 	nextLock, err := compiled.LockingScript(cell, nextRow)
 	if err != nil {
@@ -159,6 +167,7 @@ func (c *Chain) AdvanceCell(
 	return &StepResult{
 		Cell:       cell,
 		Generation: nextGen,
+		RowHex:     nextRow.Hex(),
 		TxID:       signed.Txid.String(),
 		BEEFHex:    hex.EncodeToString(signed.Tx),
 		SizeBytes:  len(finalTx.Bytes()),

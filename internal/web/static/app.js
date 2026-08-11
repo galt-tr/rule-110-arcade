@@ -124,22 +124,41 @@ const rateOut = document.getElementById('rateOut');
 rate.oninput = () => { rateOut.textContent = (+rate.value).toFixed(2) + ' gen/s'; };
 rate.onchange = () => control('rate', { rate: +rate.value });
 
-// Hover a cell to see which transaction proved it.
-canvas.onmousemove = (ev) => {
-  if (!snapshot) return;
+/** Which cell is under the pointer, or null. */
+function cellAt(ev) {
+  if (!snapshot) return null;
   const r = canvas.getBoundingClientRect();
   const g = Math.floor((ev.clientY - r.top) / cellPx);
-  const col = Math.floor((ev.clientX - r.left) / cellPx);
-  const c = snapshot.cells - 1 - col;
+  const c = snapshot.cells - 1 - Math.floor((ev.clientX - r.left) / cellPx);
   const gen = snapshot.history[g];
-  if (!gen || c < 0 || c >= snapshot.cells) { tip.hidden = true; return; }
+  if (!gen || c < 0 || c >= snapshot.cells) return null;
+  return { gen, cell: gen.cells[c] || {}, index: c };
+}
 
-  const cell = gen.cells[c] || {};
+/** Arcade's status page for a transaction. */
+function arcadeTxURL(txid) {
+  return snapshot.arcadeUrl.replace(/\/+$/, '') + '/tx/' + txid;
+}
+
+// Click a cell to open its transaction in arcade.
+canvas.onclick = (ev) => {
+  const hit = cellAt(ev);
+  if (!hit || !hit.cell.txid) return;
+  window.open(arcadeTxURL(hit.cell.txid), '_blank', 'noopener');
+};
+
+// Hover a cell to see which transaction proved it.
+canvas.onmousemove = (ev) => {
+  const hit = cellAt(ev);
+  if (!hit) { tip.hidden = true; canvas.style.cursor = 'default'; return; }
+  const { gen, cell } = hit;
+  const c = hit.index;
+  canvas.style.cursor = cell.txid ? 'pointer' : 'default';
   const bits = bitsOf(gen.row, snapshot.cells);
   tip.innerHTML =
     `<b>cell ${c}</b> · generation ${gen.number}<br>` +
     `state: ${bits[c] ? 'alive' : 'dead'} · tx: ${cell.state || 'pending'}<br>` +
-    (cell.txid ? `${cell.txid}` : '') +
+    (cell.txid ? `${cell.txid}<br><span class="hint">click to open in arcade</span>` : '') +
     (cell.err ? `<br><span style="color:var(--failed)">${cell.err}</span>` : '');
   tip.hidden = false;
   tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 440) + 'px';

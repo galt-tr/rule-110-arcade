@@ -320,6 +320,7 @@ func (e *Engine) recordCell(genIdx, cell int, res *chain.StepResult, err error) 
 		Vout:       0,
 		Satoshis:   e.state.Chains[cell].Satoshis,
 		Generation: res.Generation,
+		RowHex:     res.RowHex,
 		BEEFHex:    res.BEEFHex,
 	}
 	e.totalTx++

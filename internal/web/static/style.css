@@ -127,3 +127,5 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   box-shadow: 0 6px 18px rgba(0,0,0,.5);
 }
 #tip b { color: var(--accent); }
+
+#tip .hint { color: var(--muted); }
