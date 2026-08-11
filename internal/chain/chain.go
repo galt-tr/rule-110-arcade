@@ -104,11 +104,17 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 	extra := []storage.Option{
 		storage.WithChangeBasket(changeBasket),
 
-		// A fee rate of exactly 100 sat/kB is NOT safe. Arcade's GoBDK enforces
-		// a 100 sat/kB floor over the EXTENDED-format size, which counts bytes
-		// per input the toolbox does not, so a transaction priced at exactly the
-		// floor comes back as a final 4xx "failed to validate transaction".
+		// Priced above arcade's floor for headroom, not because the floor is
+		// applied to a larger size than we price — it is not. See
+		// Config.FeeSatPerKB.
 		storage.WithFeeModel(defs.FeeModel{Type: defs.SatPerKB, Value: cfg.FeeSatPerKB}),
+
+		// The fee is committed from a size ESTIMATE made before the unlocking
+		// scripts exist, and ours are ~2.6 kB of covenant, so an estimate that
+		// comes out short is the one remaining way to emit an underpriced
+		// transaction. This measures the finished article instead of the plan,
+		// before anything is persisted or sent.
+		storage.WithMinBroadcastFeeRate(cfg.MinBroadcastFeeRate),
 
 		// Coin selection is the difference between 128 cells running in parallel
 		// and 128 cells queueing. Under the privacy strategy they contend for the

@@ -81,12 +81,33 @@ type Config struct {
 	// serve would queue without limit and the reported rate would be fiction.
 	MaxLag uint64
 
-	// FeeSatPerKB prices transactions.
+	// FeeSatPerKB prices transactions, above arcade's 100 sat/kB floor.
 	//
-	// NOT 100, even though that is arcade's floor: GoBDK enforces the floor over
-	// the EXTENDED-format size, which counts bytes per input the toolbox does
-	// not, so pricing at exactly the floor earns a final 4xx rejection.
+	// Not because the floor is applied to a larger size than the toolbox prices
+	// — it is not. The extended format carries each prevout inline, but the
+	// validator takes that as separate spent-coin data and does not bill it, and
+	// the node TRUNCATES the required fee where the toolbox rounds up. Pricing
+	// at exactly 100 is therefore safe on its own terms. (An earlier version of
+	// this comment claimed the opposite; it was wrong.)
+	//
+	// The margin is for a different hazard: the fee is committed from a SIZE
+	// ESTIMATE made before any unlocking script exists, and every script that
+	// comes out longer than estimated eats into it. Ours are ~2.6 kB of
+	// covenant, so a small error is a large number of bytes. MinBroadcastFeeRate
+	// is the check that catches the estimate being wrong; this is the headroom
+	// that stops it triggering.
 	FeeSatPerKB int64
+
+	// MinBroadcastFeeRate is the floor a finished transaction must clear locally
+	// before it is allowed to exist, or 0 to skip the check.
+	//
+	// This measures the real transaction rather than the plan — fee from inputs
+	// minus outputs, size from the bytes that will actually be broadcast — so it
+	// catches a fee committed against a bad estimate, which is the one way a
+	// correctly configured wallet still emits an underpriced transaction. Set it
+	// to the floor the receiving arcade enforces, not to your own target rate:
+	// it is the network's policy, not ours.
+	MinBroadcastFeeRate int64
 
 	// FuelDenomination is the value of one fuel coin, and FuelPoolSize how many
 	// the keeper maintains.
@@ -141,6 +162,7 @@ func DefaultConfig() Config {
 		MaxUnconfirmedDepth: 64,
 		MaxLag:              32,
 		FeeSatPerKB:         125,
+		MinBroadcastFeeRate: 100,
 		// A cell transition is ~4.1 kB, so ~512 satoshis of fee at 125 sat/kB.
 		// 1000 leaves comfortable change above the ~48 satoshi dust floor while
 		// stranding little value per coin.

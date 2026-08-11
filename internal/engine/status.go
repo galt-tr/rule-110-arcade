@@ -173,8 +173,54 @@ func (e *Engine) applyStatus(txid string, status arcade.Status, extra string) {
 		// "utxo already spent" — noise that hides the original rejection.
 		e.halted[loc.cell] = true
 		e.logger.Warn("cell halted by rejection", "cell", loc.cell, "txid", txid, "status", string(status))
+		if extra == "" {
+			go e.fetchRejectionReason(txid, loc.cell)
+		}
 	}
 	e.notify()
+}
+
+// fetchRejectionReason asks arcade why a transaction was rejected, when the
+// event that told us did not say.
+//
+// Arcade's asynchronous publish path builds its event from the status, the
+// timestamp and a list of txids — there is nowhere in it for a per-transaction
+// reason, so EVERY pushed rejection arrives bare. The reason does exist, and
+// GET /tx returns it in full:
+//
+//	UTXO_SPENT (70): d8f2ccc0…:0 utxo already spent by tx ffb1c43e…[0]
+//
+// which names the conflicting spend outright. Losing that costs real time: we
+// reconstructed exactly this by hand from a node's propagation logs, and it is
+// the difference between "your state is stale, resync" and "this transaction is
+// malformed, never retry" — opposite responses.
+//
+// It runs off the hot path because a rejection is terminal for the cell anyway,
+// and it must not hold the engine's write lock across a network call.
+// Reported upstream as bsv-blockchain/arcade#301.
+func (e *Engine) fetchRejectionReason(txid string, cell int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	rec, err := e.chain.Oracle.GetTx(ctx, txid)
+	if err != nil || rec == nil || rec.ExtraInfo == "" {
+		return
+	}
+	reason := rejectionMessage(rec.Status, rec.ExtraInfo)
+	e.logger.Warn("rejection reason", "cell", cell, "txid", txid, "reason", rec.ExtraInfo)
+
+	e.mu.Lock()
+	if loc, ok := e.txIndex[txid]; ok {
+		if idx := indexOfGeneration(e.history, loc.generation); idx >= 0 {
+			e.history[idx].Cells[loc.cell].Err = reason
+		}
+	}
+	e.notify()
+	e.mu.Unlock()
+
+	if err := e.store.UpdateStatus(ctx, txid, history.StatusFailed, reason); err != nil {
+		e.logger.Error("persist rejection reason", "txid", txid, "err", err)
+	}
 }
 
 // persistStatus writes a status to the store and drops the transaction from the
