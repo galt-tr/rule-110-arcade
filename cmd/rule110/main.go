@@ -18,10 +18,12 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 
 	"github.com/dymurray/rule-110-arcade/internal/ca"
+	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
 )
 
@@ -42,6 +44,8 @@ func run(args []string) error {
 		return cmdAddress(args[1:])
 	case "fund":
 		return cmdFund(args[1:])
+	case "genesis":
+		return cmdGenesis(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -56,6 +60,7 @@ func usage() {
 
   rule110 address [flags]   print the funding address for this deployment
   rule110 fund [flags]      internalize a mined funding transaction
+  rule110 genesis [flags]   create generation 0: one UTXO per cell
   rule110 help              show this message
 
 Common flags:
@@ -177,6 +182,80 @@ func cmdFund(args []string) error {
 	}
 	fmt.Printf("balance: %d -> %d sat (+%d)\n", before, after, after-before)
 	return nil
+}
+
+func cmdGenesis(args []string) error {
+	cfg := chain.DefaultConfig()
+	fs := flag.NewFlagSet("genesis", flag.ContinueOnError)
+	network := bindCommon(fs, &cfg)
+	rule := fs.Uint("rule", uint(cfg.Rule), "Wolfram rule number")
+	seedHex := fs.String("seed", "", "initial row as hex; empty seeds a single live cell at index 0")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg.Rule = ca.Rule(*rule)
+
+	net, err := parseNetwork(*network)
+	if err != nil {
+		return err
+	}
+	cfg.Network = net
+
+	seed, err := seedRow(cfg.Cells, *seedHex)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	compiled, err := cellscript.Compile(cfg.Cells, cfg.Rule)
+	if err != nil {
+		return err
+	}
+
+	c, err := chain.Open(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(ctx) }()
+
+	fmt.Println("waiting for claimable funds (monitor applies statuses on startup)...")
+	if err := c.WaitForClaimableFunds(ctx, 3*time.Minute); err != nil {
+		return err
+	}
+
+	balance, err := c.Balance(ctx)
+	if err != nil {
+		return fmt.Errorf("read balance: %w", err)
+	}
+	fmt.Printf("balance before: %d sat\n", balance)
+	fmt.Printf("creating %d cells, rule %d, seed %s\n", cfg.Cells, cfg.Rule, seed.Hex())
+
+	state, err := c.Genesis(ctx, compiled, seed)
+	if err != nil {
+		return err
+	}
+
+	after, err := c.Balance(ctx)
+	if err != nil {
+		return fmt.Errorf("read balance: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Printf("GENESIS TXID: %s\n", state.GenesisTxID)
+	fmt.Println()
+	fmt.Printf("cells:          %d (vout 0..%d)\n", state.Cells, state.Cells-1)
+	fmt.Printf("row:            %s\n", state.RowHex)
+	fmt.Printf("balance after:  %d sat (spent %d)\n", after, balance-after)
+	return nil
+}
+
+func seedRow(cells int, hexSeed string) (ca.Row, error) {
+	if hexSeed == "" {
+		return ca.SeedSingle(cells)
+	}
+	return ca.SeedHex(cells, hexSeed)
 }
 
 // parseNetwork delegates to the toolbox, which is the authority on which

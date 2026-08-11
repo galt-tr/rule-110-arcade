@@ -5,16 +5,19 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/headers"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/monitor"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/services"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/perfprovider"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 )
 
 // storageName identifies this deployment's storage to the wallet.
@@ -120,6 +123,32 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 	}
 	c.IdentityKey = pub.PublicKey.ToDERHex()
 
+	// Start the monitor's SSE apply pipeline.
+	//
+	// This is NOT optional. Change is minted at TierSending and is promoted to
+	// TierUnproven (the first claimable tier) only when the SEEN status is
+	// APPLIED — and ApplyStatusBatch is driven exclusively by this daemon.
+	// Without it, statuses never land, every change coin stays unspendable, and
+	// the funder reports "not enough funds" while the balance looks healthy.
+	//
+	// The cron tasks matter as much as the stream: the SSE feed only carries
+	// events from the moment it connects, so a status that fired before startup
+	// is never replayed. CheckForProofs is the poll fallback that recovers it.
+	monCfg := defs.DefaultMonitorConfig()
+	mon, err := monitor.NewDaemon(logger, provider, hdrs, oracle,
+		monCfg, monitor.WithoutDistributedLock())
+	if err != nil {
+		c.close(ctx)
+		return nil, fmt.Errorf("chain: monitor: %w", err)
+	}
+	if err := mon.Start(ctx, monCfg.Tasks.EnabledTasks()); err != nil {
+		c.close(ctx)
+		return nil, fmt.Errorf("chain: start monitor: %w", err)
+	}
+	c.closers = append([]func(context.Context) error{
+		func(context.Context) error { return mon.Stop() },
+	}, c.closers...)
+
 	return c, nil
 }
 
@@ -137,6 +166,38 @@ func (c *Chain) close(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// WaitForClaimableFunds blocks until the change basket holds at least one
+// claimable coin, or the deadline passes.
+//
+// This is needed after any wallet restart: coins become claimable only once the
+// monitor has applied their status, and the SSE stream does not replay history,
+// so a freshly-started process must wait for the poll fallback to catch up.
+func (c *Chain) WaitForClaimableFunds(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		n, err := c.Wallet.BasketClaimableCount(ctx, string(wdk.BasketNameForChange))
+		if err != nil {
+			return fmt.Errorf("chain: count claimable coins: %w", err)
+		}
+		if n > 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			balance, _ := c.Balance(ctx)
+			return fmt.Errorf(
+				"chain: no claimable coins after %s (balance %d sat)\n"+
+					"coins become claimable only once the monitor applies their status; "+
+					"if the funding transaction is still unmined, mine a block",
+				timeout, balance)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // Balance returns the wallet's spendable change balance.
