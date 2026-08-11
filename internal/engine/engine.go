@@ -95,6 +95,13 @@ type Engine struct {
 	totalTx   int
 	lastError string
 
+	// txIndex maps a broadcast txid back to the cell that produced it, so
+	// arcade's status stream can be reflected in the diagram.
+	txIndex map[string]txLoc
+	// halted marks cells whose chain is broken (a rejected transaction), so we
+	// stop trying to spend outputs that do not exist.
+	halted map[int]bool
+
 	// stepReq carries manual single-step requests.
 	stepReq chan struct{}
 	// changed is closed and replaced whenever the snapshot changes, so
@@ -117,6 +124,8 @@ func New(c *chain.Chain, compiled *cellscript.Compiled, state *chain.State, logg
 		rate:     1,
 		stepReq:  make(chan struct{}, 1),
 		changed:  make(chan struct{}),
+		txIndex:  make(map[string]txLoc),
+		halted:   make(map[int]bool),
 	}
 	e.history = []Generation{genesisGeneration(state, row)}
 	return e, nil
@@ -207,6 +216,7 @@ func (e *Engine) Step() {
 // Run drives the clock until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	go e.trackBalance(ctx)
+	go e.watchStatus(ctx)
 
 	for {
 		e.mu.RLock()
@@ -255,6 +265,10 @@ func (e *Engine) advance(ctx context.Context) {
 		Cells:  make([]CellTx, state.Cells),
 	}
 	for i := range state.Cells {
+		if e.halted[i] {
+			gen.Cells[i] = CellTx{Cell: i, State: TxFailed, Err: "chain halted by an earlier rejection"}
+			continue
+		}
 		gen.Cells[i] = CellTx{Cell: i, State: TxPending}
 	}
 	e.history = append(e.history, gen)
@@ -267,6 +281,12 @@ func (e *Engine) advance(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for cell := range state.Cells {
+		e.mu.RLock()
+		skip := e.halted[cell]
+		e.mu.RUnlock()
+		if skip {
+			continue
+		}
 		wg.Add(1)
 		go func(cell int) {
 			defer wg.Done()
@@ -314,6 +334,7 @@ func (e *Engine) recordCell(genIdx, cell int, res *chain.StepResult, err error) 
 	}
 
 	e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
+	e.indexTx(res.TxID, genIdx, cell)
 	e.state.Chains[cell] = chain.CellChain{
 		Cell:       cell,
 		TxID:       res.TxID,
