@@ -81,6 +81,39 @@ type Config struct {
 	// serve would queue without limit and the reported rate would be fiction.
 	MaxLag uint64
 
+	// FeeSatPerKB prices transactions.
+	//
+	// NOT 100, even though that is arcade's floor: GoBDK enforces the floor over
+	// the EXTENDED-format size, which counts bytes per input the toolbox does
+	// not, so pricing at exactly the floor earns a final 4xx rejection.
+	FeeSatPerKB int64
+
+	// FuelDenomination is the value of one fuel coin, and FuelPoolSize how many
+	// the keeper maintains.
+	//
+	// One coin funds exactly one cell transition, which is what makes every coin
+	// in the pool interchangeable and lets the funder's ClaimExact claim without
+	// ever colliding. It must comfortably clear the fee plus the dust floor, or
+	// the change output vanishes and the covenant cannot spend the result.
+	FuelDenomination uint64
+	FuelPoolSize     uint64
+
+	// Throughput selects the denominated fuel pool over the default privacy
+	// strategy. Off means every cell competes for the same change set.
+	Throughput bool
+
+	// FullStatusUpdates asks arcade for every status transition rather than
+	// terminal ones only. Good for a diagram, roughly 4x the event volume, and
+	// arcade's SSE fan-out is measured at ~1,500-1,700 events/s.
+	FullStatusUpdates bool
+
+	// ApplyConcurrency is how many workers the monitor uses to apply arcade
+	// status batches. The toolbox default of 8 is documented as too low for a
+	// sustained high rate: when the appliers cannot drain the hand-off queue the
+	// SSE reader blocks and arcade drops events, which is how transactions end
+	// up with no status at all.
+	ApplyConcurrency int
+
 	// Chronicle selects Chronicle-era script rules for local pre-broadcast
 	// verification. Rúnar covenants contain OP_2MUL and cannot verify without
 	// it, so it defaults on; turn it off only against a Genesis-rules network,
@@ -107,6 +140,15 @@ func DefaultConfig() Config {
 		// bites long before the node's ancestor limit does.
 		MaxUnconfirmedDepth: 64,
 		MaxLag:              32,
+		FeeSatPerKB:         125,
+		// A cell transition is ~4.1 kB, so ~512 satoshis of fee at 125 sat/kB.
+		// 1000 leaves comfortable change above the ~48 satoshi dust floor while
+		// stranding little value per coin.
+		FuelDenomination:  1000,
+		FuelPoolSize:      20000,
+		Throughput:        true,
+		FullStatusUpdates: true,
+		ApplyConcurrency:  32,
 	}
 }
 
@@ -152,4 +194,48 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("chain: %w", err)
 	}
 	return nil
+}
+
+// utxoManagement builds the funding strategy.
+//
+// The privacy default has every cell competing for the same unreserved change
+// set, which is why 128 concurrent cells collapsed to 4 transactions a second
+// with 981 coins in the wallet and one of them claimable. The throughput
+// strategy replaces that with a pool of identical coins: because any coin will
+// do, the funder's ClaimExact issues a single SKIP LOCKED claim that cannot
+// collide with another cell's.
+//
+// RecycleChangeToPool stays OFF deliberately. It would route each transition's
+// change straight back into the pool, chaining every payment onto the previous
+// one's change — and this workload already runs 128 unbroken unconfirmed chains.
+// Adding a 129th, shared by every cell, is how the toolbox's own benchmarks
+// blew past the mempool ancestor limit and took 22,853 rejections.
+func (c *Config) utxoManagement() (defs.UTXOManagement, error) {
+	um := defs.DefaultUTXOManagement()
+	if !c.Throughput {
+		return um, nil
+	}
+	um.Strategy = defs.StrategyThroughput
+	um.Throughput.DenominationSatoshis = c.FuelDenomination
+	um.Throughput.TargetPoolSize = c.FuelPoolSize
+	// A cell transition spends a fuel coin whether or not it is mined yet, and
+	// on a test network the pool lingers unproven, so mined-only would find the
+	// pool empty and fall back to the contended walk we are trying to escape.
+	um.Throughput.SpendPolicy = defs.SpendPolicyPreferMined
+
+	fee := defs.FeeModel{Type: defs.SatPerKB, Value: c.FeeSatPerKB}
+	if err := um.Validate(fee, defs.Commission{}); err != nil {
+		return um, fmt.Errorf("chain: fuel pool configuration: %w", err)
+	}
+	return um, nil
+}
+
+// FuelPool reports the basket and denomination the fuel keeper maintains, and
+// whether the throughput strategy is on at all.
+func (c *Config) FuelPool() (basket string, denomination, target uint64, enabled bool) {
+	um, err := c.utxoManagement()
+	if err != nil || !um.Enabled() {
+		return "", 0, 0, false
+	}
+	return um.Throughput.PoolBasket, c.FuelDenomination, c.FuelPoolSize, true
 }

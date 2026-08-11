@@ -64,15 +64,24 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		URL:           cfg.ArcadeURL,
 		EventsURL:     cfg.ArcadeURL,
 		CallbackToken: callbackToken,
-		// Ask for every transition, not just terminal ones: the diagram is
-		// showing the lifecycle, so the intermediate states are the point.
-		FullStatusUpdates: true,
+		// Every transition, not just terminal ones: the diagram is showing the
+		// lifecycle, so the intermediate states are the point.
+		//
+		// This is roughly a 4x multiplier on event volume, and arcade's SSE
+		// fan-out is measured at ~1,500-1,700 events/s, so above about three
+		// generations a second it is the wrong trade and should be turned off.
+		FullStatusUpdates: cfg.FullStatusUpdates,
 	})
 
 	hdrs, err := headers.New(logger, defs.ChainTracks{
 		Enabled: true,
 		URL:     cfg.chainTracksURL(),
-	})
+	},
+		// The ~1000 proofs that share a block then cost one header fetch between
+		// them rather than one each — the lever that keeps the status-apply
+		// pipeline ahead of mining at a sustained high rate.
+		headers.WithCacheDepth(0),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("chain: headers client: %w", err)
 	}
@@ -83,13 +92,31 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 	// which produces a 9-output transaction the covenant cannot satisfy.
 	//
 	// This costs parallelism: the change pool grows one coin per transaction
-	// rather than eight, so many concurrent cells will contend for coins. The
-	// throughput strategy's denominated fuel pool is the real answer at scale.
+	// rather than eight, so many concurrent cells contend for coins.
 	changeBasket := defs.DefaultChangeBasket()
 	changeBasket.MaxChangeOutputsPerTx = 1
 
+	um, err := cfg.utxoManagement()
+	if err != nil {
+		return nil, err
+	}
+
 	extra := []storage.Option{
 		storage.WithChangeBasket(changeBasket),
+
+		// A fee rate of exactly 100 sat/kB is NOT safe. Arcade's GoBDK enforces
+		// a 100 sat/kB floor over the EXTENDED-format size, which counts bytes
+		// per input the toolbox does not, so a transaction priced at exactly the
+		// floor comes back as a final 4xx "failed to validate transaction".
+		storage.WithFeeModel(defs.FeeModel{Type: defs.SatPerKB, Value: cfg.FeeSatPerKB}),
+
+		// Coin selection is the difference between 128 cells running in parallel
+		// and 128 cells queueing. Under the privacy strategy they contend for the
+		// unreserved change set: we measured the whole automaton down to 4 tx/s
+		// with 981 coins in the wallet and exactly ONE of them claimable. The
+		// denominated pool makes every coin interchangeable, so ClaimExact's
+		// SKIP LOCKED claim never collides.
+		storage.WithUTXOManagement(um),
 
 		// One change output is not enough — there must also always BE one. The
 		// funder otherwise drops it whenever the leftover falls under the dust
@@ -188,8 +215,16 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 	// events from the moment it connects, so a status that fired before startup
 	// is never replayed. CheckForProofs is the poll fallback that recovers it.
 	monCfg := defs.DefaultMonitorConfig()
-	mon, err := monitor.NewDaemon(logger, provider, hdrs, oracle,
-		monCfg, monitor.WithoutDistributedLock())
+	mon, err := monitor.NewDaemon(logger, provider, hdrs, oracle, monCfg,
+		monitor.WithoutDistributedLock(),
+		// The default of 8 appliers is documented as too low for a sustained
+		// high rate, and the failure is not a slowdown: when the appliers cannot
+		// drain the hand-off queue the SSE reader blocks, arcade drops events
+		// for a slow client, and those transactions end up with no status at
+		// all. Statuses are what release the depth gate here, so losing them
+		// would wedge every cell.
+		monitor.WithApplyConcurrency(cfg.ApplyConcurrency),
+	)
 	if err != nil {
 		c.close(ctx)
 		return nil, fmt.Errorf("chain: monitor: %w", err)

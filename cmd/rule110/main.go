@@ -102,6 +102,22 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "how many cells advance at once")
 	fs.BoolVar(&cfg.Chronicle, "chronicle", cfg.Chronicle,
 		"verify with Chronicle-era script rules (required for Rúnar covenants)")
+	fs.Int64Var(&cfg.FeeSatPerKB, "fee-sat-per-kb", cfg.FeeSatPerKB,
+		"fee rate; must exceed arcade's 100 sat/kB floor, which it applies to the extended-format size")
+	fs.BoolVar(&cfg.Throughput, "throughput", cfg.Throughput,
+		"fund from a denominated fuel pool instead of contending for change")
+	fs.Uint64Var(&cfg.FuelDenomination, "fuel-sats", cfg.FuelDenomination,
+		"value of one fuel coin; must clear one transition's fee plus the dust floor")
+	fs.Uint64Var(&cfg.FuelPoolSize, "fuel-pool", cfg.FuelPoolSize,
+		"how many fuel coins the keeper maintains")
+	fs.Uint64Var(&cfg.MaxUnconfirmedDepth, "max-depth", cfg.MaxUnconfirmedDepth,
+		"how far a cell may run ahead of its newest mined transaction (0 = unbounded)")
+	fs.Uint64Var(&cfg.MaxLag, "max-lag", cfg.MaxLag,
+		"how far the clock may run ahead of the slowest cell")
+	fs.IntVar(&cfg.ApplyConcurrency, "apply-concurrency", cfg.ApplyConcurrency,
+		"monitor workers applying arcade status batches")
+	fs.BoolVar(&cfg.FullStatusUpdates, "full-status", cfg.FullStatusUpdates,
+		"subscribe to every status transition (~4x the events; turn off above ~3 gen/s)")
 
 	network := fs.String("network", envOr("RULE110_NETWORK", string(defs.NetworkTSTN)),
 		"main | test | ttn (Teranode test net) | tstn (private scaling test net)")
@@ -391,9 +407,21 @@ func cmdRun(args []string) error {
 	}
 	go eng.Run(ctx)
 
+	// The pool only drains on its own: throughput change deliberately does not
+	// recycle back into it, so without the keeper the automaton runs until the
+	// pool is empty and then starves.
+	go func() {
+		if err := c.RunFuelKeeper(ctx); err != nil {
+			logger.Error("fuel keeper stopped", "err", err)
+		}
+	}()
+
 	fmt.Printf("rule 110 · %d cells · generation %d\n", state.Cells, state.Generation)
 	fmt.Printf("arcade:  %s\n", cfg.ArcadeURL)
 	fmt.Printf("genesis: %s\n", state.GenesisTxID)
+	if basket, denom, target, on := cfg.FuelPool(); on {
+		fmt.Printf("fuel:    %d x %d sat in %q, kept topped up\n", target, denom, basket)
+	}
 	fmt.Printf("\n  UI ready at http://localhost%s\n\n", *addr)
 
 	return web.New(eng, logger).Serve(ctx, *addr)
