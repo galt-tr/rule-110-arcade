@@ -57,6 +57,8 @@ func run(args []string) error {
 		return cmdRun(args[1:])
 	case "fuel":
 		return cmdFuel(args[1:])
+	case "depth-probe":
+		return cmdDepthProbe(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -75,6 +77,7 @@ func usage() {
   rule110 step [flags]      advance one cell by one generation
   rule110 run [flags]       start the automaton and its web UI
   rule110 fuel [flags]      mint coins so a whole generation can fan out
+  rule110 depth-probe       measure how deep an unconfirmed chain this network accepts
   rule110 help              show this message
 
 Common flags:

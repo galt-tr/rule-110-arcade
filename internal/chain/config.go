@@ -62,18 +62,27 @@ type Config struct {
 	Concurrency int
 
 	// MaxUnconfirmedDepth bounds how far ahead of its newest mined transaction
-	// a cell may run.
+	// a cell may run, or 0 for no bound.
 	//
 	// A cell is an unbroken chain of unconfirmed transactions, so its depth
-	// grows at the generation rate and only shrinks when a block arrives. Past
-	// the node's mempool ancestor limit the deepest transaction is rejected and
-	// the rejection cascades to every descendant — the one failure that ruins a
-	// whole run rather than a single step. Bounding it turns that into ordinary
-	// backpressure: the automaton self-paces to whatever cadence the network
-	// mines at.
+	// grows at the generation rate and only falls when a block lands. The
+	// original justification was a mempool ancestor limit: past it the deepest
+	// transaction is rejected and the rejection cascades to every descendant,
+	// which destroys a cell rather than costing a step.
 	//
-	// We have run 139 deep against the dev-ovh-1 scale network with no
-	// rejections. Raise this only with a measurement behind it.
+	// WE COULD NOT FIND THAT LIMIT. `rule110 depth-probe` built 600 consecutive
+	// transactions on a single chain against the dev-ovh-1 scale network,
+	// reaching at least 250 unconfirmed ancestors, with zero rejections. That
+	// matches arcade enforcing no ancestor limit — its LimitAncestorCount is a
+	// dead value with no setter — and teranode's documentation saying ancestor
+	// tracking is not enforced. The cascade recorded in the toolbox benchmarks
+	// may well have had another cause.
+	//
+	// So this is kept as a deliberate margin, not a proven boundary: the
+	// benchmarks did observe SOME cascade, other networks may differ, and the
+	// bound also usefully caps the in-flight set the status pipeline and
+	// reconciler have to carry. Set it from a probe of the network you are
+	// actually running against rather than trusting this default.
 	MaxUnconfirmedDepth uint64
 
 	// MaxLag bounds how far the clock may run ahead of the slowest cell before
@@ -157,9 +166,9 @@ func DefaultConfig() Config {
 		Chronicle:    true,
 		MaxDBConns:   72,
 		Concurrency:  32,
-		// Well under the 139 we have run without a rejection, so the governor
-		// bites long before the node's ancestor limit does.
-		MaxUnconfirmedDepth: 64,
+		// Below the 250 we measured without a rejection, well above the 64 this
+		// was set to when the limit was still assumed rather than tested.
+		MaxUnconfirmedDepth: 200,
 		MaxLag:              32,
 		FeeSatPerKB:         125,
 		MinBroadcastFeeRate: 100,
