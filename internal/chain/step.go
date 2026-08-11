@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -14,6 +15,11 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/ca"
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 )
+
+// ErrNotBroadcast marks a failure that happened before anything could reach the
+// network, so the cell's UTXO is certainly still unspent and the attempt can be
+// retried — or retracted — without risking a double spend.
+var ErrNotBroadcast = errors.New("chain: not broadcast")
 
 // StepResult describes one completed cell transition.
 type StepResult struct {
@@ -46,7 +52,18 @@ func (c *Chain) AdvanceCell(
 	tip CellChain,
 	cells int,
 	rule ca.Rule,
-) (*StepResult, error) {
+) (res *StepResult, err error) {
+	// Signing is what broadcasts, so a caller cannot otherwise tell whether a
+	// failure left anything on the network. Everything that fails before that
+	// point is reported as ErrNotBroadcast, which lets the caller retract its
+	// write-ahead record instead of treating the cell's tip as unknown.
+	broadcast := false
+	defer func() {
+		if err != nil && !broadcast {
+			err = fmt.Errorf("%w: %w", ErrNotBroadcast, err)
+		}
+	}()
+
 	cell := tip.Cell
 	if cell < 0 || cell >= cells {
 		return nil, fmt.Errorf("chain: cell %d out of range", cell)
@@ -162,6 +179,8 @@ func (c *Chain) AdvanceCell(
 		return nil, fmt.Errorf("chain: cell %d covenant rejected locally: %w", cell, err)
 	}
 
+	// Past this line the transaction may exist on the network whatever happens.
+	broadcast = true
 	signed, err := c.Wallet.SignAction(ctx, sdk.SignActionArgs{
 		Reference: created.SignableTransaction.Reference,
 		Spends:    map[uint32]sdk.SignActionSpend{0: {UnlockingScript: unlock}},

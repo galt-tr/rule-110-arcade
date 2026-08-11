@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -171,8 +172,24 @@ func (e *Engine) advanceCell(ctx context.Context, cell int) {
 	cells, rule := e.state.Cells, e.state.Rule
 	e.mu.RUnlock()
 
+	// Write the intent BEFORE building anything. Signing broadcasts, so there is
+	// a window in which the output is spent on chain and we do not yet know it;
+	// a process killed there would come back a generation behind and re-spend an
+	// output that is already gone. This row is what tells the next startup that
+	// the tip is unknown rather than stale. See history.StatusAttempting.
+	e.persist(history.CellTx{
+		Generation: tip.Generation + 1, Cell: cell, Status: history.StatusAttempting,
+	})
+
 	res, err := e.chain.AdvanceCell(ctx, e.compiled, tip, cells, rule)
 	if err != nil {
+		// Nothing reached the network, so the write-ahead record is a false
+		// alarm and has to go: leaving it would make the next startup treat a
+		// perfectly healthy cell as having an unknown tip. Shortfalls are the
+		// common case, and they all land here.
+		if errors.Is(err, chain.ErrNotBroadcast) {
+			e.retractAttempt(tip.Generation+1, cell)
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -308,6 +325,15 @@ func (e *Engine) claimProbe() bool {
 	}
 	e.lastProbe = time.Now()
 	return true
+}
+
+// retractAttempt removes a write-ahead record for something that never reached
+// the network, so it cannot be mistaken later for a lost broadcast.
+func (e *Engine) retractAttempt(generation uint64, cell int) {
+	if err := e.store.DeleteAttempt(context.Background(), generation, cell); err != nil {
+		e.logger.Error("retract write-ahead record",
+			"generation", generation, "cell", cell, "err", err)
+	}
 }
 
 // doneWaiting clears a cell's funding-shortfall flag.

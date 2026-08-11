@@ -9,6 +9,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -255,6 +256,35 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, sta
 		if c.TxID != "" {
 			e.indexTx(c.TxID, c.Generation, c.Cell)
 		}
+	}
+
+	// A write-ahead record left unresolved means the process died between
+	// broadcasting a transition and recording it. That cell's real tip is
+	// UNKNOWN — advancing it from the last tip we did record would re-spend an
+	// output the network may already have consumed, and the resulting rejection
+	// is indistinguishable from a genuine failure. It is exactly how cells 34
+	// and 51 were lost.
+	//
+	// So stop the cell instead of guessing. This is deliberately conservative:
+	// one stalled cell an operator can see beats a silent double spend, and
+	// recovering the real tip from chain data is a separate job.
+	uncertain, err := store.UnresolvedAttempts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for cell, generation := range uncertain {
+		if cell < 0 || cell >= state.Cells {
+			continue
+		}
+		e.halted[cell] = true
+		e.logger.Warn("cell tip is unknown after an unclean shutdown; refusing to advance it",
+			"cell", cell, "generation", generation,
+			"detail", "a transition may have been broadcast without being recorded")
+	}
+	if len(uncertain) > 0 {
+		e.lastError = fmt.Sprintf(
+			"%d cell(s) stopped: a transition may have been broadcast but not recorded before shutdown",
+			len(uncertain))
 	}
 	e.logger.Info("history loaded", "generations", len(e.history), "unsettled", len(unsettled))
 

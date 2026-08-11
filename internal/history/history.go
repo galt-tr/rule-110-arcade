@@ -26,6 +26,20 @@ import (
 type Status string
 
 const (
+	// StatusAttempting is written BEFORE a transaction is built, and carries no
+	// txid because none exists yet.
+	//
+	// It is the write-ahead record. Signing a cell transition broadcasts it, so
+	// there is a window between "this output is now spent on chain" and "we know
+	// that". A process killed inside that window comes back believing the cell is
+	// a generation behind, re-spends an output that is already spent, and loses
+	// the cell to a rejection it cannot distinguish from a real failure. That is
+	// exactly how cells 34 and 51 died: ffb1c43e was broadcast at 22:20:02, the
+	// process restarted at 22:20:05, and the replacement was rejected at 22:20:55.
+	//
+	// An attempt left unresolved at startup means the tip is UNKNOWN, not stale.
+	StatusAttempting Status = "attempting"
+
 	StatusBroadcast Status = "broadcast"
 	StatusSeen      Status = "seen"
 	StatusMined     Status = "mined"
@@ -279,4 +293,49 @@ func scanCells(rows *sql.Rows) ([]CellTx, error) {
 		return nil, fmt.Errorf("history: scan cells: %w", err)
 	}
 	return out, nil
+}
+
+// UnresolvedAttempts returns the cells whose newest record is a write-ahead
+// attempt that was never resolved, mapped to the generation attempted.
+//
+// Each of these means a transaction may have been broadcast and then lost to a
+// crash: the cell's real tip is unknown, and advancing it from the last recorded
+// tip would double-spend. See StatusAttempting.
+func (s *Store) UnresolvedAttempts(ctx context.Context) (map[int]uint64, error) {
+	q := `SELECT c.cell, c.generation FROM cell_txs c
+	      JOIN (SELECT cell, MAX(generation) AS g FROM cell_txs GROUP BY cell) m
+	        ON m.cell = c.cell AND m.g = c.generation
+	      WHERE c.status = ?`
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), string(StatusAttempting))
+	if err != nil {
+		return nil, fmt.Errorf("history: query unresolved attempts: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[int]uint64{}
+	for rows.Next() {
+		var cell int
+		var generation uint64
+		if err := rows.Scan(&cell, &generation); err != nil {
+			return nil, fmt.Errorf("history: scan unresolved attempt: %w", err)
+		}
+		out[cell] = generation
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history: query unresolved attempts: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteAttempt removes a write-ahead record, and only a write-ahead record.
+//
+// The status check is the whole safety property: if the attempt has since been
+// resolved into a real transaction, this must not touch it.
+func (s *Store) DeleteAttempt(ctx context.Context, generation uint64, cell int) error {
+	q := `DELETE FROM cell_txs WHERE generation = ? AND cell = ? AND status = ?`
+	_, err := s.db.ExecContext(ctx, s.rebind(q), generation, cell, string(StatusAttempting))
+	if err != nil {
+		return fmt.Errorf("history: delete attempt for cell %d generation %d: %w", cell, generation, err)
+	}
+	return nil
 }

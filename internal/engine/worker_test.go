@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+
+	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
 // atGeneration puts every cell at g, as if the automaton had reached it.
@@ -222,5 +224,112 @@ func TestStepAdvancesTheTargetByOne(t *testing.T) {
 
 	if got != 6 {
 		t.Errorf("target = %d after one step from generation 5, want 6", got)
+	}
+}
+
+// TestWriteAheadSurvivesACrash covers the failure that killed cells 34 and 51.
+//
+// Signing broadcasts, so there is a window where a transition is on the network
+// and we have not recorded it. A process killed there used to come back a
+// generation behind, re-spend an output the network had already consumed, and
+// lose the cell to a rejection indistinguishable from a real failure.
+//
+// The write-ahead record turns that into a cell the operator can see.
+func TestWriteAheadSurvivesACrash(t *testing.T) {
+	e := newTestEngine(t, 4)
+	ctx := t.Context()
+
+	// A transition is about to be attempted for cell 2...
+	if err := e.store.RecordTx(ctx, history.CellTx{
+		Generation: 300, Cell: 2, Status: history.StatusAttempting,
+	}); err != nil {
+		t.Fatalf("record attempt: %v", err)
+	}
+	// ...and the process dies here, before the result is known.
+
+	uncertain, err := e.store.UnresolvedAttempts(ctx)
+	if err != nil {
+		t.Fatalf("unresolved attempts: %v", err)
+	}
+	if got, ok := uncertain[2]; !ok || got != 300 {
+		t.Fatalf("unresolved attempts = %v, want cell 2 at generation 300", uncertain)
+	}
+}
+
+// A resolved attempt is not a crash, and must not stall the cell.
+func TestResolvedAttemptIsNotFlagged(t *testing.T) {
+	e := newTestEngine(t, 4)
+	ctx := t.Context()
+
+	for _, tx := range []history.CellTx{
+		{Generation: 300, Cell: 2, Status: history.StatusAttempting},
+		{Generation: 300, Cell: 2, TxID: "abc", Status: history.StatusBroadcast},
+	} {
+		if err := e.store.RecordTx(ctx, tx); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+
+	uncertain, err := e.store.UnresolvedAttempts(ctx)
+	if err != nil {
+		t.Fatalf("unresolved attempts: %v", err)
+	}
+	if len(uncertain) != 0 {
+		t.Errorf("unresolved attempts = %v, want none once the attempt resolved", uncertain)
+	}
+}
+
+// A failure before broadcast leaves the UTXO untouched, so its write-ahead
+// record must be retracted — otherwise every funding shortfall would look like
+// a lost broadcast at the next startup, and shortfalls are routine.
+func TestRetractedAttemptIsNotFlagged(t *testing.T) {
+	e := newTestEngine(t, 4)
+	ctx := t.Context()
+
+	if err := e.store.RecordTx(ctx, history.CellTx{
+		Generation: 300, Cell: 2, Status: history.StatusAttempting,
+	}); err != nil {
+		t.Fatalf("record attempt: %v", err)
+	}
+	e.retractAttempt(300, 2)
+
+	uncertain, err := e.store.UnresolvedAttempts(ctx)
+	if err != nil {
+		t.Fatalf("unresolved attempts: %v", err)
+	}
+	if len(uncertain) != 0 {
+		t.Errorf("unresolved attempts = %v, want none after retraction", uncertain)
+	}
+}
+
+// Retraction must never touch a real transaction.
+func TestRetractionSparesARealTransaction(t *testing.T) {
+	e := newTestEngine(t, 4)
+	ctx := t.Context()
+
+	if err := e.store.RecordGeneration(ctx, 300, "00"); err != nil {
+		t.Fatalf("record generation: %v", err)
+	}
+	if err := e.store.RecordTx(ctx, history.CellTx{
+		Generation: 300, Cell: 2, TxID: "abc", Status: history.StatusBroadcast,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	e.retractAttempt(300, 2)
+
+	gens, err := e.store.Load(ctx, 300, 1)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	found := false
+	for _, g := range gens {
+		for _, c := range g.Cells {
+			if c.Cell == 2 && c.TxID == "abc" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("retraction deleted a broadcast transaction; it must only remove write-ahead records")
 	}
 }
