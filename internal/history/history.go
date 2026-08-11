@@ -132,6 +132,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS cell_txs_inflight ON cell_txs (updated_at)
 		   WHERE status NOT IN ('mined', 'failed')`,
 		`CREATE INDEX IF NOT EXISTS cell_txs_txid ON cell_txs (txid)`,
+		// Single-writer election. See AcquireLease.
+		`CREATE TABLE IF NOT EXISTS leases (
+			name       TEXT PRIMARY KEY,
+			owner      TEXT NOT NULL,
+			expires_at TIMESTAMP NOT NULL
+		)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
@@ -363,6 +369,46 @@ func (s *Store) DeleteAttempt(ctx context.Context, generation uint64, cell int) 
 	_, err := s.db.ExecContext(ctx, s.rebind(q), generation, cell, string(StatusAttempting))
 	if err != nil {
 		return fmt.Errorf("history: delete attempt for cell %d generation %d: %w", cell, generation, err)
+	}
+	return nil
+}
+
+// AcquireLease takes or renews a named lease, returning whether it is held.
+//
+// This is what makes the automaton safe to deploy as anything but a single
+// hand-run process. The engine owns 128 live UTXO chains; two instances
+// advancing them would double-spend every one, and a rolling update runs two
+// pods at once by design. Whoever holds the lease advances; everyone else
+// serves the UI read-only.
+//
+// The lease is reclaimable rather than permanent, so a pod that dies without
+// releasing does not wedge the deployment — the next one takes over once the
+// lease expires. That means ttl must comfortably exceed the renewal interval.
+func (s *Store) AcquireLease(ctx context.Context, name, owner string, ttl time.Duration) (bool, error) {
+	now := time.Now().UTC()
+	// The WHERE on the conflict path is the mutual exclusion: an existing lease
+	// is only taken over by its current owner (a renewal) or once it has
+	// expired. Anything else leaves the row untouched and reports 0 rows.
+	q := `INSERT INTO leases (name, owner, expires_at) VALUES (?, ?, ?)
+	      ON CONFLICT (name) DO UPDATE SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at
+	      WHERE leases.owner = EXCLUDED.owner OR leases.expires_at < ?`
+	res, err := s.db.ExecContext(ctx, s.rebind(q), name, owner, now.Add(ttl), now)
+	if err != nil {
+		return false, fmt.Errorf("history: acquire lease %q: %w", name, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("history: acquire lease %q: %w", name, err)
+	}
+	return n > 0, nil
+}
+
+// ReleaseLease gives up a lease we hold, so a successor need not wait out the
+// TTL after a clean shutdown.
+func (s *Store) ReleaseLease(ctx context.Context, name, owner string) error {
+	q := `DELETE FROM leases WHERE name = ? AND owner = ?`
+	if _, err := s.db.ExecContext(ctx, s.rebind(q), name, owner); err != nil {
+		return fmt.Errorf("history: release lease %q: %w", name, err)
 	}
 	return nil
 }

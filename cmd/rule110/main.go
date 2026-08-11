@@ -405,7 +405,22 @@ func cmdRun(args []string) error {
 	if *start {
 		eng.SetMode(engine.ModeRunning)
 	}
-	go eng.Run(ctx)
+	// Wait for the engine to drain on the way out. Run returns once every cell
+	// worker has stopped at its loop top and the tips have been checkpointed;
+	// exiting before that would abandon in-flight transitions in exactly the
+	// window that costs a cell — see history.StatusAttempting.
+	engineDone := make(chan struct{})
+	go func() {
+		defer close(engineDone)
+		eng.Run(ctx)
+	}()
+	defer func() {
+		select {
+		case <-engineDone:
+		case <-time.After(20 * time.Second):
+			logger.Warn("engine did not drain in time; exiting anyway")
+		}
+	}()
 
 	// The pool only drains on its own: throughput change deliberately does not
 	// recycle back into it, so without the keeper the automaton runs until the

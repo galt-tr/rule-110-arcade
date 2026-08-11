@@ -42,6 +42,7 @@ func (e *Engine) Run(ctx context.Context) {
 	go e.reconcile(ctx)
 	go e.checkpoint(ctx)
 	go e.clock(ctx)
+	go e.holdLease(ctx)
 
 	done := make(chan struct{})
 	for cell := range e.state.Cells {
@@ -113,6 +114,11 @@ func (e *Engine) turnReady(cell int) bool {
 		maxDeep = e.chain.Config.MaxUnconfirmedDepth
 	)
 	e.mu.RUnlock()
+
+	if !e.isLeader() {
+		// Another instance owns these chains. See holdLease.
+		return false
+	}
 
 	if mode == ModeStarved {
 		// Starved is not a dead end. One cell at a time retries, and a success
@@ -475,4 +481,84 @@ func (e *Engine) wake() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.notify()
+}
+
+const (
+	// leaseName is the single-writer election key, and leaseTTL how long a lease
+	// survives without renewal.
+	//
+	// The TTL is the failover delay: a pod that dies without releasing keeps the
+	// automaton stopped for this long. Short enough that a crash is not an
+	// outage, long enough that a slow renewal does not hand the chains to a
+	// second writer while the first is still using them.
+	leaseName = "rule110-engine"
+	leaseTTL  = 30 * time.Second
+
+	// leaseRenew must be comfortably shorter than leaseTTL so a transient
+	// database hiccup does not cost the lease.
+	leaseRenew = 10 * time.Second
+)
+
+// holdLease keeps this instance's claim on being the single writer.
+//
+// The engine owns 128 live UTXO chains. Two instances advancing them would
+// double-spend every one, and a Kubernetes rolling update runs two pods at once
+// by design — so this is not a theoretical concern, it is the default
+// deployment behaviour. An instance without the lease still serves the UI and
+// still applies statuses; it just does not advance anything.
+func (e *Engine) holdLease(ctx context.Context) {
+	tick := time.NewTicker(leaseRenew)
+	defer tick.Stop()
+
+	for {
+		held, err := e.store.AcquireLease(ctx, leaseName, e.owner, leaseTTL)
+		if err != nil {
+			// Treat an unreachable store as not holding it. Advancing on the
+			// assumption that we still do is the one outcome worth avoiding.
+			held = false
+			e.logger.ErrorContext(ctx, "lease renewal failed", "err", err)
+		}
+		e.setLeader(held)
+
+		select {
+		case <-ctx.Done():
+			// Hand over promptly on a clean shutdown rather than making the
+			// successor wait out the whole TTL.
+			if e.isLeader() {
+				rel, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if err := e.store.ReleaseLease(rel, leaseName, e.owner); err != nil {
+					e.logger.Error("release lease", "err", err)
+				}
+			}
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// setLeader records whether this instance may advance cells, logging only the
+// transitions.
+func (e *Engine) setLeader(held bool) {
+	e.mu.Lock()
+	was := e.leader
+	e.leader = held
+	e.mu.Unlock()
+
+	if was == held {
+		return
+	}
+	if held {
+		e.logger.Info("acquired the writer lease; advancing", "owner", e.owner)
+	} else {
+		e.logger.Warn("lost the writer lease; serving read-only", "owner", e.owner)
+	}
+	e.wake()
+}
+
+// isLeader reports whether this instance holds the writer lease.
+func (e *Engine) isLeader() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.leader
 }

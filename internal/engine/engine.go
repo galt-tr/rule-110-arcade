@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -84,6 +85,10 @@ type Snapshot struct {
 	ArcadeURL   string       `json:"arcadeUrl"`
 	GenesisTxID string       `json:"genesisTxid"`
 	LastError   string       `json:"lastError,omitempty"`
+
+	// Leader reports whether this instance holds the single-writer lease. Only
+	// the leader advances cells; everyone else serves the UI read-only.
+	Leader bool `json:"leader"`
 
 	// Starved reports that the automaton has stopped for want of funding, with
 	// the address to send coin to. It resumes unattended once coin arrives.
@@ -161,6 +166,11 @@ type Engine struct {
 	// dirty marks tip state that the checkpointer has not written yet.
 	dirty bool
 
+	// owner identifies this instance in the single-writer election, and leader
+	// records whether it currently holds it. See holdLease.
+	owner  string
+	leader bool
+
 	// waitingOnCoin holds the cells currently retrying a funding shortfall, so
 	// coin contention is visible rather than looking like a slow network.
 	waitingOnCoin map[int]bool
@@ -207,6 +217,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, sta
 		halted:        make(map[int]bool),
 		waitingOnCoin: make(map[int]bool),
 		store:         store,
+		owner:         instanceOwner(),
 	}
 	// The address is what an operator needs the moment funding runs out, so
 	// resolve it now rather than when the automaton is already stopped.
@@ -391,6 +402,7 @@ func (e *Engine) Snapshot() Snapshot {
 
 		Starved:        e.mode == ModeStarved,
 		FundingAddress: e.fundingAddress,
+		Leader:         e.leader,
 		Lag:            e.target - min(e.target, frontier),
 		Depth:          e.deepestLocked(),
 		WaitingOnCoin:  len(e.waitingOnCoin),
@@ -496,4 +508,16 @@ func (e *Engine) persist(c history.CellTx) {
 		e.logger.Error("persist cell transaction",
 			"generation", c.Generation, "cell", c.Cell, "err", err)
 	}
+}
+
+// instanceOwner is this process's identity in the single-writer election.
+//
+// The hostname is the pod name under Kubernetes, which makes the lease row
+// legible to an operator; the suffix keeps two processes on one host distinct.
+func instanceOwner() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }

@@ -51,7 +51,33 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/control", s.handleControl)
+	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /readyz", s.handleReady)
 	return mux
+}
+
+// handleHealth is liveness: the process is up and serving. It deliberately
+// says nothing about the automaton — restarting a pod does not conjure coin or
+// mine a block, so tying liveness to progress would just add a crash loop to
+// whatever was already wrong.
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// handleReady is readiness: this instance can serve.
+//
+// Neither starved nor read-only is unready. A starved automaton is waiting for
+// a payment and its UI is exactly where an operator finds the address to send
+// it to; an instance without the writer lease is serving correct history and is
+// the standby that takes over. Failing readiness in either case would remove
+// the endpoint that explains the situation.
+func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	snap := s.engine.Snapshot()
+	writeJSON(w, map[string]any{
+		"status":  "ok",
+		"leader":  snap.Leader,
+		"starved": snap.Starved,
+	})
 }
 
 func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {

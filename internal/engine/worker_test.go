@@ -333,3 +333,76 @@ func TestRetractionSparesARealTransaction(t *testing.T) {
 		t.Error("retraction deleted a broadcast transaction; it must only remove write-ahead records")
 	}
 }
+
+// TestNonLeaderNeverAdvances is the guard against the worst failure this
+// deployment can have.
+//
+// The engine owns 128 live UTXO chains. Two instances advancing them would
+// double-spend every one, and a Kubernetes rolling update runs two pods at once
+// by design — so an instance that does not hold the lease must not advance a
+// cell for any reason, whatever the clock says.
+func TestNonLeaderNeverAdvances(t *testing.T) {
+	e := newTestEngine(t, 4)
+	atGeneration(e, 10)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 1000 // the clock is asking for plenty
+	e.leader = false
+	e.mu.Unlock()
+
+	for cell := range 4 {
+		if e.turnReady(cell) {
+			t.Fatalf("cell %d advanced without holding the writer lease", cell)
+		}
+	}
+
+	// Starved must not be a way around it either: the probe would broadcast.
+	e.mu.Lock()
+	e.mode = ModeStarved
+	e.mu.Unlock()
+	if e.turnReady(0) {
+		t.Error("a starved non-leader probed anyway; the probe broadcasts a real transaction")
+	}
+
+	e.setLeader(true)
+	if !e.turnReady(0) {
+		t.Error("the leader must advance once it holds the lease")
+	}
+}
+
+// TestLeaseIsExclusiveAndReclaimable pins the two properties the deployment
+// depends on: only one holder at a time, and a dead holder does not wedge the
+// automaton forever.
+func TestLeaseIsExclusiveAndReclaimable(t *testing.T) {
+	e := newTestEngine(t, 2)
+	ctx := t.Context()
+
+	held, err := e.store.AcquireLease(ctx, "l", "pod-a", time.Minute)
+	if err != nil || !held {
+		t.Fatalf("first acquire: held=%v err=%v", held, err)
+	}
+	if held, err := e.store.AcquireLease(ctx, "l", "pod-b", time.Minute); err != nil || held {
+		t.Fatalf("a second instance took a live lease: held=%v err=%v", held, err)
+	}
+	if held, err := e.store.AcquireLease(ctx, "l", "pod-a", time.Minute); err != nil || !held {
+		t.Fatalf("the holder could not renew: held=%v err=%v", held, err)
+	}
+
+	// An expired lease is reclaimable, or a crashed pod would stop the
+	// automaton permanently.
+	if _, err := e.store.AcquireLease(ctx, "l", "pod-a", -time.Second); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if held, err := e.store.AcquireLease(ctx, "l", "pod-b", time.Minute); err != nil || !held {
+		t.Fatalf("an expired lease was not reclaimed: held=%v err=%v", held, err)
+	}
+
+	// A clean release hands over without waiting out the TTL.
+	if err := e.store.ReleaseLease(ctx, "l", "pod-b"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if held, err := e.store.AcquireLease(ctx, "l", "pod-a", time.Minute); err != nil || !held {
+		t.Fatalf("a released lease was not available: held=%v err=%v", held, err)
+	}
+}

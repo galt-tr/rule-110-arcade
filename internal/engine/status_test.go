@@ -34,6 +34,9 @@ func newTestEngine(t *testing.T, cells int, gens ...uint64) *Engine {
 		txIndex:   map[string]txLoc{},
 		halted:    map[int]bool{},
 		lastMined: map[int]uint64{},
+		owner:     "test",
+		// The tests exercise a writer; the non-leader path has its own test.
+		leader: true,
 	}
 	for _, n := range gens {
 		g := Generation{Number: n, Cells: make([]CellTx, cells)}
