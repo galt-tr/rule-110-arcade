@@ -46,6 +46,8 @@ func run(args []string) error {
 		return cmdFund(args[1:])
 	case "genesis":
 		return cmdGenesis(args[1:])
+	case "step":
+		return cmdStep(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -61,6 +63,7 @@ func usage() {
   rule110 address [flags]   print the funding address for this deployment
   rule110 fund [flags]      internalize a mined funding transaction
   rule110 genesis [flags]   create generation 0: one UTXO per cell
+  rule110 step [flags]      advance one cell by one generation
   rule110 help              show this message
 
 Common flags:
@@ -248,6 +251,68 @@ func cmdGenesis(args []string) error {
 	fmt.Printf("cells:          %d (vout 0..%d)\n", state.Cells, state.Cells-1)
 	fmt.Printf("row:            %s\n", state.RowHex)
 	fmt.Printf("balance after:  %d sat (spent %d)\n", after, balance-after)
+	return nil
+}
+
+func cmdStep(args []string) error {
+	cfg := chain.DefaultConfig()
+	fs := flag.NewFlagSet("step", flag.ContinueOnError)
+	network := bindCommon(fs, &cfg)
+	cell := fs.Int("cell", 0, "which cell to advance")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	net, err := parseNetwork(*network)
+	if err != nil {
+		return err
+	}
+	cfg.Network = net
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	c, err := chain.Open(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(ctx) }()
+
+	state, err := c.LoadState()
+	if err != nil {
+		return err
+	}
+	compiled, err := cellscript.Compile(state.Cells, state.Rule)
+	if err != nil {
+		return err
+	}
+	row, err := state.Row()
+	if err != nil {
+		return err
+	}
+	next := state.Rule.Step(row)
+
+	fmt.Printf("cell %d, generation %d -> %d\n", *cell, state.Generation, state.Generation+1)
+	fmt.Printf("row  %s -> %s\n", row.Hex(), next.Hex())
+	fmt.Printf("bit  %v -> %v\n", row.Get(*cell), next.Get(*cell))
+
+	res, err := c.AdvanceCell(ctx, compiled, state, *cell, next)
+	if err != nil {
+		return err
+	}
+
+	// Record this cell's new tip. The row advances only once every cell has.
+	state.Chains[*cell] = chain.CellChain{
+		Cell: *cell, TxID: res.TxID, Vout: 0,
+		Satoshis: state.Chains[*cell].Satoshis, Generation: res.Generation,
+		BEEFHex: res.BEEFHex,
+	}
+	if err := c.SaveState(state); err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Printf("STEP TXID: %s\n", res.TxID)
+	fmt.Printf("size:      %d bytes\n", res.SizeBytes)
 	return nil
 }
 

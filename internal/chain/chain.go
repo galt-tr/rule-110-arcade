@@ -62,13 +62,25 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		return nil, fmt.Errorf("chain: headers client: %w", err)
 	}
 
+	// The covenant reconstructs exactly two outputs — its continuation and one
+	// P2PKH change — so every cell transition must have exactly one change
+	// output. The default change basket splits change up to 8 ways for privacy,
+	// which produces a 9-output transaction the covenant cannot satisfy.
+	//
+	// This costs parallelism: the change pool grows one coin per transaction
+	// rather than eight, so many concurrent cells will contend for coins. The
+	// throughput strategy's denominated fuel pool is the real answer at scale.
+	changeBasket := defs.DefaultChangeBasket()
+	changeBasket.MaxChangeOutputsPerTx = 1
+
 	extra := []storage.Option{
 		// Rúnar covenants contain OP_2MUL, which Genesis-era rules reject. See
 		// the cellscript package docs.
 		storage.WithChronicleOpcodes(),
+		storage.WithChangeBasket(changeBasket),
 	}
 	if !cfg.Chronicle {
-		extra = nil
+		extra = []storage.Option{storage.WithChangeBasket(changeBasket)}
 	}
 
 	provider, closeProvider, err := perfprovider.New(ctx, logger, perfprovider.Config{
