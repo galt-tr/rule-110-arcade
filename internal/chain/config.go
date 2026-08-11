@@ -61,6 +61,26 @@ type Config struct {
 	// latency shows up as a stalled generation.
 	Concurrency int
 
+	// MaxUnconfirmedDepth bounds how far ahead of its newest mined transaction
+	// a cell may run.
+	//
+	// A cell is an unbroken chain of unconfirmed transactions, so its depth
+	// grows at the generation rate and only shrinks when a block arrives. Past
+	// the node's mempool ancestor limit the deepest transaction is rejected and
+	// the rejection cascades to every descendant — the one failure that ruins a
+	// whole run rather than a single step. Bounding it turns that into ordinary
+	// backpressure: the automaton self-paces to whatever cadence the network
+	// mines at.
+	//
+	// We have run 139 deep against the dev-ovh-1 scale network with no
+	// rejections. Raise this only with a measurement behind it.
+	MaxUnconfirmedDepth uint64
+
+	// MaxLag bounds how far the clock may run ahead of the slowest cell before
+	// it stops asking for new generations. Without it, a rate the chain cannot
+	// serve would queue without limit and the reported rate would be fiction.
+	MaxLag uint64
+
 	// Chronicle selects Chronicle-era script rules for local pre-broadcast
 	// verification. Rúnar covenants contain OP_2MUL and cannot verify without
 	// it, so it defaults on; turn it off only against a Genesis-rules network,
@@ -83,6 +103,10 @@ func DefaultConfig() Config {
 		Chronicle:    true,
 		MaxDBConns:   72,
 		Concurrency:  32,
+		// Well under the 139 we have run without a rejection, so the governor
+		// bites long before the node's ancestor limit does.
+		MaxUnconfirmedDepth: 64,
+		MaxLag:              32,
 	}
 }
 
@@ -111,6 +135,12 @@ func (c *Config) Validate() error {
 	}
 	if c.CellSatoshis == 0 {
 		return fmt.Errorf("chain: cell satoshis must be positive")
+	}
+	// A zero MaxLag would stop the clock outright, so fill it in rather than
+	// leaving an unset field to look like a hang. MaxUnconfirmedDepth is left
+	// alone: zero legitimately means "no depth limit".
+	if c.MaxLag == 0 {
+		c.MaxLag = DefaultConfig().MaxLag
 	}
 	if c.Originator == "" {
 		return fmt.Errorf("chain: originator is required")

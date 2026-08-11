@@ -37,29 +37,32 @@ type StepResult struct {
 // inputs and change. CreateAction returns the assembled-but-unsigned
 // transaction, we build the unlocking script against it, and SignAction
 // completes it.
+// It takes the cell's tip by value rather than the whole State: cells advance
+// concurrently and independently, so reaching into shared state here would be a
+// race waiting to happen. The caller reads the tip under its own lock.
 func (c *Chain) AdvanceCell(
 	ctx context.Context,
 	compiled *cellscript.Compiled,
-	chainState *State,
-	cell int,
-	_ ca.Row,
+	tip CellChain,
+	cells int,
+	rule ca.Rule,
 ) (*StepResult, error) {
-	if cell < 0 || cell >= len(chainState.Chains) {
+	cell := tip.Cell
+	if cell < 0 || cell >= cells {
 		return nil, fmt.Errorf("chain: cell %d out of range", cell)
 	}
-	tip := chainState.Chains[cell]
 
 	// Use the row THIS cell's UTXO carries, not the global row. They diverge
 	// whenever cells sit at different generations, and the mismatch surfaces
 	// only as OP_CHECKSIGVERIFY failing on a script that looks correct.
-	currentRow, err := tip.Row(chainState.Cells)
+	currentRow, err := tip.Row(cells)
 	if err != nil {
 		return nil, fmt.Errorf("chain: cell %d: %w", cell, err)
 	}
 
 	// Derive the successor from this cell's own row so a skewed cell still
 	// advances correctly rather than being dragged to another generation's row.
-	nextRow := chainState.Rule.Step(currentRow)
+	nextRow := rule.Step(currentRow)
 
 	nextLock, err := compiled.LockingScript(cell, nextRow)
 	if err != nil {
@@ -111,9 +114,14 @@ func (c *Chain) AdvanceCell(
 		},
 	}
 
-	created, err := retryUntilFunded(ctx, func() (*sdk.CreateActionResult, error) {
-		return c.Wallet.CreateAction(ctx, args, c.Config.Originator)
-	})
+	// Deliberately NOT wrapped in retryUntilFunded. A cell transition is one
+	// step of a continuous pipeline, so a funding shortfall has to surface
+	// immediately and let the caller decide: retry after a few milliseconds if
+	// it is the fuel pool briefly draining, or stop the whole automaton if the
+	// deployment is genuinely out of coin. Blocking here for minutes instead
+	// wedges the cell — and with it the automaton's frontier — while reporting
+	// nothing at all.
+	created, err := c.Wallet.CreateAction(ctx, args, c.Config.Originator)
 	if err != nil {
 		return nil, fmt.Errorf("chain: create step action for cell %d: %w", cell, err)
 	}

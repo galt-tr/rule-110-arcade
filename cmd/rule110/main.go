@@ -313,7 +313,7 @@ func cmdStep(args []string) error {
 	fmt.Printf("row  %s -> %s\n", row.Hex(), next.Hex())
 	fmt.Printf("bit  %v -> %v\n", row.Get(*cell), next.Get(*cell))
 
-	res, err := c.AdvanceCell(ctx, compiled, state, *cell, next)
+	res, err := c.AdvanceCell(ctx, compiled, tip, state.Cells, state.Rule)
 	if err != nil {
 		return err
 	}

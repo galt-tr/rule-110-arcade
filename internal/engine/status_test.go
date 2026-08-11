@@ -24,15 +24,16 @@ func newTestEngine(t *testing.T, cells int, gens ...uint64) *Engine {
 	t.Cleanup(func() { _ = store.Close() })
 
 	e := &Engine{
-		chain:   &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
-		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-		state:   &chain.State{Cells: cells, Chains: make([]chain.CellChain, cells)},
-		store:   store,
-		mode:    ModePaused,
-		rate:    1,
-		changed: make(chan struct{}),
-		txIndex: map[string]txLoc{},
-		halted:  map[int]bool{},
+		chain:     &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		state:     &chain.State{Cells: cells, Chains: make([]chain.CellChain, cells)},
+		store:     store,
+		mode:      ModePaused,
+		rate:      1,
+		changed:   make(chan struct{}),
+		txIndex:   map[string]txLoc{},
+		halted:    map[int]bool{},
+		lastMined: map[int]uint64{},
 	}
 	for _, n := range gens {
 		g := Generation{Number: n, Cells: make([]CellTx, cells)}

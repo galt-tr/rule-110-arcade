@@ -159,6 +159,13 @@ func (e *Engine) applyStatus(txid string, status arcade.Status, extra string) {
 
 	cell.State = next
 
+	// A mined transaction shortens that cell's unconfirmed chain, which is what
+	// releases its depth gate. Without this the governor would clamp every cell
+	// shut after MaxUnconfirmedDepth generations and never reopen.
+	if next == TxMined && loc.generation > e.lastMined[loc.cell] {
+		e.lastMined[loc.cell] = loc.generation
+	}
+
 	// Persist before anything else: this status is the fact worth keeping.
 	e.persistStatus(txid, next, status, extra)
 

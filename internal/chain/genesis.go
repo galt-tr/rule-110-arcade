@@ -117,6 +117,15 @@ func (c CellChain) tipBEEF() ([]byte, error) {
 // Row returns the state's current row.
 func (s *State) Row() (ca.Row, error) { return ca.SeedHex(s.Cells, s.RowHex) }
 
+// Clone returns a deep copy, so the caller can write it to disk without
+// holding a lock over the encode.
+func (s *State) Clone() *State {
+	out := *s
+	out.Chains = make([]CellChain, len(s.Chains))
+	copy(out.Chains, s.Chains)
+	return &out
+}
+
 // Genesis creates generation 0: one output per cell, all carrying the same row.
 //
 // Every cell is created in a SINGLE transaction, which is what establishes the

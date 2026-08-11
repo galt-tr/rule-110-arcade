@@ -9,7 +9,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -45,6 +44,13 @@ const (
 	ModePaused Mode = "paused"
 	// ModeRunning advances continuously at Rate generations per second.
 	ModeRunning Mode = "running"
+	// ModeStarved means there is not enough coin to buy another transaction.
+	//
+	// This is a normal state, not a failure. Cells stop at their next loop top,
+	// every chain is left on a signed and broadcast tip, and the status stream,
+	// reconciler and UI keep running so in-flight work still settles. The clock
+	// resumes on its own once the balance poller sees funds again.
+	ModeStarved Mode = "starved"
 )
 
 // CellTx is one cell's transaction in one generation.
@@ -77,6 +83,27 @@ type Snapshot struct {
 	ArcadeURL   string       `json:"arcadeUrl"`
 	GenesisTxID string       `json:"genesisTxid"`
 	LastError   string       `json:"lastError,omitempty"`
+
+	// Starved reports that the automaton has stopped for want of funding, with
+	// the address to send coin to. It resumes unattended once coin arrives.
+	Starved        bool   `json:"starved"`
+	FundingAddress string `json:"fundingAddress,omitempty"`
+
+	// Lag is how far the clock has run ahead of the slowest cell, and Depth the
+	// deepest unconfirmed chain. Both are backpressure made visible: lag means
+	// the cells cannot keep up with the requested rate, depth means mining
+	// cannot keep up with the cells.
+	Lag   uint64 `json:"lag"`
+	Depth uint64 `json:"depth"`
+
+	// WaitingOnCoin is how many cells are currently retrying a funding
+	// shortfall.
+	//
+	// A transient shortfall is not an error and is not worth a log line, but it
+	// must not therefore be invisible: a contended coin pool looks exactly like
+	// a slow network from the outside, and we lost real time to that. If this
+	// sits high, the fuel pool is the bottleneck, not the chain.
+	WaitingOnCoin int `json:"waitingOnCoin"`
 }
 
 // maxHistory bounds how many generations the UI keeps.
@@ -107,6 +134,36 @@ type Engine struct {
 	totalTx   int
 	lastError string
 
+	// target is the generation every cell is being asked to reach.
+	//
+	// This is what replaces the per-generation barrier. The clock raises it and
+	// each cell chases it independently, so a slow cell falls behind instead of
+	// holding all the others up, and the automaton's rate stops being set by its
+	// worst cell. The clock refuses to run more than maxLag ahead of the slowest
+	// cell, so "cannot keep up" shows as a bounded lag rather than a runaway.
+	target uint64
+
+	// lastMined[cell] is the newest generation of that cell known to be in a
+	// block. tip − lastMined is that cell's unconfirmed chain depth, which the
+	// worker bounds: a cell is an unbroken chain of unconfirmed transactions,
+	// and past the node's mempool ancestor limit the deepest one is rejected and
+	// the rejection cascades to every descendant.
+	lastMined map[int]uint64
+
+	// starvedSince is when funding ran out, or the zero time. lastProbe paces
+	// the single retry that resumes the automaton once coin arrives.
+	starvedSince time.Time
+	lastProbe    time.Time
+	// fundingAddress is shown to the operator while starved.
+	fundingAddress string
+
+	// dirty marks tip state that the checkpointer has not written yet.
+	dirty bool
+
+	// waitingOnCoin holds the cells currently retrying a funding shortfall, so
+	// coin contention is visible rather than looking like a slow network.
+	waitingOnCoin map[int]bool
+
 	// txIndex maps a broadcast txid back to the cell that produced it, so
 	// arcade's status stream can be reflected in the diagram.
 	txIndex map[string]txLoc
@@ -118,8 +175,6 @@ type Engine struct {
 	// holds everything.
 	store *history.Store
 
-	// stepReq carries manual single-step requests.
-	stepReq chan struct{}
 	// changed is closed and replaced whenever the snapshot changes, so
 	// subscribers can wait without polling.
 	changed chan struct{}
@@ -138,17 +193,32 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, sta
 		return nil, err
 	}
 	e := &Engine{
-		chain:    c,
-		compiled: compiled,
-		logger:   logger,
-		state:    state,
-		mode:     ModePaused,
-		rate:     1,
-		stepReq:  make(chan struct{}, 1),
-		changed:  make(chan struct{}),
-		txIndex:  make(map[string]txLoc),
-		halted:   make(map[int]bool),
-		store:    store,
+		chain:         c,
+		compiled:      compiled,
+		logger:        logger,
+		state:         state,
+		mode:          ModePaused,
+		rate:          1,
+		target:        state.Generation,
+		lastMined:     make(map[int]uint64, state.Cells),
+		changed:       make(chan struct{}),
+		txIndex:       make(map[string]txLoc),
+		halted:        make(map[int]bool),
+		waitingOnCoin: make(map[int]bool),
+		store:         store,
+	}
+	// The address is what an operator needs the moment funding runs out, so
+	// resolve it now rather than when the automaton is already stopped.
+	if target, err := chain.FundingAddress(c.Identity, c.Config.Network); err == nil {
+		e.fundingAddress = target.Address
+	} else {
+		logger.Warn("could not derive the funding address", "err", err)
+	}
+	// Nothing is known to be mined until the status stream says so; starting at
+	// the recorded generation means the depth gate opens rather than clamping
+	// every cell shut on a fresh start.
+	for i := range state.Cells {
+		e.lastMined[i] = state.Chains[i].Generation
 	}
 	loaded, err := loadHistory(ctx, store, state)
 	if err != nil {
@@ -273,12 +343,13 @@ func (e *Engine) Snapshot() Snapshot {
 		}
 	}
 
+	frontier := e.frontierLocked()
 	return Snapshot{
 		Cells:       e.state.Cells,
 		Rule:        int(e.state.Rule),
 		Mode:        e.mode,
 		Rate:        e.rate,
-		Generation:  e.state.Generation,
+		Generation:  frontier,
 		History:     history,
 		Balance:     e.balance,
 		TotalTx:     e.totalTx,
@@ -287,6 +358,12 @@ func (e *Engine) Snapshot() Snapshot {
 		ArcadeURL:   e.chain.Config.ArcadeURL,
 		GenesisTxID: e.state.GenesisTxID,
 		LastError:   e.lastError,
+
+		Starved:        e.mode == ModeStarved,
+		FundingAddress: e.fundingAddress,
+		Lag:            e.target - min(e.target, frontier),
+		Depth:          e.deepestLocked(),
+		WaitingOnCoin:  len(e.waitingOnCoin),
 	}
 }
 
@@ -304,9 +381,23 @@ func (e *Engine) notify() {
 }
 
 // SetMode starts or stops the clock.
+//
+// Resuming from starved clears the shortfall timer too, so an operator who has
+// just sent coin does not have to wait out the grace period.
 func (e *Engine) SetMode(m Mode) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if m == ModeRunning {
+		e.starvedSince = time.Time{}
+		if e.mode == ModeStarved {
+			e.lastError = ""
+		}
+		// Never leave the clock behind the cells: a target stale from a previous
+		// pause would make every worker idle until it caught up.
+		if f := e.frontierLocked(); e.target < f {
+			e.target = f
+		}
+	}
 	e.mode = m
 	e.notify()
 }
@@ -319,165 +410,17 @@ func (e *Engine) SetRate(r float64) {
 	e.notify()
 }
 
-// Step requests exactly one generation. Non-blocking: a request already queued
-// is left as-is rather than stacking up behind a slow generation.
-func (e *Engine) Step() {
-	select {
-	case e.stepReq <- struct{}{}:
-	default:
-	}
-}
-
-// Run drives the clock until ctx is cancelled.
-func (e *Engine) Run(ctx context.Context) {
-	go e.trackBalance(ctx)
-	go e.watchStatus(ctx)
-	go e.reconcile(ctx)
-
-	for {
-		e.mu.RLock()
-		mode, rate := e.mode, e.rate
-		e.mu.RUnlock()
-
-		if mode == ModeRunning {
-			e.advance(ctx)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(float64(time.Second) / rate)):
-			}
-			continue
-		}
-
-		// Paused: wait for a manual step, a mode change, or cancellation.
-		select {
-		case <-ctx.Done():
-			return
-		case <-e.stepReq:
-			e.advance(ctx)
-		case <-e.Changed():
-		}
-	}
-}
-
-// advance moves every cell forward one generation.
+// Step asks every cell to advance exactly one generation.
 //
-// Cells are independent, so they go out concurrently; the generation is
-// recorded as soon as the rows are known, and each cell's transaction status is
-// filled in as it completes.
-func (e *Engine) advance(ctx context.Context) {
-	e.mu.Lock()
-	state := e.state
-	row, err := state.Row()
-	if err != nil {
-		e.lastError = err.Error()
-		e.mu.Unlock()
-		return
-	}
-	next := state.Rule.Step(row)
-	gen := Generation{
-		Number: state.Generation + 1,
-		RowHex: next.Hex(),
-		Cells:  make([]CellTx, state.Cells),
-	}
-
-	// A generation number repeats whenever a previous attempt left a cell
-	// unproved, because the row only advances once every cell has proved its
-	// bit. Carry that attempt's cells forward: the ones that succeeded already
-	// spent their UTXO and must not be advanced a second time, or they run
-	// ahead of the automaton and the diagram stops describing the chain.
-	genIdx := indexOfGeneration(e.history, gen.Number)
-	if genIdx >= 0 {
-		copy(gen.Cells, e.history[genIdx].Cells)
-	}
-
-	todo := make([]int, 0, state.Cells)
-	for i := range state.Cells {
-		switch {
-		case e.halted[i]:
-			gen.Cells[i] = CellTx{Cell: i, State: TxFailed, Err: "chain halted by an earlier rejection"}
-		case state.Chains[i].Generation >= gen.Number:
-			// Already proved this generation: its UTXO is spent, so advancing
-			// it again would run the cell ahead of the automaton. The copy
-			// above carried the transaction that proved it.
-			//
-			// Anything else the copy carried is stale and must not stand. In
-			// particular a recorded failure cannot survive here: the chain
-			// moved past this generation, so whatever went wrong was made good,
-			// and leaving the cell failed would block the row forever — every
-			// later attempt skips the cell, so nothing would ever clear it.
-			if gen.Cells[i].State == "" || gen.Cells[i].State == TxFailed {
-				gen.Cells[i] = CellTx{Cell: i, State: TxPending}
-			}
-		default:
-			gen.Cells[i] = CellTx{Cell: i, State: TxPending}
-			todo = append(todo, i)
-		}
-	}
-
-	if genIdx >= 0 {
-		e.history[genIdx] = gen
-	} else {
-		e.history = append(e.history, gen)
-		if len(e.history) > maxHistory {
-			e.history = e.history[len(e.history)-maxHistory:]
-		}
-		genIdx = len(e.history) - 1
-	}
-	e.notify()
-	e.mu.Unlock()
-
-	if err := e.store.RecordGeneration(ctx, gen.Number, gen.RowHex); err != nil {
-		e.logger.ErrorContext(ctx, "persist generation", "generation", gen.Number, "err", err)
-	}
-
-	// Bound the fan-out. Releasing all N cells at once does not make a
-	// single-writer store faster — the writers just queue on a lock, and the
-	// whole generation stalls behind the resulting contention.
-	limit := e.chain.Config.Concurrency
-	if limit <= 0 {
-		limit = state.Cells
-	}
-	sem := make(chan struct{}, limit)
-
-	var wg sync.WaitGroup
-	for _, cell := range todo {
-		wg.Add(1)
-		go func(cell int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			res, err := e.chain.AdvanceCell(ctx, e.compiled, state, cell, next)
-			e.recordCell(gen.Number, cell, res, err)
-		}(cell)
-	}
-	wg.Wait()
-
-	// The row only advances once every cell has proved its bit. A cell that
-	// failed leaves the automaton where it was, so the failure is visible
-	// rather than silently skipped.
+// With no barrier there is nothing to trigger, only a target to raise: each cell
+// chases it at its own pace and the step completes when the slowest one lands.
+func (e *Engine) Step() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	failed := 0
-	if idx := indexOfGeneration(e.history, gen.Number); idx >= 0 {
-		for _, c := range e.history[idx].Cells {
-			if c.State == TxFailed {
-				failed++
-			}
-		}
-	}
-	if failed == 0 {
-		// Clear the banner: whatever went wrong on an earlier attempt at this
-		// generation has been made good, and leaving the message up reports a
-		// failure that no longer exists.
-		e.lastError = ""
-		e.state.Generation = gen.Number
-		e.state.RowHex = gen.RowHex
-		if err := e.chain.SaveState(e.state); err != nil {
-			e.lastError = err.Error()
-		}
+	if e.target < e.frontierLocked()+1 {
+		e.target = e.frontierLocked() + 1
 	} else {
-		e.lastError = fmt.Sprintf("generation %d: %d/%d cells failed", gen.Number, failed, state.Cells)
+		e.target++
 	}
 	e.notify()
 }
@@ -494,53 +437,6 @@ func indexOfGeneration(gens []Generation, number uint64) int {
 		}
 	}
 	return -1
-}
-
-// recordCell stores one cell's outcome and updates its chain tip.
-//
-// generation is the generation NUMBER, resolved to a slice index here under the
-// lock. A cell can finish long after its generation was appended, and the
-// history trim shifts every index, so an index captured at dispatch time would
-// address the wrong row by the time the result lands.
-func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, err error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// The store is the durable record and does not depend on the window, so it
-	// is written whether or not the generation is still displayable.
-	genIdx := indexOfGeneration(e.history, generation)
-
-	if err != nil {
-		if genIdx >= 0 {
-			e.history[genIdx].Cells[cell] = CellTx{Cell: cell, State: TxFailed, Err: err.Error()}
-		}
-		e.persist(history.CellTx{
-			Generation: generation, Cell: cell,
-			Status: history.StatusFailed, Err: err.Error(),
-		})
-		e.notify()
-		return
-	}
-
-	if genIdx >= 0 {
-		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
-	}
-	e.indexTx(res.TxID, generation, cell)
-	e.persist(history.CellTx{
-		Generation: generation, Cell: cell,
-		TxID: res.TxID, Status: history.StatusBroadcast,
-	})
-	e.state.Chains[cell] = chain.CellChain{
-		Cell:       cell,
-		TxID:       res.TxID,
-		Vout:       0,
-		Satoshis:   e.state.Chains[cell].Satoshis,
-		Generation: res.Generation,
-		RowHex:     res.RowHex,
-		RawTxHex:   res.RawTxHex,
-	}
-	e.totalTx++
-	e.notify()
 }
 
 // trackBalance refreshes the reported balance periodically.
