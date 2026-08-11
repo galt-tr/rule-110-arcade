@@ -21,9 +21,12 @@ type StepResult struct {
 	Generation uint64
 	TxID       string
 	RowHex     string
-	BEEFHex    string
-	SizeBytes  int
-	FeePaid    uint64
+
+	// RawTxHex is this transaction alone, which is all the successor needs to
+	// spend it. Deliberately not the atomic BEEF — see CellChain.RawTxHex.
+	RawTxHex  string
+	SizeBytes int
+	FeePaid   uint64
 }
 
 // AdvanceCell moves one cell forward a generation.
@@ -62,9 +65,9 @@ func (c *Chain) AdvanceCell(
 	if err != nil {
 		return nil, err
 	}
-	inputBEEF, err := hex.DecodeString(tip.BEEFHex)
+	inputBEEF, err := tip.tipBEEF()
 	if err != nil {
-		return nil, fmt.Errorf("chain: decode stored BEEF for cell %d: %w", cell, err)
+		return nil, err
 	}
 	txid, err := chainhash.NewHashFromHex(tip.TxID)
 	if err != nil {
@@ -169,7 +172,7 @@ func (c *Chain) AdvanceCell(
 		Generation: nextGen,
 		RowHex:     nextRow.Hex(),
 		TxID:       signed.Txid.String(),
-		BEEFHex:    hex.EncodeToString(signed.Tx),
+		RawTxHex:   hex.EncodeToString(finalTx.Bytes()),
 		SizeBytes:  len(finalTx.Bytes()),
 	}, nil
 }

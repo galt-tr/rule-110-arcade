@@ -70,10 +70,48 @@ type CellChain struct {
 	// OP_CHECKSIGVERIFY that gives no hint why.
 	RowHex string `json:"row"`
 
-	// BEEFHex is the atomic BEEF of the transaction that created this UTXO.
-	// CreateAction needs it as InputBEEF when spending: the source transaction
-	// is NOT recovered automatically for caller-provided inputs.
-	BEEFHex string `json:"beef"`
+	// RawTxHex is the transaction that created this UTXO, and ONLY that
+	// transaction. CreateAction needs the source transaction as InputBEEF when
+	// spending, because it is not recovered automatically for caller-provided
+	// inputs — but it needs nothing behind it.
+	//
+	// Storing the atomic BEEF here instead is the single most expensive mistake
+	// this program has made. A cell is an unbroken self-spending chain, so its
+	// BEEF carries every generation back to genesis: it grew ~11 KB per
+	// generation per cell, reached 694 KB per cell by generation 63, and was
+	// handed straight back to CreateAction as InputBEEF, which storage then
+	// persisted twice per transaction (known_txs and transactions). The state
+	// file hit 175 MB and the wallet database 12 GB after 8,000 transactions.
+	// The successor is rebuilt from these bytes on demand by tipBEEF.
+	RawTxHex string `json:"rawTx"`
+
+	// LegacyBEEFHex reads the field RawTxHex replaced, so an automaton written
+	// by an older build keeps running instead of needing a fresh genesis.
+	// LoadState converts it and drops it. Transitional: delete this along with
+	// the state file itself.
+	LegacyBEEFHex string `json:"beef,omitempty"`
+}
+
+// tipBEEF wraps the tip transaction in a BEEF carrying nothing but itself.
+//
+// That is all CreateAction wants: storage's hydrateInputs only looks the source
+// transaction up by hash, and arcade validates the extended-format broadcast
+// from each input's inline prevout, so the ancestry behind it is never read. The
+// create path does not call VerifyBeef at all — only InternalizeAction does.
+func (c CellChain) tipBEEF() ([]byte, error) {
+	raw, err := hex.DecodeString(c.RawTxHex)
+	if err != nil {
+		return nil, fmt.Errorf("chain: decode stored transaction for cell %d: %w", c.Cell, err)
+	}
+	beef := transaction.NewBeefV2()
+	if _, err := beef.MergeRawTx(raw, nil); err != nil {
+		return nil, fmt.Errorf("chain: wrap tip transaction for cell %d: %w", c.Cell, err)
+	}
+	out, err := beef.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("chain: encode tip beef for cell %d: %w", c.Cell, err)
+	}
+	return out, nil
 }
 
 // Row returns the state's current row.
@@ -142,13 +180,18 @@ func (c *Chain) Genesis(ctx context.Context, compiled *cellscript.Compiled, seed
 	}
 
 	txid := res.Txid.String()
-	beefHex := hex.EncodeToString(res.Tx)
 
 	// Confirm the broadcast transaction really carries our scripts where we
 	// expect them, rather than trusting the ordering option.
 	if err := verifyGenesisLayout(res.Tx, compiled, seed, c.Config.CellSatoshis); err != nil {
 		return nil, err
 	}
+
+	genesisTx, err := transaction.NewTransactionFromBEEF(res.Tx)
+	if err != nil {
+		return nil, fmt.Errorf("chain: re-parse genesis transaction: %w", err)
+	}
+	rawHex := hex.EncodeToString(genesisTx.Bytes())
 
 	state := &State{
 		Cells:       n,
@@ -167,7 +210,7 @@ func (c *Chain) Genesis(ctx context.Context, compiled *cellscript.Compiled, seed
 			Satoshis:   c.Config.CellSatoshis,
 			Generation: 0,
 			RowHex:     seed.Hex(),
-			BEEFHex:    beefHex,
+			RawTxHex:   rawHex,
 		}
 	}
 	if err := c.SaveState(state); err != nil {
@@ -249,7 +292,38 @@ func (c *Chain) LoadState() (*State, error) {
 		}
 		s.Chains[i].RowHex = s.RowHex
 	}
+	if err := s.migrateLegacyBEEF(); err != nil {
+		return nil, err
+	}
 	return &s, nil
+}
+
+// migrateLegacyBEEF converts tips still carrying a whole atomic BEEF into the
+// single transaction that is all a successor actually needs.
+//
+// The tip transaction is the subject of its own atomic BEEF, so this is a
+// lossless projection — it just discards the ancestry that should never have
+// been kept. On a 128-cell automaton at generation 63 it turns a 175 MB state
+// file into roughly 512 KB.
+func (s *State) migrateLegacyBEEF() error {
+	for i := range s.Chains {
+		c := &s.Chains[i]
+		if c.RawTxHex != "" || c.LegacyBEEFHex == "" {
+			c.LegacyBEEFHex = ""
+			continue
+		}
+		beefBytes, err := hex.DecodeString(c.LegacyBEEFHex)
+		if err != nil {
+			return fmt.Errorf("chain: decode legacy beef for cell %d: %w", c.Cell, err)
+		}
+		tx, err := transaction.NewTransactionFromBEEF(beefBytes)
+		if err != nil {
+			return fmt.Errorf("chain: parse legacy beef for cell %d: %w", c.Cell, err)
+		}
+		c.RawTxHex = hex.EncodeToString(tx.Bytes())
+		c.LegacyBEEFHex = ""
+	}
+	return nil
 }
 
 // fundingWait bounds how long to wait for the monitor to make coins claimable.

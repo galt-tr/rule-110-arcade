@@ -514,7 +514,7 @@ func (e *Engine) recordCell(genIdx, cell int, res *chain.StepResult, err error) 
 		Satoshis:   e.state.Chains[cell].Satoshis,
 		Generation: res.Generation,
 		RowHex:     res.RowHex,
-		BEEFHex:    res.BEEFHex,
+		RawTxHex:   res.RawTxHex,
 	}
 	e.totalTx++
 	e.notify()

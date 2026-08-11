@@ -322,7 +322,7 @@ func cmdStep(args []string) error {
 	state.Chains[*cell] = chain.CellChain{
 		Cell: *cell, TxID: res.TxID, Vout: 0,
 		Satoshis: state.Chains[*cell].Satoshis, Generation: res.Generation,
-		RowHex: res.RowHex, BEEFHex: res.BEEFHex,
+		RowHex: res.RowHex, RawTxHex: res.RawTxHex,
 	}
 	if err := c.SaveState(state); err != nil {
 		return err
