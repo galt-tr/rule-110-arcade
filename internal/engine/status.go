@@ -56,23 +56,81 @@ func rank(s TxState) int {
 // rejected cell would keep showing as broadcast and, worse, the engine would go
 // on trying to spend an output that does not exist.
 func (e *Engine) watchStatus(ctx context.Context) {
+	// lastEventID is the replay cursor. Reconnecting with an empty cursor would
+	// resume from "now" and silently drop every event that fired while we were
+	// disconnected — precisely the updates most likely to matter, since a
+	// dropped stream and a burst of status changes tend to coincide.
+	lastEventID := ""
+
 	for {
-		err := e.chain.Oracle.StreamStatus(ctx, "", func(ev arcade.StatusEvent) error {
+		err := e.chain.Oracle.StreamStatus(ctx, lastEventID, func(ev arcade.StatusEvent) error {
+			if ev.ID != "" {
+				lastEventID = ev.ID
+			}
 			e.applyStatus(ev.Record.TxID, ev.Record.Status, ev.Record.ExtraInfo)
 			return nil
 		})
 		if ctx.Err() != nil {
 			return
 		}
-		// The stream ends on network trouble or an arcade restart. Reconnect:
-		// losing it silently is how the UI ends up frozen on stale statuses.
-		e.logger.WarnContext(ctx, "arcade status stream ended, reconnecting", "err", err)
+		e.logger.WarnContext(ctx, "arcade status stream ended, reconnecting",
+			"err", err, "resumeFrom", lastEventID)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// reconcile polls arcade for cells that are still non-terminal.
+//
+// The event stream is the fast path, not the authority. Events can be missed
+// across a reconnect gap, and a status that fired before we ever subscribed is
+// never replayed at all. Polling the transactions we are still waiting on makes
+// the displayed state converge on arcade's own view rather than drifting from
+// it — which is the difference between a diagram that is merely live and one
+// that is correct.
+func (e *Engine) reconcile(ctx context.Context) {
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+
+		for txid, loc := range e.unsettled() {
+			rec, err := e.chain.Oracle.GetTx(ctx, txid)
+			if err != nil || rec == nil {
+				continue // not known to arcade yet; the stream may still deliver it
+			}
+			e.applyStatus(rec.TxID, rec.Status, rec.ExtraInfo)
+			_ = loc
+		}
+	}
+}
+
+// unsettled returns the transactions whose cells have not reached a terminal
+// state, so reconciliation only asks about what it does not already know.
+func (e *Engine) unsettled() map[string]txLoc {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	out := make(map[string]txLoc)
+	for txid, loc := range e.txIndex {
+		if loc.genIdx >= len(e.history) {
+			continue
+		}
+		switch e.history[loc.genIdx].Cells[loc.cell].State {
+		case TxMined, TxFailed:
+			continue // terminal; arcade cannot tell us anything new
+		}
+		out[txid] = loc
+	}
+	return out
 }
 
 // applyStatus records a status update against whichever cell owns the txid.

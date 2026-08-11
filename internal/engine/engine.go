@@ -217,6 +217,7 @@ func (e *Engine) Step() {
 func (e *Engine) Run(ctx context.Context) {
 	go e.trackBalance(ctx)
 	go e.watchStatus(ctx)
+	go e.reconcile(ctx)
 
 	for {
 		e.mu.RLock()
