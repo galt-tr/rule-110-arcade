@@ -121,9 +121,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated_at TIMESTAMP NOT NULL,
 			PRIMARY KEY (generation, cell)
 		)`,
-		// The hot query is "which transactions are still in flight", so index
-		// the non-terminal set rather than scanning the whole history.
-		`CREATE INDEX IF NOT EXISTS cell_txs_status ON cell_txs (status)`,
+		// The hot query is "which transactions are still in flight". A plain
+		// index on status does NOT serve it: the predicate is `status NOT IN
+		// (terminal...)`, which no planner will satisfy from an index on a
+		// low-cardinality column, so it degrades to a full scan of the whole
+		// history — minutes, every ten seconds, once the table is large.
+		//
+		// A PARTIAL index over exactly the non-terminal rows does serve it, and
+		// it stays small because it only ever holds the in-flight set.
+		`CREATE INDEX IF NOT EXISTS cell_txs_inflight ON cell_txs (updated_at)
+		   WHERE status NOT IN ('mined', 'failed')`,
 		`CREATE INDEX IF NOT EXISTS cell_txs_txid ON cell_txs (txid)`,
 	}
 	for _, q := range stmts {
@@ -196,10 +203,30 @@ func (s *Store) UpdateStatus(ctx context.Context, txid string, status Status, er
 // no further attention from the status stream or the reconciler.
 func (s *Store) Unsettled(ctx context.Context) ([]CellTx, error) {
 	q := `SELECT generation, cell, txid, status, err FROM cell_txs
-	      WHERE status NOT IN (?, ?) ORDER BY generation, cell`
-	rows, err := s.db.QueryContext(ctx, s.rebind(q), string(StatusMined), string(StatusFailed))
+	      WHERE status NOT IN ('mined', 'failed') ORDER BY generation, cell`
+	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("history: query unsettled: %w", err)
+	}
+	defer rows.Close()
+	return scanCells(rows)
+}
+
+// Stale returns up to limit transactions that have been in flight for longer
+// than age, oldest first.
+//
+// This is what the reconciler polls, and both bounds matter. The age filter
+// keeps it off transactions the status stream is about to resolve on its own —
+// polling those is pure duplicated work. The limit keeps one pass bounded: the
+// unfiltered set grows with the automaton, and a reconciler whose pass takes
+// longer than its own interval never finishes a pass again.
+func (s *Store) Stale(ctx context.Context, age time.Duration, limit int) ([]CellTx, error) {
+	q := `SELECT generation, cell, txid, status, err FROM cell_txs
+	      WHERE status NOT IN ('mined', 'failed') AND txid <> '' AND updated_at < ?
+	      ORDER BY updated_at LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), time.Now().UTC().Add(-age), limit)
+	if err != nil {
+		return nil, fmt.Errorf("history: query stale: %w", err)
 	}
 	defer rows.Close()
 	return scanCells(rows)

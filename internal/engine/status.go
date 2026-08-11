@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
@@ -112,22 +113,18 @@ func (e *Engine) reconcile(ctx context.Context) {
 
 		// The store is the authority on what is still in flight, so a restart
 		// resumes reconciling transactions this process never broadcast.
-		pending, err := e.store.Unsettled(ctx)
+		//
+		// Bounded on both axes. Only transactions that have been in flight a
+		// while are worth polling — the stream resolves the rest on its own —
+		// and only a batch of them per pass, because the in-flight set grows
+		// with the automaton and a pass that outlasts its own interval never
+		// completes again.
+		pending, err := e.store.Stale(ctx, reconcileAfter, reconcileLimit)
 		if err != nil {
-			e.logger.ErrorContext(ctx, "load unsettled", "err", err)
+			e.logger.ErrorContext(ctx, "load stale transactions", "err", err)
 			continue
 		}
-		for _, c := range pending {
-			txid := c.TxID
-			if txid == "" {
-				continue
-			}
-			rec, err := e.chain.Oracle.GetTx(ctx, txid)
-			if err != nil || rec == nil {
-				continue // not known to arcade yet; the stream may still deliver it
-			}
-			e.applyStatus(rec.TxID, rec.Status, rec.ExtraInfo)
-		}
+		e.reconcileBatch(ctx, pending)
 	}
 }
 
@@ -214,4 +211,51 @@ func (e *Engine) indexTx(txid string, generation uint64, cell int) {
 		e.txIndex = make(map[string]txLoc)
 	}
 	e.txIndex[txid] = txLoc{generation: generation, cell: cell}
+}
+
+const (
+	// reconcileAfter is how long a transaction must have been in flight before
+	// the reconciler polls it. Below this the status stream is still the fast
+	// path and polling only duplicates its work.
+	reconcileAfter = 90 * time.Second
+
+	// reconcileLimit bounds one pass, and reconcileWorkers bounds how many
+	// arcade lookups are in flight at once. Serially, a pass over a large
+	// in-flight set takes hours; the point of the reconciler is to converge on
+	// arcade, and a pass that never finishes converges on nothing.
+	reconcileLimit   = 512
+	reconcileWorkers = 16
+)
+
+// reconcileBatch polls arcade for a batch of in-flight transactions.
+func (e *Engine) reconcileBatch(ctx context.Context, pending []history.CellTx) {
+	if len(pending) == 0 {
+		return
+	}
+	work := make(chan history.CellTx)
+	var wg sync.WaitGroup
+	for range min(reconcileWorkers, len(pending)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range work {
+				rec, err := e.chain.Oracle.GetTx(ctx, c.TxID)
+				if err != nil || rec == nil {
+					continue // not known to arcade yet; the stream may still deliver it
+				}
+				e.applyStatus(rec.TxID, rec.Status, rec.ExtraInfo)
+			}
+		}()
+	}
+	for _, c := range pending {
+		select {
+		case <-ctx.Done():
+			close(work)
+			wg.Wait()
+			return
+		case work <- c:
+		}
+	}
+	close(work)
+	wg.Wait()
 }
