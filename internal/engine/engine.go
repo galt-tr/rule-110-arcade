@@ -32,12 +32,9 @@ const (
 	TxSeen TxState = "seen"
 	// TxMined means it is in a block.
 	TxMined TxState = "mined"
-	// TxFailed means it was rejected; that cell's chain has halted.
+	// TxFailed means it was rejected, or never got far enough to broadcast;
+	// that cell's chain has halted.
 	TxFailed TxState = "failed"
-	// TxHistoric means the generation was replayed from the seed after a
-	// restart: the row is exact, but the transaction that proved it is not in
-	// this process's memory.
-	TxHistoric TxState = "historic"
 )
 
 // Mode is the clock's behaviour.
@@ -372,18 +369,50 @@ func (e *Engine) advance(ctx context.Context) {
 		RowHex: next.Hex(),
 		Cells:  make([]CellTx, state.Cells),
 	}
+
+	// A generation number repeats whenever a previous attempt left a cell
+	// unproved, because the row only advances once every cell has proved its
+	// bit. Carry that attempt's cells forward: the ones that succeeded already
+	// spent their UTXO and must not be advanced a second time, or they run
+	// ahead of the automaton and the diagram stops describing the chain.
+	genIdx := indexOfGeneration(e.history, gen.Number)
+	if genIdx >= 0 {
+		copy(gen.Cells, e.history[genIdx].Cells)
+	}
+
+	todo := make([]int, 0, state.Cells)
 	for i := range state.Cells {
-		if e.halted[i] {
+		switch {
+		case e.halted[i]:
 			gen.Cells[i] = CellTx{Cell: i, State: TxFailed, Err: "chain halted by an earlier rejection"}
-			continue
+		case state.Chains[i].Generation >= gen.Number:
+			// Already proved this generation: its UTXO is spent, so advancing
+			// it again would run the cell ahead of the automaton. The copy
+			// above carried the transaction that proved it.
+			//
+			// Anything else the copy carried is stale and must not stand. In
+			// particular a recorded failure cannot survive here: the chain
+			// moved past this generation, so whatever went wrong was made good,
+			// and leaving the cell failed would block the row forever — every
+			// later attempt skips the cell, so nothing would ever clear it.
+			if gen.Cells[i].State == "" || gen.Cells[i].State == TxFailed {
+				gen.Cells[i] = CellTx{Cell: i, State: TxPending}
+			}
+		default:
+			gen.Cells[i] = CellTx{Cell: i, State: TxPending}
+			todo = append(todo, i)
 		}
-		gen.Cells[i] = CellTx{Cell: i, State: TxPending}
 	}
-	e.history = append(e.history, gen)
-	if len(e.history) > maxHistory {
-		e.history = e.history[len(e.history)-maxHistory:]
+
+	if genIdx >= 0 {
+		e.history[genIdx] = gen
+	} else {
+		e.history = append(e.history, gen)
+		if len(e.history) > maxHistory {
+			e.history = e.history[len(e.history)-maxHistory:]
+		}
+		genIdx = len(e.history) - 1
 	}
-	genIdx := len(e.history) - 1
 	e.notify()
 	e.mu.Unlock()
 
@@ -401,13 +430,7 @@ func (e *Engine) advance(ctx context.Context) {
 	sem := make(chan struct{}, limit)
 
 	var wg sync.WaitGroup
-	for cell := range state.Cells {
-		e.mu.RLock()
-		skip := e.halted[cell]
-		e.mu.RUnlock()
-		if skip {
-			continue
-		}
+	for _, cell := range todo {
 		wg.Add(1)
 		go func(cell int) {
 			defer wg.Done()
@@ -431,6 +454,10 @@ func (e *Engine) advance(ctx context.Context) {
 		}
 	}
 	if failed == 0 {
+		// Clear the banner: whatever went wrong on an earlier attempt at this
+		// generation has been made good, and leaving the message up reports a
+		// failure that no longer exists.
+		e.lastError = ""
 		e.state.Generation = gen.Number
 		e.state.RowHex = gen.RowHex
 		if err := e.chain.SaveState(e.state); err != nil {
@@ -440,6 +467,20 @@ func (e *Engine) advance(ctx context.Context) {
 		e.lastError = fmt.Sprintf("generation %d: %d/%d cells failed", gen.Number, failed, state.Cells)
 	}
 	e.notify()
+}
+
+// indexOfGeneration finds a generation by number, or -1. It scans from the end
+// because the only caller is looking for the newest generation.
+func indexOfGeneration(gens []Generation, number uint64) int {
+	for i := len(gens) - 1; i >= 0; i-- {
+		if gens[i].Number == number {
+			return i
+		}
+		if gens[i].Number < number {
+			break // ordered by number: no earlier entry can match
+		}
+	}
+	return -1
 }
 
 // recordCell stores one cell's outcome and updates its chain tip.

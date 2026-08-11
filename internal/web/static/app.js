@@ -14,13 +14,13 @@ function color(name, fallback) {
   return CSS.getPropertyValue(name).trim() || fallback;
 }
 const COLOR = {
-  dead:      color('--dead', '#161b26'),
-  pending:   color('--pending', '#2d3550'),
-  broadcast: color('--broadcast', '#3f6fa8'),
-  seen:      color('--seen', '#62a8e8'),
-  mined:     color('--mined', '#b9e0ff'),
-  failed:    color('--failed', '#e0575b'),
-  historic:  color('--historic', '#4a5570'),
+  dead:       color('--dead', '#161b26'),
+  pending:    color('--pending', '#2d3550'),
+  broadcast:  color('--broadcast', '#3f6fa8'),
+  seen:       color('--seen', '#62a8e8'),
+  mined:      color('--mined', '#b9e0ff'),
+  failed:     color('--failed', '#e0575b'),
+  failedDead: color('--failed-dead', '#5c2226'),
 };
 
 const canvas = document.getElementById('grid');
@@ -75,11 +75,15 @@ function draw(s) {
     const gen = s.history[g];
     const bits = bitsOf(gen.row, s.cells);
     for (let c = 0; c < s.cells; c++) {
-      // A dead cell is background regardless of its transaction: the pattern
-      // has to stay readable as a pattern first.
-      if (!bits[c]) continue;
       const state = gen.cells[c] ? gen.cells[c].state : 'pending';
-      ctx.fillStyle = COLOR[state] || COLOR.pending;
+      // A dead cell is background regardless of its transaction — the pattern
+      // has to stay readable as a pattern first — with one exception. A failure
+      // is a fact about the chain, not about the automaton, and roughly half of
+      // all cells are dead, so hiding those failures lets a stalled run look
+      // perfectly healthy. Draw them in a dark red instead: visible as a
+      // defect, too dim to be mistaken for a live cell.
+      if (!bits[c] && state !== 'failed') continue;
+      ctx.fillStyle = bits[c] ? (COLOR[state] || COLOR.pending) : COLOR.failedDead;
       // Cell 0 is drawn rightmost so the row reads like the printed form,
       // highest index leftmost.
       const x = (s.cells - 1 - c) * cellPx;
@@ -106,7 +110,7 @@ function renderStats(s) {
     ['generation', s.generation],
     ['transactions', s.totalTx.toLocaleString()],
     ['balance', sat + ' sat'],
-    ['chains', s.consensus ? `${s.cells}/${s.cells} agree` : `${s.failedCells} halted`],
+    ['chains', s.consensus ? `${s.cells}/${s.cells} agree` : `${s.failedCells} unproved`],
   ];
   document.getElementById('stats').innerHTML = rows
     .map(([k, v]) => `<span class="stat"><span>${k}</span> <b>${v}</b></span>`)

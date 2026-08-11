@@ -14,9 +14,10 @@
   --seen: #62a8e8;
   --mined: #b9e0ff;
   --failed: #e0575b;
-  /* replayed from the seed after a restart: the row is exact, the proving
-     transaction is not in memory */
-  --historic: #4a5570;
+  /* A failure on a DEAD cell. It has to be visible — a stalled run must not
+     look healthy — but not bright, or the diagram would read it as alive and
+     the pattern would be wrong. */
+  --failed-dead: #5c2226;
 }
 
 * { box-sizing: border-box; }
@@ -132,7 +133,7 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 .sw.seen { background: var(--seen); }
 .sw.mined { background: var(--mined); }
 .sw.failed { background: var(--failed); }
-.sw.historic { background: var(--historic); }
+.sw.failed-dead { background: var(--failed-dead); }
 
 #err {
   background: #3a1c22;

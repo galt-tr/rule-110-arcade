@@ -89,10 +89,16 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 	changeBasket.MaxChangeOutputsPerTx = 1
 
 	extra := []storage.Option{
-		// Rúnar covenants contain OP_2MUL, which Genesis-era rules reject. See
-		// the cellscript package docs.
-		storage.WithChronicleOpcodes(),
 		storage.WithChangeBasket(changeBasket),
+
+		// One change output is not enough — there must also always BE one. The
+		// funder otherwise drops it whenever the leftover falls under the dust
+		// floor (40 satoshis at 100 sat/kB) and donates it to the miner, which
+		// leaves a one-output transaction the covenant cannot spend. That is not
+		// rare: every transition returns its change as a smaller coin, so the
+		// pool grinds down and the totals land in the sub-dust window more and
+		// more often as the automaton runs.
+		storage.WithRequiredChangeOutput(),
 
 		// Bound BEEF assembly to the directly-spent coin instead of walking the
 		// whole ancestry. Each cell is an unbroken self-spending chain that
@@ -104,8 +110,10 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		// serialises a generation that is otherwise fully parallel.
 		storage.WithSendConcurrency(64),
 	}
-	if !cfg.Chronicle {
-		extra = []storage.Option{storage.WithChangeBasket(changeBasket)}
+	if cfg.Chronicle {
+		// Rúnar covenants contain OP_2MUL, which Genesis-era rules reject. See
+		// the cellscript package docs.
+		extra = append(extra, storage.WithChronicleOpcodes())
 	}
 
 	pcfg := perfprovider.Config{
