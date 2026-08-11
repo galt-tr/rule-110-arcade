@@ -1,0 +1,5 @@
+/rule110
+/spike
+*.db
+*.db-*
+/data/
