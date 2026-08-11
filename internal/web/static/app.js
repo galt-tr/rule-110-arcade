@@ -5,14 +5,21 @@
 // the pattern behind the leading edge — the automaton and the chain are the
 // same picture.
 
+// Read the palette from CSS so the stylesheet stays the single source of
+// truth, but fall back to literals: an empty custom property is silently
+// ignored by fillStyle, which would leave cells drawn in whatever colour was
+// set last rather than failing visibly.
 const CSS = getComputedStyle(document.documentElement);
+function color(name, fallback) {
+  return CSS.getPropertyValue(name).trim() || fallback;
+}
 const COLOR = {
-  dead:      CSS.getPropertyValue('--dead').trim(),
-  pending:   CSS.getPropertyValue('--pending').trim(),
-  broadcast: CSS.getPropertyValue('--broadcast').trim(),
-  seen:      CSS.getPropertyValue('--seen').trim(),
-  mined:     CSS.getPropertyValue('--mined').trim(),
-  failed:    CSS.getPropertyValue('--failed').trim(),
+  dead:      color('--dead', '#161b26'),
+  pending:   color('--pending', '#2d3550'),
+  broadcast: color('--broadcast', '#3f6fa8'),
+  seen:      color('--seen', '#62a8e8'),
+  mined:     color('--mined', '#b9e0ff'),
+  failed:    color('--failed', '#e0575b'),
 };
 
 const canvas = document.getElementById('grid');

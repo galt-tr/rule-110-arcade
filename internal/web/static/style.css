@@ -73,6 +73,9 @@ canvas { display: block; image-rendering: pixelated; }
   color: var(--muted);
   pointer-events: none;
 }
+/* An explicit display beats the UA stylesheet's [hidden] { display: none },
+   so the attribute has to be honoured here or the overlay never goes away. */
+#empty[hidden] { display: none; }
 
 .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 button {
