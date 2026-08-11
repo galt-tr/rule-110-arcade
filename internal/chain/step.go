@@ -122,7 +122,18 @@ func (c *Chain) AdvanceCell(
 			CustomInstructions: string(instructions),
 			Tags:               []string{"rule110", "step"},
 		}},
-		Labels: []string{"rule110", "step"},
+		// The per-cell label is what makes a lost transition findable again.
+		//
+		// If this process dies between signing (which broadcasts) and recording,
+		// the transaction exists on chain and nowhere in our record — and the
+		// only public way back to it is ListActions, which filters by label and
+		// nothing else. Labelling by cell turns "what did cell 34 actually do?"
+		// into two paginated calls; without it, a lost tip is unrecoverable
+		// through any supported API and the cell is gone for good.
+		//
+		// "step" was replaced rather than added to: it distinguished nothing, so
+		// this costs no extra label rows.
+		Labels: []string{"rule110", CellLabel(cell)},
 		Options: &sdk.CreateActionOptions{
 			// The continuation MUST be vout 0: the covenant rebuilds it there.
 			RandomizeOutputs:       &no,
@@ -255,3 +266,10 @@ func (c *Chain) unlockingScriptEstimate(compiled *cellscript.Compiled, cell int,
 	total := (len(codePart) + 5) + (len(row) + 2) + 22 + 6 + 6 + (preimage + 5)
 	return uint32(total)
 }
+
+// CellLabel is the wallet label carrying a transition's cell.
+//
+// Zero-padded so the labels sort in cell order, which matters only for a human
+// reading them, and fixed-width so a prefix match cannot confuse cell 3 with
+// cell 30.
+func CellLabel(cell int) string { return fmt.Sprintf("rule110-cell-%03d", cell) }
