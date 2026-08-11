@@ -90,6 +90,14 @@ type Snapshot struct {
 	// the leader advances cells; everyone else serves the UI read-only.
 	Leader bool `json:"leader"`
 
+	// HaltedCells is how many cells can never advance again.
+	//
+	// Distinct from FailedCells, which counts failures in the newest row only
+	// and therefore reads zero the moment the window moves on. A halted cell is
+	// permanent until its tip is recovered, so this is the number that says
+	// whether the ring is being eroded.
+	HaltedCells int `json:"haltedCells"`
+
 	// Starved reports that the automaton has stopped for want of funding, with
 	// the address to send coin to. It resumes unattended once coin arrives.
 	Starved        bool   `json:"starved"`
@@ -403,6 +411,7 @@ func (e *Engine) Snapshot() Snapshot {
 		Starved:        e.mode == ModeStarved,
 		FundingAddress: e.fundingAddress,
 		Leader:         e.leader,
+		HaltedCells:    len(e.halted),
 		Lag:            e.target - min(e.target, frontier),
 		Depth:          e.deepestLocked(),
 		WaitingOnCoin:  len(e.waitingOnCoin),

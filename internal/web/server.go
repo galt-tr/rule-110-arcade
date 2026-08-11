@@ -53,6 +53,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/control", s.handleControl)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /readyz", s.handleReady)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	return mux
 }
 
@@ -194,5 +195,48 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		http.Error(w, "encode error", http.StatusInternalServerError)
+	}
+}
+
+// handleMetrics exposes the automaton in Prometheus text format.
+//
+// Hand-rolled rather than pulling in a client library: it is a dozen gauges off
+// a snapshot the engine already builds, and the exposition format is stable.
+//
+// The choice of what to expose is deliberate. Every number here is one this
+// session actually needed to diagnose something: a stalled automaton with no
+// errors turned out to be 127 cells queueing for one coin, and a frontier that
+// would not move turned out to be the depth governor doing its job. Those are
+// indistinguishable from the outside without waiting_on_coin and depth.
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	snap := s.engine.Snapshot()
+	bool01 := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
+
+	metrics := []struct {
+		name, help, kind string
+		value            float64
+	}{
+		{"rule110_generation", "Newest generation every cell has proved.", "gauge", float64(snap.Generation)},
+		{"rule110_transactions_total", "Cell transitions broadcast since startup.", "counter", float64(snap.TotalTx)},
+		{"rule110_cells", "Cells in the ring.", "gauge", float64(snap.Cells)},
+		{"rule110_halted_cells", "Cells that can never advance again until their tip is recovered.", "gauge", float64(snap.HaltedCells)},
+		{"rule110_failed_cells", "Failures in the newest generation.", "gauge", float64(snap.FailedCells)},
+		{"rule110_lag_generations", "How far the clock has run ahead of the slowest cell.", "gauge", float64(snap.Lag)},
+		{"rule110_unconfirmed_depth", "Deepest unconfirmed chain, against the mempool ancestor limit.", "gauge", float64(snap.Depth)},
+		{"rule110_waiting_on_coin", "Cells retrying a funding shortfall.", "gauge", float64(snap.WaitingOnCoin)},
+		{"rule110_balance_satoshis", "Wallet balance.", "gauge", float64(snap.Balance)},
+		{"rule110_starved", "1 when stopped for want of funding.", "gauge", float64(bool01(snap.Starved))},
+		{"rule110_leader", "1 when this instance holds the single-writer lease.", "gauge", float64(bool01(snap.Leader))},
+		{"rule110_rate_generations_per_second", "Configured clock rate.", "gauge", snap.Rate},
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	for _, m := range metrics {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %g\n", m.name, m.help, m.name, m.kind, m.name, m.value)
 	}
 }
