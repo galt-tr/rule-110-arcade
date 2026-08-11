@@ -95,6 +95,10 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.StringVar(&cfg.Originator, "originator", cfg.Originator, "BRC-100 originator (FQDN-shaped)")
 	fs.IntVar(&cfg.Cells, "cells", cfg.Cells, "ring size (multiple of 8)")
 	fs.Uint64Var(&cfg.CellSatoshis, "cell-sats", cfg.CellSatoshis, "satoshis each cell UTXO carries")
+	fs.StringVar(&cfg.PostgresDSN, "postgres-dsn", envOr("RULE110_POSTGRES_DSN", ""),
+		"PostgreSQL DSN; empty uses SQLite (much slower under a wide fan-out)")
+	fs.IntVar(&cfg.MaxDBConns, "max-db-conns", cfg.MaxDBConns, "storage connection pool size")
+	fs.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "how many cells advance at once")
 	fs.BoolVar(&cfg.Chronicle, "chronicle", cfg.Chronicle,
 		"verify with Chronicle-era script rules (required for Rúnar covenants)")
 

@@ -279,6 +279,15 @@ func (e *Engine) advance(ctx context.Context) {
 	e.notify()
 	e.mu.Unlock()
 
+	// Bound the fan-out. Releasing all N cells at once does not make a
+	// single-writer store faster — the writers just queue on a lock, and the
+	// whole generation stalls behind the resulting contention.
+	limit := e.chain.Config.Concurrency
+	if limit <= 0 {
+		limit = state.Cells
+	}
+	sem := make(chan struct{}, limit)
+
 	var wg sync.WaitGroup
 	for cell := range state.Cells {
 		e.mu.RLock()
@@ -290,6 +299,8 @@ func (e *Engine) advance(ctx context.Context) {
 		wg.Add(1)
 		go func(cell int) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			res, err := e.chain.AdvanceCell(ctx, e.compiled, state, cell, next)
 			e.recordCell(genIdx, cell, res, err)
 		}(cell)

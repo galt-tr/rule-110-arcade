@@ -108,13 +108,21 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		extra = []storage.Option{storage.WithChangeBasket(changeBasket)}
 	}
 
-	provider, closeProvider, err := perfprovider.New(ctx, logger, perfprovider.Config{
+	pcfg := perfprovider.Config{
 		Backend:      perfprovider.BackendSQLite,
 		SQLitePath:   filepath.Join(cfg.DataDir, "wallet.db"),
 		Network:      cfg.Network,
 		StorageName:  storageName,
+		MaxDBConns:   cfg.MaxDBConns,
 		ExtraOptions: extra,
-	}, oracle, hdrs)
+	}
+	if cfg.PostgresDSN != "" {
+		pcfg.Backend = perfprovider.BackendPostgres
+		pcfg.PostgresDSN = cfg.PostgresDSN
+		pcfg.SQLitePath = ""
+	}
+
+	provider, closeProvider, err := perfprovider.New(ctx, logger, pcfg, oracle, hdrs)
 	if err != nil {
 		return nil, fmt.Errorf("chain: storage provider: %w", err)
 	}

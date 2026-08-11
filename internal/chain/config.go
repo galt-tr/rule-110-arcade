@@ -44,6 +44,23 @@ type Config struct {
 	// across generations: fees come from the fuel pool, not from the cells.
 	CellSatoshis uint64
 
+	// PostgresDSN switches storage from SQLite to PostgreSQL.
+	//
+	// This is the single biggest throughput lever. SQLite serialises every
+	// write, so 128 cells advancing at once thrash a single writer lock; the
+	// toolbox's own benchmarks put SQLite at ~57-108 TPS against ~575 for
+	// PostgreSQL. Empty keeps SQLite, which is fine for a small ring.
+	PostgresDSN string
+
+	// MaxDBConns bounds the storage connection pool. The benchmarks pair it
+	// with worker count (conns ~ workers + margin).
+	MaxDBConns int
+
+	// Concurrency bounds how many cells advance at once. Unbounded fan-out
+	// makes SQLite worse, not better: the writers queue on a lock and the
+	// latency shows up as a stalled generation.
+	Concurrency int
+
 	// Chronicle selects Chronicle-era script rules for local pre-broadcast
 	// verification. Rúnar covenants contain OP_2MUL and cannot verify without
 	// it, so it defaults on; turn it off only against a Genesis-rules network,
@@ -64,6 +81,8 @@ func DefaultConfig() Config {
 		Rule:         ca.Rule110,
 		CellSatoshis: 1,
 		Chronicle:    true,
+		MaxDBConns:   72,
+		Concurrency:  32,
 	}
 }
 
