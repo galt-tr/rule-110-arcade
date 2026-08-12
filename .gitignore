@@ -1,3 +1,7 @@
+# Agent worktrees and session scratch. These are gitlinks to embedded
+# repositories; committing them makes a clone that cannot be checked out.
+/.claude/
+
 # Build output.
 /rule110
 /spike
