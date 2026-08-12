@@ -72,19 +72,25 @@ type Generation struct {
 
 // Snapshot is the UI's view of the world.
 type Snapshot struct {
-	Cells       int          `json:"cells"`
-	Rule        int          `json:"rule"`
-	Mode        Mode         `json:"mode"`
-	Rate        float64      `json:"rate"`
-	Generation  uint64       `json:"generation"`
-	History     []Generation `json:"history"`
-	Balance     uint64       `json:"balance"`
-	TotalTx     int          `json:"totalTx"`
-	FailedCells int          `json:"failedCells"`
-	Consensus   bool         `json:"consensus"`
-	ArcadeURL   string       `json:"arcadeUrl"`
-	GenesisTxID string       `json:"genesisTxid"`
-	LastError   string       `json:"lastError,omitempty"`
+	Cells      int          `json:"cells"`
+	Rule       int          `json:"rule"`
+	Mode       Mode         `json:"mode"`
+	Rate       float64      `json:"rate"`
+	Generation uint64       `json:"generation"`
+	History    []Generation `json:"history"`
+	// Balance is what the funder can actually claim — NOT the wallet total.
+	// Reserve is what remains to mint more spendable coin from, and PoolCoins
+	// how many claimable coins back the balance. PoolCoins is the one that
+	// predicts starvation: one coin funds one transition.
+	Balance     uint64 `json:"balance"`
+	Reserve     uint64 `json:"reserve"`
+	PoolCoins   int    `json:"poolCoins"`
+	TotalTx     int    `json:"totalTx"`
+	FailedCells int    `json:"failedCells"`
+	Consensus   bool   `json:"consensus"`
+	ArcadeURL   string `json:"arcadeUrl"`
+	GenesisTxID string `json:"genesisTxid"`
+	LastError   string `json:"lastError,omitempty"`
 
 	// Leader reports whether this instance holds the single-writer lease. Only
 	// the leader advances cells; everyone else serves the UI read-only.
@@ -144,7 +150,7 @@ type Engine struct {
 	history   []Generation
 	mode      Mode
 	rate      float64
-	balance   uint64
+	funds     chain.Funds
 	totalTx   int
 	lastError string
 
@@ -400,7 +406,9 @@ func (e *Engine) Snapshot() Snapshot {
 		Rate:        e.rate,
 		Generation:  frontier,
 		History:     history,
-		Balance:     e.balance,
+		Balance:     e.funds.Spendable,
+		Reserve:     e.funds.Reserve,
+		PoolCoins:   e.funds.PoolCoins,
 		TotalTx:     e.totalTx,
 		FailedCells: failed,
 		Consensus:   failed == 0,
@@ -491,13 +499,27 @@ func indexOfGeneration(gens []Generation, number uint64) int {
 }
 
 // trackBalance refreshes the reported balance periodically.
-func (e *Engine) trackBalance(ctx context.Context) {
-	tick := time.NewTicker(10 * time.Second)
+func (e *Engine) trackFunds(ctx context.Context) {
+	// Five seconds, not ten: this is the number an operator watches after
+	// sending a payment to a starved deployment, and it is also how they see the
+	// pool draining before it empties. A slow reading here reads as "nothing is
+	// happening".
+	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {
-		if b, err := e.chain.Balance(ctx); err == nil {
+		funds, err := e.chain.Funds(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			e.logger.Warn("read funds", "err", err)
+		} else {
 			e.mu.Lock()
-			e.balance = b
+			changed := e.funds != funds
+			e.funds = funds
+			if changed {
+				e.notify()
+			}
 			e.mu.Unlock()
 		}
 		select {

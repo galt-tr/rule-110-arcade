@@ -37,7 +37,7 @@ const backpressurePause = 25 * time.Millisecond
 // cell falls behind rather than holding every other cell up, so the automaton's
 // rate stops being set by its worst cell.
 func (e *Engine) Run(ctx context.Context) {
-	go e.trackBalance(ctx)
+	go e.trackFunds(ctx)
 	go e.watchStatus(ctx)
 	go e.reconcile(ctx)
 	go e.checkpoint(ctx)

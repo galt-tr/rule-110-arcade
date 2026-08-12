@@ -299,6 +299,72 @@ func (c *Chain) Balance(ctx context.Context) (uint64, error) {
 	return c.Wallet.Balance(ctx)
 }
 
+// Funds is what the deployment can actually spend, and what it has left to
+// convert into spendable coin.
+//
+// The distinction is the whole point. Wallet.Balance reports the CHANGE basket,
+// but under the throughput strategy the funder claims from the FUEL basket, so
+// the headline balance measures a pot the automaton never spends from. We
+// watched that happen: 2,955,934,265 satoshis reported, zero claimable fuel
+// coins, and an automaton that could not build a single transaction. A number
+// that healthy while nothing works is worse than no number at all.
+type Funds struct {
+	// Spendable is the value the funder can claim right now.
+	Spendable uint64
+	// Reserve is what is left to mint more fuel from once Spendable runs down.
+	Reserve uint64
+	// PoolCoins is how many claimable coins back Spendable. This is the figure
+	// that predicts starvation: one coin funds one transition, so the pool
+	// draining is visible long before the satoshis are gone.
+	//
+	// Indicative rather than authoritative — it is counted from the metastore
+	// while the funder claims from the utxostore, so the two can briefly
+	// disagree under load.
+	PoolCoins int
+}
+
+// Funds reports spendable and reserve balances for whichever funding strategy
+// is configured.
+func (c *Chain) Funds(ctx context.Context) (Funds, error) {
+	pool, _, _, throughput := c.Config.FuelPool()
+	if !throughput {
+		// Privacy strategy: the change basket IS the spendable pot.
+		spendable, err := c.Wallet.Balance(ctx)
+		if err != nil {
+			return Funds{}, err
+		}
+		coins, err := c.Wallet.BasketClaimableCount(ctx, string(wdk.BasketNameForChange))
+		if err != nil {
+			return Funds{}, fmt.Errorf("chain: count claimable coins: %w", err)
+		}
+		return Funds{Spendable: spendable, PoolCoins: coins}, nil
+	}
+
+	spendable, err := c.Wallet.BasketBalance(ctx, pool)
+	if err != nil {
+		return Funds{}, fmt.Errorf("chain: fuel pool balance: %w", err)
+	}
+	coins, err := c.Wallet.BasketClaimableCount(ctx, pool)
+	if err != nil {
+		return Funds{}, fmt.Errorf("chain: count claimable fuel: %w", err)
+	}
+	// Everything the keeper can still turn into fuel: unspent change plus
+	// whatever is already staged in the reserve basket.
+	change, err := c.Wallet.Balance(ctx)
+	if err != nil {
+		return Funds{}, err
+	}
+	um, err := c.Config.utxoManagement()
+	if err != nil {
+		return Funds{}, err
+	}
+	reserve, err := c.Wallet.BasketBalance(ctx, um.Throughput.ReserveBasket)
+	if err != nil {
+		return Funds{}, fmt.Errorf("chain: reserve balance: %w", err)
+	}
+	return Funds{Spendable: spendable, Reserve: change + reserve, PoolCoins: coins}, nil
+}
+
 // chainTracksURL returns the configured headers endpoint, deriving it from the
 // arcade base when unset. A standard arcade deployment serves ChainTracks under
 // /chaintracks/v2 on the same host.

@@ -109,7 +109,10 @@ function renderStats(s) {
     ['rule', s.rule],
     ['generation', s.generation],
     ['transactions', s.totalTx.toLocaleString()],
-    ['balance', sat + ' sat'],
+    // "spendable", not "balance": the wallet total is a different and
+    // misleading number — see chain.Funds.
+    ['spendable', sat + ' sat'],
+    ['fuel', s.poolCoins.toLocaleString() + ' coins'],
     ['chains', s.consensus ? `${s.cells}/${s.cells} agree` : `${s.failedCells} unproved`],
   ];
   document.getElementById('stats').innerHTML = rows
