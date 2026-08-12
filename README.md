@@ -57,6 +57,13 @@ baked into the locking script, so anyone can read all 128 locking scripts at
 generation *g* and check they carry identical rows. That check is real and it is
 cheap. It is just not something a miner would reject a transaction for failing.
 
+**`rule110 audit` is that check, and it is executable.** It re-derives every row
+from its predecessor with the reference implementation, decodes out of each
+transaction the neighbourhood its covenant actually read, and compares the two —
+so the half of the claim that Script does not enforce is verified by something
+other than an assurance that the engine meant well. See
+[Auditing what Script does not enforce](#auditing-what-script-does-not-enforce).
+
 This is asserted deliberately, and executably, by
 `TestOtherCellsBitsAreNotChecked` in `internal/cellscript/cellscript_test.go`: it
 corrupts a bit belonging to another cell and requires the transaction to
@@ -230,6 +237,51 @@ rule110 run -arcade-url https://... -data-dir ./data -start -rate 2
 Serves the UI on `-addr` (default `:8110`), with `/healthz`, `/readyz` and
 `/metrics` alongside it. Without `-start` the automaton comes up paused and
 waits for the UI.
+
+### Auditing what Script does not enforce
+
+```
+rule110 audit                       # the newest 10 generations
+rule110 audit -last 200             # the newest 200
+rule110 audit -from 0 -to 500       # an explicit range
+```
+
+Read-only. It takes no lease, opens no wallet and spends nothing, so it is meant
+to be run *while the automaton is running* — an audit that needed the engine
+stopped is an audit nobody would run. It reads the recorded history from the
+history store and the transaction bytes straight out of the wallet's database
+with a `SELECT`, falling back to arcade when `rule110 prune` has already
+reclaimed them. It exits non-zero if anything fails, so it is usable from cron.
+
+For each generation in the range it checks, independently of the engine:
+
+| check | what it establishes |
+| --- | --- |
+| row continuity | the recorded row at *N* is the Rule 110 image of the row at *N−1*, recomputed by `internal/ca` |
+| transaction identity | the bytes really are the transaction the record names — they are hashed |
+| chain integrity | cell *i*'s transaction at *N* spends cell *i*'s own output from *N−1*, so the chain is unbroken |
+| cell binding | the output being spent is cell *i*'s covenant, decoded from the script's own neighbourhood constants |
+| covenant binding | the sighash preimage the unlocking script carries is the one this spend recomputes to |
+| **cross-cell agreement** | **the three bits cell *i*'s script read are the bits its neighbours actually held** |
+| carried row | the whole row the cell's UTXO carries is the recorded row, not just the three bits it needed |
+| rule | the bit the transaction proved is Rule 110's output for the bits it read — recomputed, with no script engine |
+| successor | the continuation output carries this cell's script for the row the record ascribes to *N* |
+
+The sixth is the one this command exists for, and the one nothing else can do.
+Cell *i*'s covenant reads its neighbourhood out of the row its own UTXO carries
+and verifies one bit of what it is handed; it has no way to know what cells
+*i−1* and *i+1* did. The audit decodes the row the covenant read out of the
+`txPreimage` argument in the unlocking script — the preimage's `scriptCode` field
+is a copy of the output being spent, code and state together — cross-checks it
+byte for byte against that output, and then compares the three bits against the
+recorded row. A divergence that every miner in the world would accept is caught
+here, and named: which cell, which generation, which neighbour.
+
+Evidence the audit could not obtain is reported as a **gap**, never as a pass:
+a cell still in flight, a record the network refused, a transaction whose bytes
+have been pruned. Gaps do not set the exit status — they would make the command
+useless against a live deployment — but the summary never says a plain "PASS"
+when there are any.
 
 ### Two other subcommands
 

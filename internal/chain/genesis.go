@@ -329,7 +329,19 @@ func (c *Chain) saveDeployment(d *Deployment) error {
 // mean the history store is behind and the automaton is about to re-spend
 // outputs that are already gone.
 func (c *Chain) LoadDeployment() (*Deployment, error) {
-	path := filepath.Join(c.Config.DataDir, stateFile)
+	return LoadDeploymentFrom(c.Config.DataDir)
+}
+
+// LoadDeploymentFrom reads the same facts straight from a data directory,
+// without a wallet.
+//
+// The file is the whole source, so requiring a *Chain to read it was only a
+// habit — and an expensive one for a read-only tool. Opening a Chain starts a
+// second monitor daemon against the live deployment's storage, which is exactly
+// what `rule110 audit` must not do while the engine is running. The ring size
+// and the rule are all it needs, and they are right here.
+func LoadDeploymentFrom(dataDir string) (*Deployment, error) {
+	path := filepath.Join(dataDir, stateFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("chain: read %s: %w", path, err)

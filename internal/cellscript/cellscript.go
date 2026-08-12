@@ -16,10 +16,12 @@
 package cellscript
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
@@ -59,6 +61,14 @@ type Compiled struct {
 	// codeSepOffset is the byte offset of the OP_CODESEPARATOR that scopes the
 	// BIP-143 scriptCode for step.
 	codeSepOffset int
+
+	// bindings maps a code part back to the cell it binds, for Decode. Built on
+	// first use rather than at Compile: every subcommand compiles the contract
+	// and only the auditor decodes, so the N locking scripts this costs should
+	// not be on the engine's startup path.
+	bindingsOnce sync.Once
+	bindings     map[string]int
+	bindingsErr  error
 }
 
 // Compile compiles the embedded Cell contract for a ring of the given size.
@@ -149,8 +159,7 @@ func (c *Compiled) CodePart(i int, row ca.Row) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	stateHex := runar.SerializeState(c.artifact.StateFields, map[string]interface{}{"row": row.Hex()})
-	suffix := opReturn + stateHex
+	suffix := c.stateSuffixHex(row)
 	if !strings.HasSuffix(lockHex, suffix) {
 		return nil, fmt.Errorf("cellscript: cell %d locking script does not end with OP_RETURN|state", i)
 	}
@@ -159,6 +168,17 @@ func (c *Compiled) CodePart(i int, row ca.Row) ([]byte, error) {
 		return nil, fmt.Errorf("cellscript: decode code part for cell %d: %w", i, err)
 	}
 	return b, nil
+}
+
+// stateSuffixHex is the tail every cell locking script ends with: the OP_RETURN
+// that separates code from state, then the serialized row.
+//
+// The serialization is the contract compiler's, not ours, so it is asked for
+// rather than reimplemented — a hand-rolled pushdata that disagreed with it by
+// one byte would produce a script that no cell can spend, and the only symptom
+// would be a covenant failure in an unrelated place.
+func (c *Compiled) stateSuffixHex(row ca.Row) string {
+	return opReturn + runar.SerializeState(c.artifact.StateFields, map[string]interface{}{"row": row.Hex()})
 }
 
 func (c *Compiled) lockingScriptHex(i int, row ca.Row) (string, error) {
@@ -225,12 +245,9 @@ func (c *Compiled) UnlockingScript(s Spend) ([]byte, error) {
 		return nil, err
 	}
 
-	// ComputeOpPushTx returns (signature, preimage) — in that order.
-	_, preimage, err := runar.ComputeOpPushTxWithCodeSep(
-		s.Tx.Hex(), s.InputIndex, lockHex, int64(s.PrevSatoshis), c.codeSepOffset,
-	)
+	preimage, err := c.preimage(s.Tx.Hex(), s.InputIndex, lockHex, s.PrevSatoshis)
 	if err != nil {
-		return nil, fmt.Errorf("cellscript: compute preimage for cell %d: %w", s.CellIndex, err)
+		return nil, fmt.Errorf("cellscript: cell %d: %w", s.CellIndex, err)
 	}
 
 	unlockHex := runar.EncodePushData(hex.EncodeToString(codePart)) +
@@ -245,6 +262,273 @@ func (c *Compiled) UnlockingScript(s Spend) ([]byte, error) {
 		return nil, fmt.Errorf("cellscript: decode unlocking script for cell %d: %w", s.CellIndex, err)
 	}
 	return b, nil
+}
+
+// Preimage recomputes the BIP-143 sighash preimage that a spend of prevLock must
+// carry in its unlocking script.
+//
+// The preimage is not a signature and nothing about it is secret: it is a
+// serialization of the spending transaction, the outpoint being spent, that
+// output's value, and the scriptCode. Recomputing it and comparing byte for byte
+// with the one a transaction actually pushed is how a reader establishes, with
+// no script engine involved, that the covenant was bound to THIS spend — that
+// the row the script read really came from the output this input names, rather
+// than from a preimage assembled to say something more convenient.
+//
+// The tx must be the finished transaction. BIP-143 commits to inputs by outpoint
+// and sequence only, so the unlocking scripts it now carries do not disturb the
+// result — which is what makes recomputation possible at all after the fact.
+func (c *Compiled) Preimage(tx *transaction.Transaction, inputIndex int, prevLock []byte, prevSats uint64) ([]byte, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("cellscript: nil transaction")
+	}
+	if inputIndex < 0 || inputIndex >= len(tx.Inputs) {
+		return nil, fmt.Errorf("cellscript: input index %d out of range (%d inputs)", inputIndex, len(tx.Inputs))
+	}
+	return c.preimage(tx.Hex(), inputIndex, hex.EncodeToString(prevLock), prevSats)
+}
+
+func (c *Compiled) preimage(txHex string, inputIndex int, lockHex string, prevSats uint64) ([]byte, error) {
+	// ComputeOpPushTx returns (signature, preimage) — in that order.
+	_, preimage, err := runar.ComputeOpPushTxWithCodeSep(
+		txHex, inputIndex, lockHex, int64(prevSats), c.codeSepOffset, //nolint:gosec // satoshi values are far inside int64
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cellscript: compute preimage for input %d: %w", inputIndex, err)
+	}
+	return preimage, nil
+}
+
+// ScriptCode returns the part of a cell locking script that its spender's
+// sighash preimage commits to: everything after the OP_CODESEPARATOR that scopes
+// the step method.
+//
+// This is what makes a preimage worth reading. The scriptCode field inside it is
+// a copy of the output being spent — code AND state — so a transaction's own
+// unlocking script contains the row its covenant read, and an auditor can
+// recover it without fetching anything else. Comparing that copy against the
+// real output is what turns "the spender says it read this row" into "the
+// spender read this row".
+func (c *Compiled) ScriptCode(lockingScript []byte) ([]byte, error) {
+	if len(lockingScript) <= c.codeSepOffset+1 {
+		return nil, fmt.Errorf("cellscript: script of %d bytes is too short to be a cell locking script",
+			len(lockingScript))
+	}
+	return lockingScript[c.codeSepOffset+1:], nil
+}
+
+// Binding is what a cell locking script says it is: which cell of the ring it
+// verifies, and the row it carries as state.
+//
+// Recovering this from a script is what makes the automaton auditable at all.
+// The chain enforces each cell's own bit and says NOTHING about whether the
+// neighbourhood it read matches what its neighbours did — see the package docs
+// and TestOtherCellsBitsAreNotChecked — so the only way to check that N
+// independent chains ran the same automaton is to read back what each of them
+// asserted. This is that assertion: cell Cell read its three neighbourhood bits
+// out of Row.
+type Binding struct {
+	// Cell is the ring index the script verifies, recovered from the six
+	// neighbourhood constants baked into its code rather than assumed from
+	// whatever record pointed us at the script.
+	Cell int
+	// Row is the state the output carries: the whole row, as THIS cell claims
+	// it. Nothing in Script forces it to agree with any other cell's.
+	Row ca.Row
+}
+
+// Decode recovers the binding a cell locking script encodes.
+//
+// It is the exact inverse of LockingScript, and it proves it: the cell index
+// comes from matching the script's code part against every cell's compiled code,
+// the row comes from the state after the OP_RETURN, and the pair is then used to
+// rebuild the whole script and compare it byte for byte with the input. So a
+// successful decode is not a parse that happened to work — it is a demonstration
+// that this script IS cell N's binding of this contract carrying this row, and
+// nothing else. Anything a byte away from that is refused rather than guessed at.
+func (c *Compiled) Decode(lockingScript []byte) (Binding, error) {
+	index, err := c.bindingIndex()
+	if err != nil {
+		return Binding{}, err
+	}
+
+	rowBytes := c.cells / 8
+	// The state's push encoding depends only on the row's LENGTH, which is fixed
+	// for a ring, so serializing a throwaway row of the right size reveals how
+	// many bytes the suffix takes without this code having to know how the
+	// compiler encodes a push.
+	suffix := len(c.stateSuffixHex(make(ca.Row, rowBytes))) / 2
+	if len(lockingScript) <= suffix {
+		return Binding{}, fmt.Errorf(
+			"cellscript: script of %d bytes is too short to carry a %d-cell row", len(lockingScript), c.cells)
+	}
+
+	split := len(lockingScript) - suffix
+	if lockingScript[split] != script.OpRETURN {
+		return Binding{}, fmt.Errorf(
+			"cellscript: byte %d is %#x, not the OP_RETURN that introduces a cell's state",
+			split, lockingScript[split])
+	}
+	row := ca.Row(bytes.Clone(lockingScript[len(lockingScript)-rowBytes:]))
+
+	cell, ok := index[string(lockingScript[:split])]
+	if !ok {
+		return Binding{}, fmt.Errorf(
+			"cellscript: script's code part matches no cell of a %d-cell ring running rule %d "+
+				"(so it is not this deployment's covenant, or the contract has been recompiled since)",
+			c.cells, c.rule)
+	}
+
+	want, err := c.LockingScript(cell, row)
+	if err != nil {
+		return Binding{}, err
+	}
+	if !bytes.Equal(want, lockingScript) {
+		return Binding{}, fmt.Errorf(
+			"cellscript: script decoded as cell %d carrying row %s, but that binding rebuilds to "+
+				"%d bytes that differ from the %d given", cell, row.Hex(), len(want), len(lockingScript))
+	}
+	return Binding{Cell: cell, Row: row}, nil
+}
+
+// bindingIndex maps every cell's code part to its cell index.
+//
+// The code part is the locking script minus its state, so it is constant across
+// generations (TestCodePartIsStableAcrossGenerations) and distinct per cell
+// (TestCellsHaveDistinctScripts) — the six neighbourhood constants see to that.
+// Those two properties are what make this a lookup table rather than a heuristic,
+// and the duplicate check below refuses to build one if the second ever stops
+// holding: two cells sharing a code part would make Decode's answer arbitrary,
+// and an arbitrary cell index is worse than no answer at all.
+func (c *Compiled) bindingIndex() (map[string]int, error) {
+	c.bindingsOnce.Do(func() {
+		row := mustRow(c.cells)
+		index := make(map[string]int, c.cells)
+		for cell := range c.cells {
+			code, err := c.CodePart(cell, row)
+			if err != nil {
+				c.bindingsErr = err
+				return
+			}
+			if prev, dup := index[string(code)]; dup {
+				c.bindingsErr = fmt.Errorf(
+					"cellscript: cells %d and %d compile to identical code, so a script cannot be "+
+						"attributed to either", prev, cell)
+				return
+			}
+			index[string(code)] = cell
+		}
+		c.bindings = index
+	})
+	return c.bindings, c.bindingsErr
+}
+
+// unlockArgs is how many values a cell unlocking script pushes. See
+// UnlockingScript for what they are and why there is nothing else.
+const unlockArgs = 6
+
+// Unlock is a cell unlocking script decoded back into the arguments it pushed.
+type Unlock struct {
+	// CodePart is the code the covenant rebuilds its continuation output from.
+	CodePart []byte
+	// NextRow is the successor row the spender presented. Script checks exactly
+	// one bit of it — this cell's.
+	NextRow ca.Row
+	// ChangePKH and ChangeAmount describe the change output the covenant was
+	// told to expect, and NewAmount the value it was told to continue with.
+	ChangePKH    []byte
+	ChangeAmount uint64
+	NewAmount    uint64
+	// Preimage is the sighash preimage the covenant verified against, and the
+	// only argument that describes the spend rather than the result. See
+	// Preimage and ScriptCode.
+	Preimage []byte
+}
+
+// DecodeUnlocking parses a cell unlocking script back into its arguments.
+//
+// The layout is UnlockingScript's, and this must be read beside it. There is no
+// signature and no method selector to skip: the script is six pushes and
+// nothing else, which is the only reason a reader can index them positionally.
+func (c *Compiled) DecodeUnlocking(unlockingScript []byte) (Unlock, error) {
+	chunks, err := script.NewFromBytes(unlockingScript).Chunks()
+	if err != nil {
+		return Unlock{}, fmt.Errorf("cellscript: parse unlocking script: %w", err)
+	}
+	if len(chunks) != unlockArgs {
+		return Unlock{}, fmt.Errorf(
+			"cellscript: unlocking script pushes %d values, want %d "+
+				"(codePart, nextRow, changePKH, changeAmount, newAmount, preimage)",
+			len(chunks), unlockArgs)
+	}
+
+	nextRow := ca.Row(pushedBytes(chunks[1]))
+	if len(nextRow) != c.cells/8 {
+		return Unlock{}, fmt.Errorf(
+			"cellscript: unlocking script presents a %d-byte row, want %d for %d cells",
+			len(nextRow), c.cells/8, c.cells)
+	}
+	changeAmount, err := scriptUint(chunks[3])
+	if err != nil {
+		return Unlock{}, fmt.Errorf("cellscript: change amount: %w", err)
+	}
+	newAmount, err := scriptUint(chunks[4])
+	if err != nil {
+		return Unlock{}, fmt.Errorf("cellscript: continuation amount: %w", err)
+	}
+
+	return Unlock{
+		CodePart:     pushedBytes(chunks[0]),
+		NextRow:      nextRow,
+		ChangePKH:    pushedBytes(chunks[2]),
+		ChangeAmount: changeAmount,
+		NewAmount:    newAmount,
+		Preimage:     chunks[5].Data,
+	}, nil
+}
+
+// pushedBytes recovers the byte string a chunk actually puts on the stack.
+//
+// It is not always chunk.Data. runar.EncodePushData encodes minimally, so a
+// value of 1 to 16 becomes OP_1..OP_16 and 0x81 becomes OP_1NEGATE — opcodes
+// that carry no data but push a one-byte string all the same. Only a ring of 8
+// cells has a row small enough to be encoded that way, and a decoder that read
+// chunk.Data alone would report every one of its transitions as malformed while
+// working perfectly at 128.
+func pushedBytes(chunk *script.ScriptChunk) []byte {
+	switch {
+	case chunk.Op == script.Op0:
+		return nil // the empty string
+	case chunk.Op == script.Op1NEGATE:
+		return []byte{0x81}
+	case chunk.Op >= script.Op1 && chunk.Op <= script.Op16:
+		return []byte{chunk.Op - script.Op1 + 1}
+	}
+	return chunk.Data
+}
+
+// scriptUint decodes a pushed Script number that must be non-negative.
+//
+// Script numbers are little-endian sign-magnitude with the sign in the high bit
+// of the last byte, so a value that reads as negative here is not a satoshi
+// amount however it was meant — and silently taking its magnitude would report
+// an amount the covenant never saw.
+func scriptUint(chunk *script.ScriptChunk) (uint64, error) {
+	b := pushedBytes(chunk)
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if len(b) > 8 {
+		return 0, fmt.Errorf("%d bytes is not a Script number", len(b))
+	}
+	if b[len(b)-1]&0x80 != 0 {
+		return 0, fmt.Errorf("Script number %x is negative", b)
+	}
+	var n uint64
+	for i := len(b) - 1; i >= 0; i-- {
+		n = n<<8 | uint64(b[i])
+	}
+	return n, nil
 }
 
 // VerifyInput runs one input's script pair through the go-sdk interpreter with

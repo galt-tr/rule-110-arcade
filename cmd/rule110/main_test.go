@@ -116,3 +116,44 @@ func TestUIURL(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditRange covers what `rule110 audit` decides to look at when it is run
+// with no flags at all, which is how it will nearly always be run.
+//
+// The clamp at the bottom is the case worth pinning: a deployment that has only
+// run 3 generations must audit 0..3 rather than underflowing its way to an
+// unsigned range that starts near 2^64 and reports nothing.
+func TestAuditRange(t *testing.T) {
+	cases := []struct {
+		name             string
+		from, to         int64
+		last, latest     uint64
+		wantFrom, wantTo uint64
+		wantErr          bool
+	}{
+		{name: "newest ten", from: -1, to: -1, last: 10, latest: 800, wantFrom: 791, wantTo: 800},
+		{name: "younger than the window", from: -1, to: -1, last: 10, latest: 3, wantFrom: 0, wantTo: 3},
+		{name: "explicit range", from: 5, to: 9, last: 10, latest: 800, wantFrom: 5, wantTo: 9},
+		{name: "explicit start only", from: 795, to: -1, last: 10, latest: 800, wantFrom: 795, wantTo: 800},
+		{name: "window ending at -to", from: -1, to: 100, last: 3, latest: 800, wantFrom: 98, wantTo: 100},
+		{name: "single generation", from: 7, to: 7, last: 10, latest: 800, wantFrom: 7, wantTo: 7},
+		{name: "inverted", from: 9, to: 5, last: 10, latest: 800, wantErr: true},
+		{name: "past the end", from: 900, to: -1, last: 10, latest: 800, wantErr: true},
+	}
+	for _, c := range cases {
+		from, to, err := auditRange(c.from, c.to, c.last, c.latest)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected an error, got %d..%d", c.name, from, to)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if from != c.wantFrom || to != c.wantTo {
+			t.Errorf("%s: got %d..%d, want %d..%d", c.name, from, to, c.wantFrom, c.wantTo)
+		}
+	}
+}
