@@ -61,11 +61,42 @@ type Automaton interface {
 type Server struct {
 	engine Automaton
 	logger *slog.Logger
+
+	// funder is nil unless public funding is configured, and the two funding
+	// routes 404 when it is. A deployment that does not want the surface does
+	// not have it, rather than having it and refusing.
+	funder Funder
+	// fundSlot admits one payment at a time; fundBucket rate-limits attempts.
+	fundSlot   chan struct{}
+	fundBucket *bucket
+}
+
+// Option configures a Server.
+type Option func(*Server)
+
+// WithFunder enables POST /api/fund and GET /api/funding.
+func WithFunder(f Funder) Option {
+	return func(s *Server) { s.funder = f }
+}
+
+// withClock replaces the rate limiter's clock, so its behaviour over time can
+// be asserted without the test sleeping through it.
+func withClock(now func() time.Time) Option {
+	return func(s *Server) { s.fundBucket = newBucket(fundBurst, fundRefill, now) }
 }
 
 // New builds the HTTP handler set.
-func New(e Automaton, logger *slog.Logger) *Server {
-	return &Server{engine: e, logger: logger}
+func New(e Automaton, logger *slog.Logger, opts ...Option) *Server {
+	s := &Server{
+		engine:     e,
+		logger:     logger,
+		fundSlot:   make(chan struct{}, 1),
+		fundBucket: newBucket(fundBurst, fundRefill, nil),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler returns the router.
@@ -76,6 +107,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/control", s.handleControl)
+	// Registered unconditionally and 404 when no funder is configured, so the
+	// route table does not depend on construction order.
+	mux.HandleFunc("GET /api/funding", s.handleFundingTarget)
+	mux.HandleFunc("POST /api/fund", s.handleFund)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)

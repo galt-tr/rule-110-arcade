@@ -579,9 +579,34 @@ func cmdRun(args []string) error {
 	if basket, denom, target, on := cfg.FuelPool(); on {
 		fmt.Printf("fuel:    %d x %d sat in %q, kept topped up\n", target, denom, basket)
 	}
+	var opts []web.Option
+	if cfg.PublicFunding {
+		// Suggest what a cold start would have cost. For a deployment that is
+		// already running it is not a threshold — any payment helps — but it is
+		// a figure with a meaning behind it rather than a round number, and it
+		// buys a visible amount of runtime.
+		seed, err := d.Seed()
+		if err != nil {
+			return err
+		}
+		size, err := chain.GenesisBytes(compiled, seed)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, web.WithFunder(newFunder(c, cfg.BootstrapMinimum(size))))
+
+		target, err := chain.FundingAddress(c.Identity, cfg.Network)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("funding: public, to %s (minimum %d sat)\n", target.Address, cfg.MinPaymentSatoshis)
+	}
+	if cfg.LockControls {
+		fmt.Printf("controls: LOCKED at %.2f gen/s\n", eng.Snapshot().Rate)
+	}
 	fmt.Printf("\n  UI ready at %s\n\n", uiURL(*addr))
 
-	return web.New(eng, logger).Serve(ctx, *addr)
+	return web.New(eng, logger, opts...).Serve(ctx, *addr)
 }
 
 func cmdFuel(args []string) error {
