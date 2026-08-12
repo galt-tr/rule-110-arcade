@@ -367,8 +367,16 @@ func engineOn(t *testing.T, f *fixture) *Engine {
 		halted:     map[int]bool{},
 		haltReason: map[int]string{},
 		lastMined:  map[int]uint64{},
-		owner:      "test",
-		leader:     true,
+		// The recovery seams, so a repair can be driven against the fixture's
+		// ledger rather than a wallet. See Engine.ledger.
+		ledger:        f.ledger,
+		oracle:        noArcade,
+		retries:       map[int]retryState{},
+		needsRepair:   map[int]bool{},
+		waitingOnCoin: map[int]bool{},
+		statusWrites:  make(chan history.StatusUpdate, statusWriteQueue),
+		owner:         "test",
+		leader:        true,
 	}
 	for cell := range f.facts.Cells {
 		e.tips[cell] = f.genesisTip(cell)

@@ -194,11 +194,20 @@ func (e *Engine) awaitTurn(ctx context.Context, cell int) bool {
 	for {
 		e.mu.RLock()
 		halted := e.halted[cell]
+		repair := e.needsRepair[cell]
 		e.mu.RUnlock()
 		if halted {
 			// The chain is broken; nothing this worker does can mend it.
 			<-ctx.Done()
 			return false
+		}
+		if repair {
+			// A refusal left this cell pointing at an output the network never
+			// produced. Rebuild before advancing — here, not where the rejection
+			// arrived, because this is the only goroutine that can be sure no
+			// transition for this cell is in flight. See repairCell.
+			e.repairCell(ctx, cell)
+			continue
 		}
 		if e.turnReady(cell) {
 			return true
@@ -526,6 +535,9 @@ func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, 
 	}
 	e.generation = e.frontierLocked()
 	e.totalTx++
+	// This cell has moved past whatever it was last refused for, so the refusal
+	// count that would eventually halt it no longer describes anything.
+	e.clearRetriesLocked(cell, res.Generation)
 	e.notify()
 	e.mu.Unlock()
 
@@ -684,7 +696,7 @@ func (e *Engine) rederiveIfNeeded(ctx context.Context) {
 		return
 	}
 
-	positions, err := DeriveTips(ctx, e.chain, e.compiled, e.deployment, e.store)
+	positions, err := DeriveTips(ctx, e.ledger, e.compiled, e.deployment, e.store)
 	if err != nil {
 		if ctx.Err() != nil {
 			return

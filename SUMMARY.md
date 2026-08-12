@@ -145,6 +145,48 @@ broadcast, first status through the observer ~1.9 s later, all 128 proved within
 ~4 s, 0 failed, 0 halted, and the UI's state agreed with arcade's `/tx/` for a
 sampled transaction.
 
+## A refusal no longer costs a cell
+
+Cell 106 went red at generation 249 on 2026-08-12 and took 250 with it: 250 was
+already broadcast when 249's rejection landed, 1.16s before its own. The cell then
+halted and stayed halted, because one refusal used to kill a cell until an operator
+ran `rule110 recover`.
+
+Nothing failed there — the halt fired promptly and correctly. The problem is what
+came next, and since refusals are intermittent (~2 per 16,000 transactions) it is
+monotonic erosion: the ring loses cells one at a time to a fault that usually goes
+away by itself.
+
+A network refusal now schedules a rebuild instead of a halt. The rejection arrives
+on the monitor's applier goroutine, which must never block, so it only records the
+refusal and flags the cell; the repair itself runs on the cell's own worker — the
+only goroutine that can be sure no transition for that cell is in flight.
+
+The repair does not invent a second decision path. It re-derives from the store and
+calls the same `recoverRejected` the operator's `rule110 recover` calls, with the
+same `RetryRefusal` at the end of it, and applies through the same `applyRecovery`.
+Re-deriving is the bug 9a guard: the tip comes from the newest row the network
+actually accepted, verified against the covenant locking script, and never from the
+refused transaction's own output.
+
+It loops, because a refusal usually leaves more than one dead row and the reviewed
+repair retracts exactly one per pass so that each row gets its own evidence. Cell
+106 needed two passes, and only the first needed the unexplained-retry rule — the
+second was decided by `RecoverStaleRejection`, which proved generation 250 was built
+on a parent the cell no longer had. Clearing the whole pile in one repair also keeps
+the cell away from `maxWreckage`, past which derivation stops offering it to
+recovery at all.
+
+Bounded: `maxRetries` **consecutive** refusals of the same generation and the cell
+halts for a human, keeping arcade's own words as the reason. Consecutive is the
+point — a cell that refuses once, recovers and meets an unrelated fault two hundred
+generations later has not failed twice at the same thing.
+
+**Startup stays conservative.** `-auto-recover` still never retries an unexplained
+refusal: it runs over all 128 cells, unattended, right after a crash, which is
+exactly when the program knows least. So damage already in the store when the
+process starts — cell 106's was — still needs `rule110 recover -retry-refused`.
+
 ## Measured, not assumed
 
 - **No mempool ancestor limit on this network.** 600 transactions, ≥250 deep,
@@ -165,7 +207,10 @@ along with the performance defects found while fixing the status pipeline
 (issues 8–13). This section stays as the narrative; the issues carry the same
 detail item by item.
 
-### 1. Retry an intermittent refusal instead of halting for ever — *highest value* — [#1](https://github.com/galt-tr/rule-110-arcade/issues/1)
+### 1. ~~Retry an intermittent refusal instead of halting for ever~~ — DONE — [#1](https://github.com/galt-tr/rule-110-arcade/issues/1)
+
+Implemented; see *A refusal no longer costs a cell* above. The rest of this entry
+is kept as the reasoning that led to it.
 
 Today one refusal kills a cell until an operator runs `rule110 recover`. Since
 refusals are intermittent, that is monotonic erosion: the ring loses cells one

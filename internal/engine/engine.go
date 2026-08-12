@@ -183,6 +183,14 @@ type Engine struct {
 	logger   *slog.Logger
 	opts     Options
 
+	// ledger and oracle are what recovery reads: the wallet's own record of what
+	// it signed, and the network's verdict on a transaction. Both are the chain,
+	// held as their interfaces rather than reached through it so a repair can be
+	// tested against a ledger that lies — which is the only way to test that
+	// recovery believes evidence rather than assumptions. See chain.Ledger.
+	ledger chain.Ledger
+	oracle chain.TxStatus
+
 	mu sync.RWMutex
 
 	// deployment is what genesis fixed: ring size, rule, seed, genesis txid.
@@ -265,6 +273,22 @@ type Engine struct {
 	// existed and it spent a phantom forever.
 	halted     map[int]bool
 	haltReason map[int]string
+
+	// needsRepair marks cells whose worker must repair them before its next
+	// turn. A rejection sets it; repairCell clears it.
+	//
+	// The repair runs on the cell's own worker rather than where the rejection
+	// arrives, for two reasons. The rejection arrives on the monitor's applier
+	// goroutine, which must never block. And the worker is the only goroutine
+	// that can guarantee no transition for this cell is in flight — repairing
+	// while advanceCell holds a half-built generation would rewind the tip under
+	// it.
+	needsRepair map[int]bool
+
+	// retries counts consecutive refusals of the SAME generation, per cell, so a
+	// transition that cannot be made to work halts the cell instead of rebuilding
+	// for ever. Cleared when the cell advances past the generation it counts.
+	retries map[int]retryState
 
 	// store is the durable record. Memory holds a window for the UI; the store
 	// holds everything.
@@ -368,6 +392,8 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 	}
 	e := &Engine{
 		chain:         c,
+		ledger:        c,
+		oracle:        c.Oracle,
 		compiled:      compiled,
 		logger:        logger,
 		opts:          opts,
@@ -381,6 +407,8 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		halted:        make(map[int]bool),
 		haltReason:    make(map[int]string),
 		waitingOnCoin: make(map[int]bool),
+		needsRepair:   make(map[int]bool),
+		retries:       make(map[int]retryState),
 		statusWrites:  make(chan history.StatusUpdate, statusWriteQueue),
 		store:         store,
 		owner:         instanceOwner(),

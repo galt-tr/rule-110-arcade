@@ -240,12 +240,7 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 
 		if w.next == TxFailed {
 			cell.Err = errMsg
-			// Halt the cell. Its successor UTXO does not exist, so every later
-			// generation would try to spend a phantom output and fail with
-			// "utxo already spent" — noise that hides the original rejection.
-			e.halted[loc.cell] = true
-			e.logger.Warn("cell halted by rejection",
-				"cell", loc.cell, "txid", w.rec.TxID, "status", string(w.rec.Status))
+			e.noteRefusalLocked(loc.cell, loc.generation, w.rec.TxID, string(w.rec.Status), errMsg)
 			if w.rec.ExtraInfo == "" {
 				reasons = append(reasons, struct {
 					txid string
@@ -265,6 +260,77 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 	e.enqueueStatusWrites(writes)
 	for _, r := range reasons {
 		go e.fetchRejectionReason(r.txid, r.cell)
+	}
+}
+
+// maxRetries is how many consecutive refusals of the SAME generation a cell may
+// rebuild through before it halts and waits for a human.
+//
+// Refusals here are intermittent, not deterministic: measured at roughly 2 per
+// 16,000 transactions, and a refused generation has been retracted, rebuilt and
+// accepted on the live deployment. So the first refusal says almost nothing and
+// the third says a great deal — something about this particular transition does
+// not work, and rebuilding it a fourth time is a loop, not a repair.
+const maxRetries = 3
+
+// retryState counts consecutive refusals of one generation.
+type retryState struct {
+	generation uint64
+	attempts   int
+}
+
+// noteRefusalLocked records a network refusal and decides whether the cell
+// rebuilds that generation or halts. Callers must hold the write lock.
+//
+// The cell used to halt here, unconditionally and for ever — one refusal cost a
+// cell until an operator ran `rule110 recover`. Since refusals are intermittent
+// that is monotonic erosion: the ring loses cells one at a time for a reason that
+// usually goes away by itself.
+//
+// Nothing here does I/O or derivation. This runs inline on the monitor's applier
+// goroutine, and a slow observer stops that applier draining its hand-off queue,
+// which stalls the SSE reader for the whole process. The repair itself is left to
+// the cell's own worker; see repairCell.
+func (e *Engine) noteRefusalLocked(cell int, generation uint64, txid, status, reason string) {
+	st := e.retries[cell]
+	if st.generation != generation {
+		st = retryState{generation: generation}
+	}
+	st.attempts++
+	e.retries[cell] = st
+
+	if st.attempts > maxRetries {
+		// Halt. Its successor UTXO does not exist, so every later generation
+		// would try to spend a phantom output and fail with "utxo already
+		// spent" — noise that hides the original rejection.
+		e.halted[cell] = true
+		// The reason, which this path used to drop: it set halted and left
+		// haltReason empty, so the UI and /metrics reported a halted cell with
+		// nothing to say about it.
+		e.haltReason[cell] = reason
+		delete(e.needsRepair, cell)
+		e.logger.Warn("cell halted by rejection",
+			"cell", cell, "generation", generation, "txid", txid,
+			"status", status, "attempts", st.attempts)
+		return
+	}
+
+	e.needsRepair[cell] = true
+	e.logger.Warn("cell refused, scheduling a rebuild",
+		"cell", cell, "generation", generation, "txid", txid,
+		"status", status, "attempt", st.attempts, "of", maxRetries)
+}
+
+// clearRetries forgets a cell's refusal count once it has advanced past the
+// generation being counted. Callers must hold the write lock.
+//
+// Consecutive is the whole point of the bound: a cell that refuses generation
+// 249 three times is stuck, but one that refuses 249, recovers, runs a hundred
+// generations and then refuses 349 has met two unrelated intermittent faults and
+// must not be halted for the sum of them.
+func (e *Engine) clearRetriesLocked(cell int, generation uint64) {
+	if st, ok := e.retries[cell]; ok && generation > st.generation {
+		delete(e.retries, cell)
 	}
 }
 
