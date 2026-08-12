@@ -9,13 +9,19 @@
 //	address   print the address that funds this deployment
 //	fund      internalize a mined funding transaction
 //	run       start the automaton and its web UI
+//
+// The subcommands are ordered, not a menu: address, then a payment, then fund
+// once that payment is MINED, then fuel, then genesis, then run. See usage and
+// the README runbook.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -34,6 +40,12 @@ import (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		// `rule110 run -h` asked for the flag list and the flag package has
+		// already printed it. Reporting that as an error, and exiting non-zero,
+		// made the one command that documents a subcommand look broken.
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		fmt.Fprintf(os.Stderr, "rule110: %v\n", err)
 		os.Exit(1)
 	}
@@ -71,20 +83,64 @@ func run(args []string) error {
 func usage() {
 	fmt.Fprint(os.Stderr, `rule110 — Rule 110 as a Bitcoin Script covenant
 
-  rule110 address [flags]   print the funding address for this deployment
-  rule110 fund [flags]      internalize a mined funding transaction
-  rule110 genesis [flags]   create generation 0: one UTXO per cell
-  rule110 step [flags]      advance one cell by one generation
-  rule110 run [flags]       start the automaton and its web UI
-  rule110 fuel [flags]      mint coins so a whole generation can fan out
-  rule110 depth-probe       measure how deep an unconfirmed chain this network accepts
-  rule110 help              show this message
+Usage: rule110 <subcommand> [flags]
 
-Common flags:
-  -arcade-url string   arcade instance to broadcast through
-  -network string      main | test | ttn | tstn  (default tstn)
-  -data-dir string     wallet database and key file (this IS the wallet)
-  -cells int           ring size, a multiple of 8
+The subcommands are a sequence, not a menu. A new deployment runs them in order:
+
+  1  rule110 address                 print the funding address (offline; needs no arcade)
+  2  send coin to that address       from any wallet
+  3  wait for that payment to be MINED
+  4  rule110 fund -tx <hex> -bump <hex>
+                                     internalize it; BOTH flags are required, because
+                                     the wallet verifies the merkle proof in -bump
+  5  rule110 fuel                    mint the coins one generation fans out across
+  6  rule110 genesis                 create generation 0: one UTXO per cell
+  7  rule110 run                     start the automaton and its web UI
+
+Also:
+  rule110 step -cell N               advance a single cell by hand
+  rule110 depth-probe                measure how deep an unconfirmed chain this
+                                     network accepts (destroys the cell it probes)
+  rule110 help                       show this message
+
+Run "rule110 <subcommand> -h" for that subcommand's flags with their defaults.
+
+Environment. Each is only the default for the matching flag, which wins:
+  RULE110_ARCADE_URL       -arcade-url        arcade instance to broadcast through (required)
+  RULE110_CHAINTRACKS_URL  -chaintracks-url   headers service; empty derives it from -arcade-url
+  RULE110_NETWORK          -network           main | test | ttn | tstn  (default tstn)
+  RULE110_DATA_DIR         -data-dir          wallet database and key file — this IS the wallet
+  RULE110_POSTGRES_DSN     -postgres-dsn      storage DSN; empty uses SQLite, which is much
+                                              slower under a 128-way fan-out
+  RULE110_ADDR             -addr              web UI listen address (run only)
+
+Flags every subcommand accepts, beyond the five above:
+  -originator string       BRC-100 originator, FQDN-shaped
+  -cell-sats uint          satoshis each cell UTXO carries
+  -concurrency int         how many cells advance at once
+  -max-db-conns int        storage connection pool size
+  -apply-concurrency int   monitor workers applying arcade status batches
+  -full-status             subscribe to every status transition (~4x the events)
+  -chronicle               verify with Chronicle-era script rules; required, because the
+                           covenant contains OP_2MUL (default true)
+  -fee-sat-per-kb int      fee rate, above arcade's 100 sat/kB floor
+  -throughput              fund from a denominated fuel pool instead of contending for change
+  -fuel-sats uint          value of one fuel coin
+  -fuel-pool uint          how many fuel coins the keeper maintains
+  -max-depth uint          how far a cell may run ahead of its newest mined transaction
+                           (0 = unbounded); measure it with depth-probe, do not assume it
+  -max-lag uint            how far the clock may run ahead of the slowest cell
+
+Subcommand flags:
+  fund         -tx, -bump (both required), -vout, -description
+  fuel         -count, -sats
+  genesis      -cells, -rule, -seed
+  step         -cell
+  run          -addr, -rate, -start
+  depth-probe  -cell, -max
+
+The ring size is fixed at genesis, so -cells is a genesis flag only: run, step and
+depth-probe read it back out of the recorded state.
 `)
 }
 
@@ -97,7 +153,10 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.StringVar(&cfg.DataDir, "data-dir", envOr("RULE110_DATA_DIR", cfg.DataDir),
 		"wallet database and key file — losing this loses the coins")
 	fs.StringVar(&cfg.Originator, "originator", cfg.Originator, "BRC-100 originator (FQDN-shaped)")
-	fs.IntVar(&cfg.Cells, "cells", cfg.Cells, "ring size (multiple of 8)")
+	// -cells is deliberately NOT here. The ring size is fixed when genesis
+	// creates the UTXOs, and run/step/depth-probe read it back from the recorded
+	// state; offering the flag on those made it look adjustable, which it is not.
+	// cmdGenesis binds it.
 	fs.Uint64Var(&cfg.CellSatoshis, "cell-sats", cfg.CellSatoshis, "satoshis each cell UTXO carries")
 	fs.StringVar(&cfg.PostgresDSN, "postgres-dsn", envOr("RULE110_POSTGRES_DSN", ""),
 		"PostgreSQL DSN; empty uses SQLite (much slower under a wide fan-out)")
@@ -131,11 +190,11 @@ func cmdAddress(args []string) error {
 	cfg := chain.DefaultConfig()
 	fs := flag.NewFlagSet("address", flag.ContinueOnError)
 	network := bindCommon(fs, &cfg)
-	rule := fs.Uint("rule", uint(cfg.Rule), "Wolfram rule number")
+	// No -rule here: the address is derived from the identity key and the
+	// network, and nothing else. It used to accept -rule and discard it.
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg.Rule = ca.Rule(*rule)
 
 	net, err := parseNetwork(*network)
 	if err != nil {
@@ -164,10 +223,11 @@ func cmdAddress(args []string) error {
 	fmt.Printf("derivation:      %s / %s\n", target.DerivationPrefix, target.DerivationSuffix)
 	fmt.Println()
 	fmt.Println("Send a payment to the address above, wait for it to be mined, then run:")
-	fmt.Printf("  rule110 fund -tx <raw-tx-hex> -data-dir %s\n", cfg.DataDir)
+	fmt.Printf("  rule110 fund -tx <tx-hex> -bump <bump-hex> -data-dir %s\n", cfg.DataDir)
 	fmt.Println()
 	fmt.Println("The funding transaction must be MINED before it can be internalized:")
-	fmt.Println("the wallet verifies its merkle proof against the headers service.")
+	fmt.Println("the wallet verifies the merkle proof in -bump against the headers")
+	fmt.Println("service, so -bump is required and a mempool transaction will not do.")
 
 	return nil
 }
@@ -225,6 +285,9 @@ func cmdGenesis(args []string) error {
 	cfg := chain.DefaultConfig()
 	fs := flag.NewFlagSet("genesis", flag.ContinueOnError)
 	network := bindCommon(fs, &cfg)
+	// Only genesis can choose the ring size: it is what creates the UTXOs, and
+	// every later subcommand reads the size back out of the recorded state.
+	fs.IntVar(&cfg.Cells, "cells", cfg.Cells, "ring size (multiple of 8); fixed here for the life of the deployment")
 	rule := fs.Uint("rule", uint(cfg.Rule), "Wolfram rule number")
 	seedHex := fs.String("seed", "", "initial row as hex; empty seeds a single live cell at index 0")
 	if err := fs.Parse(args); err != nil {
@@ -440,7 +503,7 @@ func cmdRun(args []string) error {
 	if basket, denom, target, on := cfg.FuelPool(); on {
 		fmt.Printf("fuel:    %d x %d sat in %q, kept topped up\n", target, denom, basket)
 	}
-	fmt.Printf("\n  UI ready at http://localhost%s\n\n", *addr)
+	fmt.Printf("\n  UI ready at %s\n\n", uiURL(*addr))
 
 	return web.New(eng, logger).Serve(ctx, *addr)
 }
@@ -492,6 +555,28 @@ func cmdFuel(args []string) error {
 	fmt.Printf("\nclaimable coins after: %d\n", after)
 	fmt.Printf("balance: %d sat\n", balance)
 	return nil
+}
+
+// uiURL renders a listen address as a URL that can actually be opened.
+//
+// The previous version printed "http://localhost" concatenated with the raw
+// address, which is right for the ":8110" default and wrong for every other
+// value: RULE110_ADDR=0.0.0.0:8110 — the setting a container uses — came out as
+// "http://localhost0.0.0.0:8110".
+//
+// A wildcard host is not reachable as written, so it becomes localhost; a host
+// that was named explicitly is kept, since that is where the operator asked the
+// server to be.
+func uiURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + addr
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 func seedRow(cells int, hexSeed string) (ca.Row, error) {
