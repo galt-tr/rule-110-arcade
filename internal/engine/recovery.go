@@ -104,14 +104,8 @@ func Recover(ctx context.Context, l chain.Ledger, oracle chain.TxStatus, compile
 
 	var decisions []CellRecovery
 	for cell, p := range positions {
-		var rec chain.Recovery
-		var err error
-		switch {
-		case p.Unknown:
-			rec, err = chain.RecoverCell(ctx, l, compiled, p.Tip, p.Attempted, d.Cells, d.Rule, tipDepth)
-		case p.Rejected:
-			rec, err = recoverRejected(ctx, l, oracle, compiled, d, store, p, opts)
-		default:
+		rec, considered, err := decideCell(ctx, l, oracle, compiled, d, store, p, opts)
+		if !considered {
 			continue
 		}
 		if err != nil {
@@ -128,6 +122,27 @@ func Recover(ctx context.Context, l chain.Ledger, oracle chain.TxStatus, compile
 		out[cell] = applied
 	}
 	return out, decisions, nil
+}
+
+// decideCell is the whole of Recover's per-cell dispatch, extracted so the
+// operator's pass and the engine's runtime repair reach the same decision by
+// running the same code rather than by two implementations agreeing.
+//
+// considered is false for a cell with nothing to decide — a healthy cell, or one
+// derivation withheld because its wreckage is a cascade (see maxWreckage).
+func decideCell(ctx context.Context, l chain.Ledger, oracle chain.TxStatus, compiled *cellscript.Compiled,
+	d *chain.Deployment, store *history.Store, p CellPosition, opts RecoverOptions,
+) (rec chain.Recovery, considered bool, err error) {
+
+	switch {
+	case p.Unknown:
+		rec, err = chain.RecoverCell(ctx, l, compiled, p.Tip, p.Attempted, d.Cells, d.Rule, tipDepth)
+	case p.Rejected:
+		rec, err = recoverRejected(ctx, l, oracle, compiled, d, store, p, opts)
+	default:
+		return chain.Recovery{}, false, nil
+	}
+	return rec, true, err
 }
 
 // isSpentTip selects the cells whose halt might be a lost transition rather
@@ -433,7 +448,7 @@ func (e *Engine) recoverUnknown(ctx context.Context, positions []CellPosition) [
 	// the one repair that does not establish what happened, and the engine reaches
 	// this path unattended on every acquisition of the lease — which is precisely
 	// when nobody is watching. See RecoverOptions.
-	out, decisions, err := Recover(ctx, e.chain, e.chain.Oracle, e.compiled, e.deployment, e.store,
+	out, decisions, err := Recover(ctx, e.ledger, e.oracle, e.compiled, e.deployment, e.store,
 		positions, RecoverOptions{Apply: true})
 	if err != nil {
 		e.logger.ErrorContext(ctx, "recovery failed; the affected cells stay halted", "err", err)
@@ -449,6 +464,121 @@ func (e *Engine) recoverUnknown(ctx context.Context, positions []CellPosition) [
 		}
 	}
 	return out
+}
+
+// repairCell rebuilds one cell after a network refusal, on the cell's own worker
+// goroutine and under the lease the engine already holds.
+//
+// # Why this may retry an unexplained refusal when recoverUnknown may not
+//
+// RecoverOptions.RetryRefused is documented as off by default and never set by
+// the engine's own auto-recovery, and the argument there is sound: that path runs
+// on every acquisition of the lease, over all 128 cells at once, unattended,
+// right after a crash — which is precisely when nobody is watching and when the
+// program knows least about why anything failed.
+//
+// This path is a different situation wearing the same words. It runs for ONE
+// cell, in response to ONE observed refusal of a transition this process built
+// and broadcast seconds earlier, on a cell that was demonstrably advancing until
+// it was refused, and it is bounded: maxRetries consecutive refusals of the same
+// generation and the cell halts for a human after all. The safety argument is
+// unchanged and is the same one chain.RetryRefusal makes — a refused transaction
+// spends nothing, so the tip is still unspent and rebuilding cannot double spend;
+// and if the tip HAS been spent, the rebuild is refused as UTXO_SPENT naming the
+// spender, which RecoverSpentTip then adopts.
+//
+// # The loop, and bug 9a
+//
+// A refusal usually leaves more than one dead row: everything the cell built on
+// the refused output is doomed too, and each pass of the reviewed repair retracts
+// exactly one row, deliberately, so that each row gets its own evidence.
+// Iterating here clears the whole pile in one repair without inventing a bulk
+// retraction that would need a new safety argument — and it must clear it, since
+// derivation stops offering a cell to recovery at all once maxWreckage rejections
+// are stacked above its tip.
+//
+// Every pass re-derives from the STORE. That is the bug 9a guard: the tip comes
+// from the newest row the network actually accepted, verified against the
+// covenant locking script by chain.DeriveTip, and never from the refused
+// transaction's own output.
+func (e *Engine) repairCell(ctx context.Context, cell int) {
+	e.mu.Lock()
+	delete(e.needsRepair, cell)
+	e.mu.Unlock()
+
+	// Bounded by what derivation will even offer: past maxWreckage stacked
+	// rejections a cell is a cascade and is withheld, so there is no pile this
+	// can usefully chase further than that.
+	for pass := 0; pass <= maxWreckage; pass++ {
+		positions, err := DeriveTips(ctx, e.ledger, e.compiled, e.deployment, e.store)
+		if err != nil {
+			e.haltRepair(ctx, cell, "re-derive the cell's tip: "+err.Error())
+			return
+		}
+		if cell >= len(positions) {
+			e.haltRepair(ctx, cell, "cell is outside the derived ring")
+			return
+		}
+		p := positions[cell]
+
+		rec, considered, err := decideCell(ctx, e.ledger, e.oracle, e.compiled, e.deployment,
+			e.store, p, RecoverOptions{Apply: true, RetryRefused: true})
+		if err != nil {
+			e.haltRepair(ctx, cell, "decide the repair: "+err.Error())
+			return
+		}
+		if !considered {
+			// Nothing left to repair: either the pile is gone and the cell can
+			// advance, or derivation withheld it as a cascade and p.Halted says so.
+			e.adoptRepaired(ctx, cell, p)
+			return
+		}
+		if rec.Verdict == chain.VerdictHalt {
+			e.haltRepair(ctx, cell, rec.Reason)
+			return
+		}
+
+		applied, err := applyRecovery(ctx, e.store, cell, p, rec)
+		if err != nil {
+			e.haltRepair(ctx, cell, "apply the repair: "+err.Error())
+			return
+		}
+		e.logger.InfoContext(ctx, "repaired a refused cell",
+			"cell", cell, "pass", pass+1, "verdict", rec.Verdict.String(), "reason", rec.Reason)
+		e.adoptRepaired(ctx, cell, applied)
+	}
+	e.haltRepair(ctx, cell, fmt.Sprintf(
+		"still refused after %d repair passes; the wreckage above this cell's tip is not clearing",
+		maxWreckage+1))
+}
+
+// adoptRepaired installs a repaired position and lets the cell run again.
+func (e *Engine) adoptRepaired(ctx context.Context, cell int, p CellPosition) {
+	_ = ctx
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.tips[cell] = p.Tip
+	if p.Halted {
+		e.halted[cell] = true
+		e.haltReason[cell] = p.HaltReason
+	} else {
+		delete(e.halted, cell)
+		delete(e.haltReason, cell)
+	}
+	e.generation = e.frontierLocked()
+	e.notify()
+}
+
+// haltRepair stops a cell that could not be repaired, keeping the reason.
+func (e *Engine) haltRepair(ctx context.Context, cell int, reason string) {
+	e.logger.WarnContext(ctx, "cell halted; the refusal could not be repaired",
+		"cell", cell, "reason", reason)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.halted[cell] = true
+	e.haltReason[cell] = reason
+	delete(e.needsRepair, cell)
+	e.notify()
 }
 
 // FormatRecovery renders one decision for an operator.

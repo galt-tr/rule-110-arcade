@@ -247,6 +247,82 @@ func (s *Store) UpdateStatus(ctx context.Context, txid string, status Status, er
 	return nil
 }
 
+// StatusUpdate is one pending status write, as UpdateStatusBatch takes them.
+type StatusUpdate struct {
+	TxID   string
+	Status Status
+	Err    string
+}
+
+// UpdateStatusBatch advances many transactions' statuses in one round trip.
+//
+// The status stream delivers in bursts — a generation of 128 cells settles as
+// 128 events, and a mined block arrives as a wave — so the round trip, not the
+// row count, is the cost. One statement per event also meant one connection held
+// per event, against a pool of maxOpenConns; the queueing that produced was
+// indistinguishable from a slow network.
+//
+// Written as a single UPDATE against a VALUES list rather than a transaction of
+// single-row updates: the latter still pays per-statement round trips, which is
+// the thing being removed. Duplicate txids within one batch are collapsed by the
+// caller, so the join here matches at most one row per txid.
+func (s *Store) UpdateStatusBatch(ctx context.Context, updates []StatusUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	if len(updates) == 1 {
+		return s.UpdateStatus(ctx, updates[0].TxID, updates[0].Status, updates[0].Err)
+	}
+
+	now := time.Now().UTC()
+	args := make([]any, 0, len(updates)*3+1)
+	args = append(args, now)
+
+	var b strings.Builder
+	b.WriteString(`UPDATE cell_txs SET status = v.status, err = v.err, updated_at = ? FROM (VALUES `)
+	for i := range updates {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(?, ?, ?)")
+		args = append(args, updates[i].TxID, string(updates[i].Status), updates[i].Err)
+	}
+	b.WriteString(`) AS v(txid, status, err) WHERE cell_txs.txid = v.txid`)
+
+	if !s.postgres {
+		// SQLite has UPDATE ... FROM only from 3.33, and modernc's driver types
+		// a bare VALUES list differently. The fallback is the honest one: a
+		// transaction of single-row updates. SQLite is the local-development
+		// store, never the deployment, so the round trips do not matter there.
+		return s.updateStatusBatchTx(ctx, updates, now)
+	}
+
+	if _, err := s.db.ExecContext(ctx, s.rebind(b.String()), args...); err != nil {
+		return fmt.Errorf("history: update %d statuses: %w", len(updates), err)
+	}
+	return nil
+}
+
+// updateStatusBatchTx is the SQLite path for UpdateStatusBatch.
+func (s *Store) updateStatusBatchTx(ctx context.Context, updates []StatusUpdate, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("history: begin status batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	q := s.rebind(`UPDATE cell_txs SET status = ?, err = ?, updated_at = ? WHERE txid = ?`)
+	for _, u := range updates {
+		if _, err := tx.ExecContext(ctx, q, string(u.Status), u.Err, now, u.TxID); err != nil {
+			return fmt.Errorf("history: update %s: %w", u.TxID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("history: commit status batch: %w", err)
+	}
+	return nil
+}
+
 // Unsettled returns the transactions that have not reached a terminal status.
 //
 // This is the live tracking set. Everything else is settled history and needs

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
@@ -40,8 +41,50 @@ type Chain struct {
 	// behind that txid have to come from somewhere that cannot go stale.
 	provider *storage.Provider
 
+	// statusObserver is where the monitor daemon's applied status batches are
+	// delivered. It is a pointer swapped in after construction because the
+	// daemon starts inside Open, before there is an Engine to hand them to —
+	// see OnStatus.
+	statusObserver atomic.Pointer[func([]arcade.TxRecord)]
+
 	logger  *slog.Logger
 	closers []func(context.Context) error
+}
+
+// OnStatus registers fn to receive every batch of arcade status records the
+// monitor's SSE pipeline applies.
+//
+// This exists so the UI can be driven off the ONE stream the monitor already
+// holds. The engine used to open its own arcade.StreamStatus subscription, which
+// is worse than it looks: arcade's GET /events has no per-client filter, so a
+// second connection on the same callback token receives a full duplicate of
+// every event and doubles arcade's per-event fan-out cost — for a fan-out that
+// is already the measured bottleneck. It also made the engine the "slow SSE
+// client" arcade drops events for, because that subscription applied each event
+// synchronously on the reader goroutine.
+//
+// fn must not block: it runs on the monitor's applier goroutine, and time spent
+// there is time the applier is not draining its hand-off queue.
+//
+// Registration is safe at any time; batches applied before it are simply not
+// delivered. That gap is not a correctness problem here because the stream is
+// the fast path, not the authority — the engine's reconciler polls arcade for
+// anything still in flight.
+func (c *Chain) OnStatus(fn func([]arcade.TxRecord)) {
+	if fn == nil {
+		c.statusObserver.Store(nil)
+		return
+	}
+	c.statusObserver.Store(&fn)
+}
+
+// dispatchStatus forwards an applied batch to the registered observer, if any.
+// It is the closure handed to monitor.WithStatusObserver at construction, when
+// there is nothing to forward to yet.
+func (c *Chain) dispatchStatus(recs []arcade.TxRecord) {
+	if fn := c.statusObserver.Load(); fn != nil {
+		(*fn)(recs)
+	}
 }
 
 // Open builds a Chain from cfg, creating the wallet on first use.
@@ -238,6 +281,9 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		// all. Statuses are what release the depth gate here, so losing them
 		// would wedge every cell.
 		monitor.WithApplyConcurrency(cfg.ApplyConcurrency),
+		// The UI's status feed, off this one connection rather than a second
+		// subscription of our own. See Chain.OnStatus.
+		monitor.WithStatusObserver(c.dispatchStatus),
 	)
 	if err != nil {
 		c.close(ctx)

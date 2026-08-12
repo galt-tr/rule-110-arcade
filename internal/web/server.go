@@ -32,14 +32,37 @@ var staticRoot = func() fs.FS {
 	return sub
 }()
 
+// Automaton is what the HTTP layer needs from the engine.
+//
+// Narrow deliberately, and an interface rather than the concrete type so the
+// handlers can be tested without standing up a wallet, a store and a chain. The
+// engine satisfies it.
+type Automaton interface {
+	// Snapshot is the full in-memory history, for the initial page load.
+	Snapshot() engine.Snapshot
+	// SnapshotTail is the recent window, which the client merges by generation
+	// number.
+	SnapshotTail() engine.Snapshot
+	// Stats is the scalars with no history, for metrics and readiness.
+	Stats() engine.Snapshot
+	// PublishedTail is the tail already marshalled, shared by every subscriber.
+	PublishedTail() ([]byte, bool)
+	// Changed is closed the next time the snapshot changes.
+	Changed() <-chan struct{}
+
+	SetMode(engine.Mode)
+	SetRate(float64)
+	Step()
+}
+
 // Server exposes the engine over HTTP.
 type Server struct {
-	engine *engine.Engine
+	engine Automaton
 	logger *slog.Logger
 }
 
 // New builds the HTTP handler set.
-func New(e *engine.Engine, logger *slog.Logger) *Server {
+func New(e Automaton, logger *slog.Logger) *Server {
 	return &Server{engine: e, logger: logger}
 }
 
@@ -73,7 +96,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // the standby that takes over. Failing readiness in either case would remove
 // the endpoint that explains the situation.
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	snap := s.engine.Snapshot()
+	snap := s.engine.Stats()
 	writeJSON(w, map[string]any{
 		"status":  "ok",
 		"leader":  snap.Leader,
@@ -97,16 +120,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	ctx := r.Context()
-	// Coalesce bursts: a generation of 128 cells produces 128 updates, and the
-	// UI only needs the resulting state, not every intermediate one.
-	const minInterval = 100 * time.Millisecond
 
+	// Write the tail the engine has already built and marshalled. Every
+	// subscriber writes the same bytes: the work of a push is done once for the
+	// process, on the publisher's goroutine, rather than once per client here.
+	// The client merges the tail into the full history it fetched from
+	// /api/state.
 	send := func() error {
-		// Stream the tail only; the client merges it into the full history it
-		// fetched from /api/state.
-		data, err := json.Marshal(s.engine.SnapshotTail())
-		if err != nil {
-			return err
+		data, ok := s.engine.PublishedTail()
+		if !ok {
+			return nil // nothing published yet; the next change will bring one
 		}
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return err
@@ -115,25 +138,31 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
+	// Subscribe BEFORE sending, here and on every pass below. Acquiring the
+	// channel afterwards leaves a window in which a change closes a channel
+	// nobody holds, stranding that update until some later change happens to
+	// fire — which, once the automaton goes quiet, is never. That showed up as a
+	// stale final frame after pause, because the 15s keepalive carries no data.
+	changed := s.engine.Changed()
 	if err := send(); err != nil {
 		return
 	}
 	for {
-		changed := s.engine.Changed()
 		select {
 		case <-ctx.Done():
 			return
 		case <-changed:
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(minInterval):
-			}
+			changed = s.engine.Changed()
+			// No wait: bursts are already coalesced by the engine's publisher,
+			// so this sends on the leading edge rather than delaying every
+			// update by a fixed interval to coalesce the few that need it.
 			if err := send(); err != nil {
 				return
 			}
 		case <-time.After(15 * time.Second):
-			// Keepalive: proxies drop idle event streams.
+			// Keepalive: proxies drop idle event streams. Deliberately not a
+			// data frame — nothing has changed, and re-sending the tail every
+			// 15s to an idle browser is bandwidth for no information.
 			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
 				return
 			}
@@ -168,7 +197,10 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown action "+strconv.Quote(req.Action), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, s.engine.Snapshot())
+	// The tail, not the whole history: the client merges by generation number,
+	// so a tail carries everything a control response can usefully say. Returning
+	// the full history meant every button click copied all of maxHistory.
+	writeJSON(w, s.engine.SnapshotTail())
 }
 
 // Serve runs the HTTP server until ctx is cancelled.
@@ -209,7 +241,9 @@ func writeJSON(w http.ResponseWriter, v any) {
 // would not move turned out to be the depth governor doing its job. Those are
 // indistinguishable from the outside without waiting_on_coin and depth.
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	snap := s.engine.Snapshot()
+	// Stats, not Snapshot: every number below is a scalar, and a scrape happens
+	// on a timer whether or not anyone is watching the diagram.
+	snap := s.engine.Stats()
 	bool01 := func(b bool) int {
 		if b {
 			return 1

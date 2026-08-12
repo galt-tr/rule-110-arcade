@@ -16,7 +16,7 @@ go 1.26.3
 // module paths are compared only for the module being replaced, Go accepts the
 // substitution even though the fork's go.mod still declares the bsv-blockchain
 // path.
-replace github.com/bsv-blockchain/go-arcade-toolbox => github.com/galt-tr/go-arcade-toolbox v0.0.0-20260812020910-67eea9f105b1
+replace github.com/bsv-blockchain/go-arcade-toolbox => github.com/galt-tr/go-arcade-toolbox v0.0.0-20260812141020-a63e087d9be6
 
 // Runar's two modules import each other: packages/runar-go needs
 // compilers/go/codegen, and compilers/go/compiler needs

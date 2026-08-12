@@ -58,38 +58,34 @@ func rank(s TxState) int {
 	}
 }
 
-// watchStatus subscribes to arcade's status stream and reflects it in the UI.
+// watchStatus attaches the engine to the monitor's status pipeline.
 //
 // Without this the engine only ever knows that a transaction was ACCEPTED at
 // intake; it never learns that the network saw it, mined it, or rejected it. A
 // rejected cell would keep showing as broadcast and, worse, the engine would go
 // on trying to spend an output that does not exist.
+//
+// This used to be our own arcade.StreamStatus subscription, which was wrong in
+// two compounding ways.
+//
+// It was a SECOND connection on the same callback token, while the wallet
+// monitor already held one. Arcade's GET /events has no per-client filter, so
+// the duplicate received every event twice over and doubled arcade's per-event
+// fan-out cost — against a fan-out that is already the measured bottleneck.
+//
+// And it was the slow consumer that behaviour punishes: every event applied
+// synchronously on the reader goroutine, under the engine's global write lock,
+// across a Postgres round trip. A reader that stops draining its socket is a
+// reader arcade drops events for.
+//
+// The replay cursor went with it, and that is a strict gain: it lived in a local
+// variable that reset to "" on every restart, and arcade replays only
+// NON-terminal statuses to a cold connection — so terminal statuses that landed
+// while we were down were silently lost. The monitor's cursor is durable.
 func (e *Engine) watchStatus(ctx context.Context) {
-	// lastEventID is the replay cursor. Reconnecting with an empty cursor would
-	// resume from "now" and silently drop every event that fired while we were
-	// disconnected — precisely the updates most likely to matter, since a
-	// dropped stream and a burst of status changes tend to coincide.
-	lastEventID := ""
-
-	for {
-		err := e.chain.Oracle.StreamStatus(ctx, lastEventID, func(ev arcade.StatusEvent) error {
-			if ev.ID != "" {
-				lastEventID = ev.ID
-			}
-			e.applyStatus(ev.Record.TxID, ev.Record.Status, ev.Record.ExtraInfo)
-			return nil
-		})
-		if ctx.Err() != nil {
-			return
-		}
-		e.logger.WarnContext(ctx, "arcade status stream ended, reconnecting",
-			"err", err, "resumeFrom", lastEventID)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
+	e.chain.OnStatus(e.applyStatusBatch)
+	<-ctx.Done()
+	e.chain.OnStatus(nil)
 }
 
 // reconcile polls arcade for cells that are still non-terminal.
@@ -129,55 +125,213 @@ func (e *Engine) reconcile(ctx context.Context) {
 }
 
 // applyStatus records a status update against whichever cell owns the txid.
+//
+// The single-record door into applyStatusBatch, kept for the reconciler and for
+// the rejection-reason backfill.
 func (e *Engine) applyStatus(txid string, status arcade.Status, extra string) {
-	next, ok := stateFor(status)
-	if !ok {
+	e.applyStatusBatch([]arcade.TxRecord{{TxID: txid, Status: status, ExtraInfo: extra}})
+}
+
+// applyStatusBatch records a batch of status updates against the cells that own
+// them. It is what monitor.WithStatusObserver delivers into.
+//
+// Three properties matter here and none of them held before.
+//
+// ONE LOCK ACQUISITION PER BATCH, NOT PER EVENT. Ownership is decided first,
+// under a read lock; a status for a txid that is not ours — and with
+// FullStatusUpdates the stream carries a great many — now costs a read lock
+// rather than the engine's global write lock.
+//
+// NO DATABASE WRITE UNDER THE LOCK. The writes are handed to a batching writer
+// after the lock is released. Holding the global lock across a Postgres round
+// trip serialised all 128 cell workers, every snapshot reader and the clock
+// behind the network, once per event.
+//
+// IT MUST NOT BLOCK. This runs inline on the monitor's applier goroutine, so
+// anything slow here stops that applier draining its hand-off queue, and a
+// hand-off queue that fills stalls the SSE reader — which is how arcade comes to
+// drop events for a slow client. Everything below is memory plus a non-blocking
+// enqueue.
+func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
+	if len(recs) == 0 {
 		return
 	}
+
+	// Pass 1, read lock: keep only records that are ours and that say something
+	// new. This is the cheap filter that keeps foreign traffic off the write
+	// lock entirely.
+	type pending struct {
+		rec  arcade.TxRecord
+		next TxState
+	}
+	var work []pending
+	e.mu.RLock()
+	for _, rec := range recs {
+		next, ok := stateFor(rec.Status)
+		if !ok {
+			continue
+		}
+		if _, known := e.txIndex[rec.TxID]; !known {
+			continue // not one of ours
+		}
+		work = append(work, pending{rec: rec, next: next})
+	}
+	e.mu.RUnlock()
+
+	if len(work) == 0 {
+		return
+	}
+
+	// Pass 2, one write lock for the whole batch. Nothing in here does I/O.
+	var (
+		writes  []history.StatusUpdate
+		reasons []struct {
+			txid string
+			cell int
+		}
+		changed bool
+	)
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	for _, w := range work {
+		// Re-read the index under the write lock: a terminal status earlier in
+		// this same batch may already have evicted it.
+		loc, known := e.txIndex[w.rec.TxID]
+		if !known {
+			continue
+		}
 
-	loc, known := e.txIndex[txid]
-	if !known {
-		return // not one of ours
-	}
-	genIdx := indexOfGeneration(e.history, loc.generation)
-	if genIdx < 0 || loc.cell >= len(e.history[genIdx].Cells) {
-		// Trimmed out of the in-memory window. The store still has it, so
-		// persist the status even though nothing is left to redraw.
-		e.persistStatus(txid, next, status, extra)
-		return
-	}
-	cell := &e.history[genIdx].Cells[loc.cell]
-	if rank(next) <= rank(cell.State) {
-		return
-	}
+		st := history.Status(w.next)
+		errMsg := ""
+		if w.next == TxFailed {
+			errMsg = rejectionMessage(w.rec.Status, w.rec.ExtraInfo)
+		}
 
-	cell.State = next
+		genIdx := indexOfGeneration(e.history, loc.generation)
+		if genIdx < 0 || loc.cell >= len(e.history[genIdx].Cells) {
+			// Trimmed out of the in-memory window. The store still has it, so
+			// persist the status even though nothing is left to redraw.
+			writes = append(writes, history.StatusUpdate{TxID: w.rec.TxID, Status: st, Err: errMsg})
+			if st.IsTerminal() {
+				delete(e.txIndex, w.rec.TxID)
+			}
+			continue
+		}
 
-	// A mined transaction shortens that cell's unconfirmed chain, which is what
-	// releases its depth gate. Without this the governor would clamp every cell
-	// shut after MaxUnconfirmedDepth generations and never reopen.
-	if next == TxMined && loc.generation > e.lastMined[loc.cell] {
-		e.lastMined[loc.cell] = loc.generation
-	}
+		cell := &e.history[genIdx].Cells[loc.cell]
+		if rank(w.next) <= rank(cell.State) {
+			continue
+		}
+		cell.State = w.next
+		changed = true
 
-	// Persist before anything else: this status is the fact worth keeping.
-	e.persistStatus(txid, next, status, extra)
+		// A mined transaction shortens that cell's unconfirmed chain, which is
+		// what releases its depth gate. Without this the governor would clamp
+		// every cell shut after MaxUnconfirmedDepth generations and never
+		// reopen. It stays on this path, synchronously, for that reason.
+		if w.next == TxMined && loc.generation > e.lastMined[loc.cell] {
+			e.lastMined[loc.cell] = loc.generation
+		}
 
-	if next == TxFailed {
-		cell.Err = rejectionMessage(status, extra)
-		// Halt the cell. Its successor UTXO does not exist, so every later
-		// generation would try to spend a phantom output and fail with
-		// "utxo already spent" — noise that hides the original rejection.
-		e.halted[loc.cell] = true
-		e.logger.Warn("cell halted by rejection", "cell", loc.cell, "txid", txid, "status", string(status))
-		if extra == "" {
-			go e.fetchRejectionReason(txid, loc.cell)
+		writes = append(writes, history.StatusUpdate{TxID: w.rec.TxID, Status: st, Err: errMsg})
+		if st.IsTerminal() {
+			delete(e.txIndex, w.rec.TxID)
+		}
+
+		if w.next == TxFailed {
+			cell.Err = errMsg
+			e.noteRefusalLocked(loc.cell, loc.generation, w.rec.TxID, string(w.rec.Status), errMsg)
+			if w.rec.ExtraInfo == "" {
+				reasons = append(reasons, struct {
+					txid string
+					cell int
+				}{w.rec.TxID, loc.cell})
+			}
 		}
 	}
-	e.notify()
+	if changed {
+		// Once per batch, not once per event. A generation settling used to
+		// wake all 128 cell workers, the clock and every SSE handler 128 times.
+		e.notify()
+	}
+	e.mu.Unlock()
+
+	// Everything past here is off the lock.
+	e.enqueueStatusWrites(writes)
+	for _, r := range reasons {
+		go e.fetchRejectionReason(r.txid, r.cell)
+	}
+}
+
+// maxRetries is how many consecutive refusals of the SAME generation a cell may
+// rebuild through before it halts and waits for a human.
+//
+// Refusals here are intermittent, not deterministic: measured at roughly 2 per
+// 16,000 transactions, and a refused generation has been retracted, rebuilt and
+// accepted on the live deployment. So the first refusal says almost nothing and
+// the third says a great deal — something about this particular transition does
+// not work, and rebuilding it a fourth time is a loop, not a repair.
+const maxRetries = 3
+
+// retryState counts consecutive refusals of one generation.
+type retryState struct {
+	generation uint64
+	attempts   int
+}
+
+// noteRefusalLocked records a network refusal and decides whether the cell
+// rebuilds that generation or halts. Callers must hold the write lock.
+//
+// The cell used to halt here, unconditionally and for ever — one refusal cost a
+// cell until an operator ran `rule110 recover`. Since refusals are intermittent
+// that is monotonic erosion: the ring loses cells one at a time for a reason that
+// usually goes away by itself.
+//
+// Nothing here does I/O or derivation. This runs inline on the monitor's applier
+// goroutine, and a slow observer stops that applier draining its hand-off queue,
+// which stalls the SSE reader for the whole process. The repair itself is left to
+// the cell's own worker; see repairCell.
+func (e *Engine) noteRefusalLocked(cell int, generation uint64, txid, status, reason string) {
+	st := e.retries[cell]
+	if st.generation != generation {
+		st = retryState{generation: generation}
+	}
+	st.attempts++
+	e.retries[cell] = st
+
+	if st.attempts > maxRetries {
+		// Halt. Its successor UTXO does not exist, so every later generation
+		// would try to spend a phantom output and fail with "utxo already
+		// spent" — noise that hides the original rejection.
+		e.halted[cell] = true
+		// The reason, which this path used to drop: it set halted and left
+		// haltReason empty, so the UI and /metrics reported a halted cell with
+		// nothing to say about it.
+		e.haltReason[cell] = reason
+		delete(e.needsRepair, cell)
+		e.logger.Warn("cell halted by rejection",
+			"cell", cell, "generation", generation, "txid", txid,
+			"status", status, "attempts", st.attempts)
+		return
+	}
+
+	e.needsRepair[cell] = true
+	e.logger.Warn("cell refused, scheduling a rebuild",
+		"cell", cell, "generation", generation, "txid", txid,
+		"status", status, "attempt", st.attempts, "of", maxRetries)
+}
+
+// clearRetries forgets a cell's refusal count once it has advanced past the
+// generation being counted. Callers must hold the write lock.
+//
+// Consecutive is the whole point of the bound: a cell that refuses generation
+// 249 three times is stuck, but one that refuses 249, recovers, runs a hundred
+// generations and then refuses 349 has met two unrelated intermittent faults and
+// must not be halted for the sum of them.
+func (e *Engine) clearRetriesLocked(cell int, generation uint64) {
+	if st, ok := e.retries[cell]; ok && generation > st.generation {
+		delete(e.retries, cell)
+	}
 }
 
 // fetchRejectionReason asks arcade why a transaction was rejected, when the
@@ -223,23 +377,123 @@ func (e *Engine) fetchRejectionReason(txid string, cell int) {
 	}
 }
 
-// persistStatus writes a status to the store and drops the transaction from the
-// live index once it can no longer change. Callers must hold the write lock.
-func (e *Engine) persistStatus(txid string, next TxState, status arcade.Status, extra string) {
-	st := history.Status(next)
-	errMsg := ""
-	if next == TxFailed {
-		errMsg = rejectionMessage(status, extra)
+const (
+	// statusWriteQueue is the apply→writer hand-off buffer. It has to absorb a
+	// burst — a generation of 128 cells settling, or a mined block's wave —
+	// without the enqueue ever blocking, because the enqueue happens on the
+	// monitor's applier goroutine and a stall there propagates back to the SSE
+	// reader.
+	statusWriteQueue = 8192
+
+	// statusWriteLinger is how long the writer waits for more updates once the
+	// queue has run dry, before writing what it has. It converts arrival rate
+	// into batch size: at idle it is never paid at all (the writer only lingers
+	// when it already holds something), and under load it turns a burst of
+	// single-row updates into one statement.
+	statusWriteLinger = 10 * time.Millisecond
+
+	// statusWriteMax bounds one statement.
+	statusWriteMax = 512
+)
+
+// enqueueStatusWrites hands status writes to the batching writer.
+//
+// Never blocks. If the queue is full the write is dropped and logged rather than
+// stalling the caller: the caller is the monitor's applier goroutine, and
+// blocking it stalls the SSE reader for every consumer in the process. A dropped
+// write costs a stale `status` column until the reconciler polls that
+// transaction and re-applies it — which is exactly the convergence guarantee the
+// reconciler exists to provide. The in-memory state, which is what the UI draws,
+// is already correct by this point.
+func (e *Engine) enqueueStatusWrites(writes []history.StatusUpdate) {
+	for _, w := range writes {
+		select {
+		case e.statusWrites <- w:
+		default:
+			e.logger.Warn("status write queue full, deferring to the reconciler", "txid", w.TxID)
+		}
 	}
-	if err := e.store.UpdateStatus(context.Background(), txid, st, errMsg); err != nil {
-		e.logger.Error("persist status", "txid", txid, "err", err)
+}
+
+// writeStatuses drains the status-write queue into batched store writes.
+//
+// One goroutine, so writes stay ordered per txid, and a bounded batch per
+// statement. Ordering across txids does not matter — each update is keyed by
+// txid and the in-memory rank guard has already decided what the status is.
+func (e *Engine) writeStatuses(ctx context.Context) {
+	for {
+		batch, ok := e.collectStatusWrites(ctx)
+		if len(batch) > 0 {
+			// Not ctx: a cancelled context here would abandon the final drain,
+			// and these writes are the record of statuses already applied in
+			// memory. Bounded instead by its own timeout.
+			writeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := e.store.UpdateStatusBatch(writeCtx, batch); err != nil {
+				e.logger.Error("persist statuses", "count", len(batch), "err", err)
+			}
+			cancel()
+		}
+		if !ok {
+			return
+		}
+	}
+}
+
+// collectStatusWrites drains one batch. It reports false once the context is
+// done and the queue is empty, having returned whatever was still in flight.
+//
+// Duplicate txids within a batch are collapsed to the last write, which is the
+// one the rank guard settled on — and which keeps UpdateStatusBatch's VALUES
+// join matching at most one row per txid.
+func (e *Engine) collectStatusWrites(ctx context.Context) ([]history.StatusUpdate, bool) {
+	var (
+		batch []history.StatusUpdate
+		seen  map[string]int
+	)
+	add := func(u history.StatusUpdate) {
+		if seen == nil {
+			seen = make(map[string]int, statusWriteMax)
+		}
+		if i, dup := seen[u.TxID]; dup {
+			batch[i] = u
+			return
+		}
+		seen[u.TxID] = len(batch)
+		batch = append(batch, u)
 	}
 
-	// Terminal: arcade has nothing further to say, so stop tracking it. The
-	// record stays in the store; only the live index shrinks.
-	if st.IsTerminal() {
-		delete(e.txIndex, txid)
+	// Block for the first one; there is nothing to write until it arrives.
+	select {
+	case <-ctx.Done():
+		// Drain what is already queued, then stop.
+		for {
+			select {
+			case u := <-e.statusWrites:
+				add(u)
+				if len(batch) >= statusWriteMax {
+					return batch, true
+				}
+			default:
+				return batch, false
+			}
+		}
+	case u := <-e.statusWrites:
+		add(u)
 	}
+
+	linger := time.NewTimer(statusWriteLinger)
+	defer linger.Stop()
+	for len(batch) < statusWriteMax {
+		select {
+		case u := <-e.statusWrites:
+			add(u)
+		case <-linger.C:
+			return batch, true
+		case <-ctx.Done():
+			return batch, true
+		}
+	}
+	return batch, true
 }
 
 // rejectionMessage renders arcade's verdict for display and for the store.
@@ -279,6 +533,14 @@ func (e *Engine) reconcileBatch(ctx context.Context, pending []history.CellTx) {
 		return
 	}
 	work := make(chan history.CellTx)
+	// Collect what the poll finds and apply it as one batch at the end, rather
+	// than having 16 workers each take the engine's write lock per transaction.
+	// A pass of reconcileLimit used to be a write-lock storm on top of the live
+	// stream, every tick.
+	var (
+		mu    sync.Mutex
+		found []arcade.TxRecord
+	)
 	var wg sync.WaitGroup
 	for range min(reconcileWorkers, len(pending)) {
 		wg.Add(1)
@@ -289,7 +551,9 @@ func (e *Engine) reconcileBatch(ctx context.Context, pending []history.CellTx) {
 				if err != nil || rec == nil {
 					continue // not known to arcade yet; the stream may still deliver it
 				}
-				e.applyStatus(rec.TxID, rec.Status, rec.ExtraInfo)
+				mu.Lock()
+				found = append(found, *rec)
+				mu.Unlock()
 			}
 		}()
 	}
@@ -298,10 +562,12 @@ func (e *Engine) reconcileBatch(ctx context.Context, pending []history.CellTx) {
 		case <-ctx.Done():
 			close(work)
 			wg.Wait()
+			e.applyStatusBatch(found)
 			return
 		case work <- c:
 		}
 	}
 	close(work)
 	wg.Wait()
+	e.applyStatusBatch(found)
 }
