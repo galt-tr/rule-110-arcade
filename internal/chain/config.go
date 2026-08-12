@@ -5,6 +5,7 @@ package chain
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 
@@ -55,11 +56,6 @@ type Config struct {
 	// MaxDBConns bounds the storage connection pool. The benchmarks pair it
 	// with worker count (conns ~ workers + margin).
 	MaxDBConns int
-
-	// Concurrency bounds how many cells advance at once. Unbounded fan-out
-	// makes SQLite worse, not better: the writers queue on a lock and the
-	// latency shows up as a stalled generation.
-	Concurrency int
 
 	// MaxUnconfirmedDepth bounds how far ahead of its newest mined transaction
 	// a cell may run, or 0 for no bound.
@@ -165,7 +161,6 @@ func DefaultConfig() Config {
 		CellSatoshis: 1,
 		Chronicle:    true,
 		MaxDBConns:   72,
-		Concurrency:  32,
 		// Below the 250 we measured without a rejection, well above the 64 this
 		// was set to when the limit was still assumed rather than tested.
 		MaxUnconfirmedDepth: 200,
@@ -173,8 +168,8 @@ func DefaultConfig() Config {
 		FeeSatPerKB:         125,
 		MinBroadcastFeeRate: 100,
 		// A cell transition is ~4.1 kB, so ~512 satoshis of fee at 125 sat/kB.
-		// 1000 leaves comfortable change above the ~48 satoshi dust floor while
-		// stranding little value per coin.
+		// 1000 leaves comfortable change above the 48 satoshi dust floor (see
+		// dustFloor) while stranding little value per coin.
 		FuelDenomination:  1000,
 		FuelPoolSize:      20000,
 		Throughput:        true,
@@ -214,6 +209,26 @@ func (c *Config) Validate() error {
 	// alone: zero legitimately means "no depth limit".
 	if c.MaxLag == 0 {
 		c.MaxLag = DefaultConfig().MaxLag
+	}
+	// Both of these are caught here because both fail a long way from their
+	// cause. A zero fee rate prices every transaction at nothing, and nothing
+	// local objects: utxoManagement's denomination check compares against a
+	// marginal input fee that is also zero, so the configuration validates and
+	// the first rejection arrives from arcade, per transaction, as an
+	// insufficient-fee error nobody would trace back to a flag.
+	if c.FeeSatPerKB <= 0 {
+		return fmt.Errorf("chain: fee rate must be positive, got %d sat/kB "+
+			"(arcade's floor is 100; see Config.FeeSatPerKB for why we price above it)", c.FeeSatPerKB)
+	}
+	// Apply concurrency fails the other way — silently. monitor's
+	// WithApplyConcurrency IGNORES a non-positive value, so asking for zero
+	// leaves the toolbox default of 8 running: the very setting this field
+	// exists to raise, and whose failure is arcade dropping status events for a
+	// slow client rather than anything that looks like a misconfiguration.
+	if c.ApplyConcurrency <= 0 {
+		return fmt.Errorf("chain: apply concurrency must be positive, got %d "+
+			"(a non-positive value is ignored and silently leaves the toolbox default of 8)",
+			c.ApplyConcurrency)
 	}
 	if c.Originator == "" {
 		return fmt.Errorf("chain: originator is required")
@@ -269,4 +284,36 @@ func (c *Config) FuelPool() (basket string, denomination, target uint64, enabled
 		return "", 0, 0, false
 	}
 	return um.Throughput.PoolBasket, c.FuelDenomination, c.FuelPoolSize, true
+}
+
+// minSpendBytes is the smallest transaction that can spend one P2PKH output:
+// one P2PKH input and one P2PKH output. 8 envelope + 1 input count + 148 input
+// + 1 output count + 34 output = 192, the figure the toolbox's own size test
+// pins.
+const minSpendBytes = 192
+
+// dustFloor is the smallest change output the funder will keep, at feeSatPerKB.
+//
+// The toolbox does not use a constant. It prices the cheapest possible future
+// spend of an output — minSpendBytes — and requires the output to be worth
+// TWICE that fee; below it the change is dropped and donated to the miner.
+// So the floor moves with the fee rate, and quoting it as a bare number is how
+// this repository ended up asserting 40 in one file and 48 in another. Both
+// were the same formula: 40 is arcade's 100 sat/kB floor, 48 is the 125 sat/kB
+// we actually configure. 48 is the one that applies here.
+//
+// It matters because WithRequiredChangeOutput turns "the change vanished" from
+// a lost rounding error into a transaction the covenant cannot spend.
+func dustFloor(feeSatPerKB int64) uint64 {
+	return 2 * feeForBytes(minSpendBytes, feeSatPerKB)
+}
+
+// feeForBytes prices sizeBytes at feeSatPerKB, rounding up the way the toolbox
+// does. A non-positive rate is priced at zero rather than panicking; Validate
+// is what refuses it.
+func feeForBytes(sizeBytes uint64, feeSatPerKB int64) uint64 {
+	if feeSatPerKB <= 0 {
+		return 0
+	}
+	return uint64(math.Ceil(float64(sizeBytes) / 1000 * float64(feeSatPerKB)))
 }
