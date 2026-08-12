@@ -10,9 +10,10 @@
 //	fund      internalize a mined funding transaction
 //	run       start the automaton and its web UI
 //
-// The subcommands are ordered, not a menu: address, then a payment, then fund
-// once that payment is MINED, then fuel, then genesis, then run. See usage and
-// the README runbook.
+// `run` brings an empty deployment up by itself: it serves the UI, shows a
+// funding address, and creates generation 0 once somebody pays it. The other
+// subcommands are the same sequence done by hand, and remain the way to
+// internalize a payment that is already on chain, to audit, and to recover.
 package main
 
 import (
@@ -95,17 +96,31 @@ func usage() {
 
 Usage: rule110 <subcommand> [flags]
 
-The subcommands are a sequence, not a menu. A new deployment runs them in order:
+Starting a new deployment takes one command:
+
+  rule110 run -arcade-url <url> -public-funding
+
+An empty data directory is not an error. run serves the UI, shows its funding
+address, and mints fuel and creates generation 0 by itself once a payment lands.
+With -public-funding the page carries a Fund button any BRC-100 wallet can use.
+
+The same sequence by hand, which is still what to reach for when a payment is
+already on chain:
 
   1  rule110 address                 print the funding address (offline; needs no arcade)
   2  send coin to that address       from any wallet
-  3  wait for that payment to be MINED
+  3  wait for that payment to be MINED  (this path only: a raw transaction
+                                     carries no ancestry, so nothing but a
+                                     merkle proof shows it is real)
   4  rule110 fund -tx <hex> -bump <hex>
-                                     internalize it; BOTH flags are required, because
-                                     the wallet verifies the merkle proof in -bump
+                                     internalize it; BOTH flags are required
   5  rule110 fuel                    mint the coins one generation fans out across
   6  rule110 genesis                 create generation 0: one UTXO per cell
   7  rule110 run                     start the automaton and its web UI
+
+Order matters at one place in particular: fuel BEFORE genesis. Under the
+throughput strategy genesis is funded from the pool, so creating it first finds
+an empty pool and fails against a wallet that plainly holds money.
 
 Also:
   rule110 audit                      re-derive the recorded history and check it against
@@ -131,10 +146,15 @@ Run "rule110 <subcommand> -h" for that subcommand's flags with their defaults.
 Environment. Each is only the default for the matching flag, which wins:
   RULE110_ARCADE_URL       -arcade-url        arcade instance to broadcast through (required)
   RULE110_CHAINTRACKS_URL  -chaintracks-url   headers service; empty derives it from -arcade-url
+  RULE110_EVENTS_URL       -events-url        arcade status stream; empty uses -arcade-url. Point it
+                                              at the sse service directly inside a cluster
+  RULE110_LOCK_CONTROLS    -lock-controls     refuse play/pause/step/rate; /api/control is
+                                              unauthenticated, so this is the lock
+  RULE110_PUBLIC_FUNDING   -public-funding    expose /api/funding and /api/fund
   RULE110_NETWORK          -network           main | test | ttn | tstn  (default tstn)
   RULE110_DATA_DIR         -data-dir          wallet database and key file — this IS the wallet
   RULE110_POSTGRES_DSN     -postgres-dsn      storage DSN; empty uses SQLite, which is much
-                                              slower under a 128-way fan-out
+                                              slower under a full generation's fan-out
   RULE110_ADDR             -addr              web UI listen address (run only)
 
 Flags every subcommand accepts, beyond the five above:
@@ -160,7 +180,7 @@ Subcommand flags:
   fuel         -count, -sats
   genesis      -cells, -rule, -seed
   step         -cell
-  run          -addr, -rate, -start
+  run          -addr, -rate, -start, -auto-recover
   depth-probe  -cell, -max
   audit        -from, -to, -last, -max-failures, -gaps
 
@@ -175,6 +195,8 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 		"arcade instance to broadcast through (required)")
 	fs.StringVar(&cfg.ChainTracksURL, "chaintracks-url", envOr("RULE110_CHAINTRACKS_URL", ""),
 		"headers service; empty derives it from the arcade URL")
+	fs.StringVar(&cfg.EventsURL, "events-url", envOr("RULE110_EVENTS_URL", ""),
+		"arcade status stream; empty uses the arcade URL. Point it at the sse service directly in-cluster")
 	fs.StringVar(&cfg.DataDir, "data-dir", envOr("RULE110_DATA_DIR", cfg.DataDir),
 		"wallet database and key file — losing this loses the coins")
 	fs.StringVar(&cfg.Originator, "originator", cfg.Originator, "BRC-100 originator (FQDN-shaped)")

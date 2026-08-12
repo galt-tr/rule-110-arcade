@@ -153,12 +153,31 @@ application, not to its packaging, and has not been made.
 
 ---
 
-## Runbook
+## Running it
 
-**These steps are ordered.** Nothing works out of sequence, and two of the
-orderings are not obvious: the funding payment must be *mined* before `fund`
-will take it, and `fuel` should come before `genesis` so the ring has coin to
-move on from the moment it exists.
+**The short version: `rule110 run`, then pay it.**
+
+A deployment with an empty data directory now brings itself up. `run` serves the
+UI immediately, shows its funding address, and — once a payment arrives — mints
+the first fuel and creates generation 0 by itself. With `-public-funding` the
+page carries a Fund button that any BRC-100 wallet can use, so the deployment
+can be started by somebody who has no shell access to it at all.
+
+```sh
+rule110 run -arcade-url https://arcade-v2-ttn-us-1.bsvblockchain.tech \
+            -network ttn -data-dir ./data -public-funding
+```
+
+The steps below are what that automates. They still exist, they are still
+supported, and they are what to reach for when something needs doing by hand —
+in particular `fund`, which takes a payment that is already on chain.
+
+### The manual sequence
+
+**Ordered.** One of the orderings is not obvious and cost this project real
+time: `fuel` must come before `genesis`, because under the throughput strategy
+genesis is funded *from* the pool, so creating it first finds an empty pool and
+fails with "not enough funds" against a wallet that plainly holds money.
 
 `rule110 help` prints the same sequence.
 
@@ -180,8 +199,15 @@ ordinary address is enough.
 
 ### 3. Wait for that payment to be mined
 
-Not optional, and not merely a good idea: step 4 verifies a merkle proof against
-the headers service. A payment sitting in the mempool cannot be internalized.
+Required *on this path*, and not merely a good idea: step 4 attaches a merkle
+proof, and a raw transaction carries no ancestry, so nothing else could show the
+payment is real.
+
+It is not a property of the wallet. `InternalizeAction` credits an unproven
+transaction at the unproven tier, which is spendable — a BEEF from a wallet
+carries its own proven ancestry and needs no block. That is what the Fund button
+uses, and it is why a payment made through the UI is credited in seconds while
+one made this way waits for a block.
 
 ### 4. Internalize it
 
@@ -412,18 +438,17 @@ before reading them:
   it on the next start rather than risk re-spending a consumed output.
 - **`fsGroup: 65532`** is what makes the PVC writable by the image's UID. See
   the two failure modes above for why that matters more than it looks.
-- **`POST /api/control` is unauthenticated.** There is no credential check on
-  it at all: anyone who can reach the pod can pause the automaton, resume it,
-  single-step it, or change its rate. The manifests state the exposure and do
-  not invent an auth scheme for it. The Service is a headless ClusterIP; guard
-  it above the pod with an ingress auth filter or a NetworkPolicy before
-  exposing it.
-- **Bootstrap runs as a Job.** Steps 1 and 4–6 of the runbook are one-shot
-  commands against the same PVC. `deploy/k8s/bootstrap-job.yaml` is how; scale
-  the StatefulSet to 0 first, because the writer lease protects the cell chains
-  and nothing else — `fuel` in particular draws on the same pool the running
-  engine's keeper is minting into. The image has no shell, so there is nothing
-  to `kubectl exec -- sh` into; run the binary directly.
+- **`POST /api/control` has no credential check**, so anyone who can reach the
+  pod can pause the automaton, resume it, single-step it, or change its rate.
+  `-lock-controls` is the answer for a public deployment: the handler returns
+  403 for all four actions and the engine's own setters refuse independently,
+  so hiding the buttons is not what does the work. Without it, guard the
+  endpoint above the pod.
+- **There is no bootstrap Job.** `run` on an empty PVC serves the UI, shows its
+  funding address and creates generation 0 by itself once a payment lands, so
+  the ordered runbook is no longer something a cluster has to be walked
+  through. The image has no shell in any case; the manual subcommands are still
+  there, run as the binary directly.
 
 `/metrics` is Prometheus text format, hand-rolled off the engine snapshot
 (`web.handleMetrics`). Every gauge there is one this project actually needed to

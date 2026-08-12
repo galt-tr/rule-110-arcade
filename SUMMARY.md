@@ -240,20 +240,27 @@ but that argument covers the *current* generation, not 32 of them. Fix: on
 pause, set `e.target = frontierLocked()`. Verify `TestPausedStillFinishesAStep`
 still passes rather than assuming it.
 
-### 3. `rule110 fuel` and `genesis` cannot bootstrap in throughput mode — [#3](https://github.com/galt-tr/rule-110-arcade/issues/3)
+### 3. `rule110 fuel` and `genesis` could not bootstrap in throughput mode — FIXED
 
-Both fail with `not enough funds` on a fresh wallet holding 30 BSV, after a
-4-minute retry, with an error that misleads on both counts it raises (the
-funding transaction *is* mined; the monitor is *not* the problem). In throughput
-mode the funder claims by exact denomination from the fuel pool, which is empty
-on a fresh wallet — so the command meant to create the pool cannot fund itself
-from it.
+Both failed with `not enough funds` on a fresh wallet holding 30 BSV, after a
+4-minute retry, with an error that misled on both counts it raised (the funding
+transaction *was* mined; the monitor was *not* the problem). The workaround on
+record was `-throughput=false`.
 
-Workaround, and how this deployment was bootstrapped: `-throughput=false`
-(`fuel` additionally needs an explicit `-sats 1000`). Note the keeper inside
-`rule110 run` does *not* have this problem, so the manual `fuel` step in the
-documented sequence may simply be unnecessary — worth deciding before changing
-the funder.
+**The cause was one unset field, and it is invisible from this repository.**
+storage's `fanOutSourceBasket` routes a fan-out by its DESTINATION: a shape whose
+`Basket` is the pool draws its funding from the RESERVE basket unless
+`SourceBasket` says otherwise. The reserve is the fuel keeper's own staging area —
+filled by aggregating change crumbs — so on a fresh wallet it is empty, while the
+deposit `internalize` just credited sits in change. The one command whose job is
+to create the pool could not fund itself.
+
+The keeper never had the bug only because its `RecycleBasket` setting becomes
+that same field.
+
+`Config.fuelShape` now names the source, and `TestFanOutDrawsFromTheChangeBasket`
+is the guard. Cold start runs fund → fuel → genesis with throughput left on, and
+`internal/boot` does exactly that unattended.
 
 ### 4. Replay the cascade cells (previous deployment only) — [#4](https://github.com/galt-tr/rule-110-arcade/issues/4)
 

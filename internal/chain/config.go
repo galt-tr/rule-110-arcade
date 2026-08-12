@@ -26,6 +26,20 @@ type Config struct {
 	// ArcadeURL", which is what a standard arcade deployment serves.
 	ChainTracksURL string
 
+	// EventsURL overrides the status stream. Empty means "the same host as
+	// ArcadeURL", which is what a standard arcade deployment serves.
+	//
+	// Worth overriding for two reasons. Arcade serves its SSE from a separate
+	// process behind the same hostname, so an ingress that does not route
+	// /events to it answers 404 and this deployment then learns nothing about
+	// its own transactions — they sit at "broadcast" in the diagram forever
+	// while the once-a-minute proof poll quietly does the work instead. And
+	// inside a cluster the stream is better taken from the sse Service
+	// directly: it is the highest-volume connection this process holds, and
+	// routing it through an ingress and a CDN adds two hops and a buffering
+	// layer to a stream whose whole value is being prompt.
+	EventsURL string
+
 	// Network is the BSV network the arcade instance is attached to.
 	Network defs.BSVNetwork
 
@@ -249,6 +263,7 @@ func (c *Config) Validate() error {
 	// a double slash.
 	c.ArcadeURL = strings.TrimRight(c.ArcadeURL, "/")
 	c.ChainTracksURL = strings.TrimRight(c.ChainTracksURL, "/")
+	c.EventsURL = strings.TrimRight(c.EventsURL, "/")
 
 	if c.Cells <= 0 || c.Cells%8 != 0 {
 		return fmt.Errorf("chain: cells must be a positive multiple of 8, got %d", c.Cells)
@@ -387,4 +402,13 @@ func feeForBytes(sizeBytes uint64, feeSatPerKB int64) uint64 {
 		return 0
 	}
 	return uint64(math.Ceil(float64(sizeBytes) / 1000 * float64(feeSatPerKB)))
+}
+
+// eventsURL is where the status stream lives: the override if there is one,
+// otherwise the arcade host itself.
+func (c *Config) eventsURL() string {
+	if c.EventsURL != "" {
+		return c.EventsURL
+	}
+	return c.ArcadeURL
 }
