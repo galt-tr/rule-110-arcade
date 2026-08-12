@@ -27,3 +27,7 @@ keys.json
 # Write-then-rename temporaries: both SaveState and LoadOrCreateIdentity write
 # to path + ".tmp" before renaming into place.
 *.tmp
+
+# Backups written by scripts/reset.sh before a destructive wipe. These contain
+# PRIVATE KEYS and a full wallet dump.
+/.reset-backups/
