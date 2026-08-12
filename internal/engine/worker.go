@@ -116,16 +116,38 @@ func (e *Engine) clock(ctx context.Context) {
 			e.wake()
 		}
 
-		wait := time.Duration(float64(time.Second) / rate)
-		if mode != ModeRunning {
-			// Paused or starved: nothing to schedule, so sleep on the state
-			// change instead of spinning. Step raises the target directly.
-			wait = time.Second
+		if mode == ModeRunning {
+			// The interval, and ONLY the interval. Waking on Changed here as
+			// well looks harmless and is not: notify() fires once per cell that
+			// records a transition, about 128 times a generation, so the clock
+			// woke on essentially every completed cell and raised the target
+			// again. The configured rate was not a rate at all — the automaton
+			// ran flat out, bounded only by maxLag.
+			//
+			// It hid because it could not bite until the automaton was fast.
+			// While a transition took ~4 seconds, cells could not keep up with
+			// 1 gen/s anyway and the target was always waiting for them.
+			// Measured after that stopped being true: -rate 1, 2, 3 and 5 all
+			// produced between 1.7 and 2.0 generations a second, which is
+			// capacity, not any of the numbers asked for.
+			//
+			// Nothing is lost by not watching Changed while running: mode is
+			// re-read at the top of every iteration, so a pause takes effect on
+			// the next tick and cannot raise the target in the meantime.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(float64(time.Second) / rate)):
+			}
+			continue
 		}
+
+		// Paused or starved: nothing to schedule, so sleep on the state change
+		// instead of spinning. Step raises the target directly.
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(wait):
+		case <-time.After(time.Second):
 		case <-e.Changed():
 		}
 	}
