@@ -511,6 +511,36 @@ func (s *Store) DeleteRejection(ctx context.Context, generation uint64, cell int
 	return nil
 }
 
+// DeleteUnsignedRejection removes a recorded failure that names NO transaction,
+// and only such a row.
+//
+// It is DeleteRejection's sibling rather than a relaxation of it. That one keys
+// on the txid it verified, which is the clause that keeps it off a different
+// transaction recorded at the same (generation, cell) since the decision was
+// made; a failure recorded before anything was signed has no txid to key on, so
+// it would have to pass "" and the clause would be doing nothing while still
+// looking like it was. Here the emptiness IS the key, and it is checked as
+// positively as the txid is there: the row must be `failed` AND must name no
+// transaction. A row that has since become a real transaction — a retry, the
+// engine, another writer — fails both clauses, the delete matches nothing, and
+// the cell stays halted, which is the direction that costs nothing.
+//
+// The row it exists for is the one chain.RecoverNotBroadcast decides about: a
+// transition that failed inside CreateAction, before signing, spending nothing.
+// Derivation halts a cell on such a row for ever, so recovery has to be able to
+// take it away.
+func (s *Store) DeleteUnsignedRejection(ctx context.Context, generation uint64, cell int) error {
+	// txid is NOT NULL with a '' default, so the empty string is the whole of
+	// how "no transaction" is spelled in this table.
+	q := `DELETE FROM cell_txs WHERE generation = ? AND cell = ? AND status = ? AND txid = ''`
+	_, err := s.db.ExecContext(ctx, s.rebind(q), generation, cell, string(StatusFailed))
+	if err != nil {
+		return fmt.Errorf(
+			"history: delete unsigned rejection for cell %d generation %d: %w", cell, generation, err)
+	}
+	return nil
+}
+
 // DeepTip is what derivation needs about a cell buried under more unsettled
 // records than the ordinary window covers.
 type DeepTip struct {

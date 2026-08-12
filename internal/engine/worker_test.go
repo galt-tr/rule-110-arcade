@@ -1,12 +1,16 @@
 package engine
 
 import (
+	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
 
+	"github.com/dymurray/rule-110-arcade/internal/chain"
 	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
@@ -336,6 +340,153 @@ func TestRetractionSparesARealTransaction(t *testing.T) {
 	}
 	if !found {
 		t.Error("retraction deleted a broadcast transaction; it must only remove write-ahead records")
+	}
+}
+
+// engineOn builds an engine over a fixture's store, deployment and contract.
+//
+// Distinct from newTestEngine because the property the next two tests are about
+// spans both halves of the program: the worker decides what to write, and
+// DERIVATION — the same code the next startup runs — decides whether what was
+// written halts the cell for ever. That question can only be asked of a store
+// the fixture is also able to derive from.
+func engineOn(t *testing.T, f *fixture) *Engine {
+	t.Helper()
+	e := &Engine{
+		chain:      &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
+		compiled:   f.compiled,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		deployment: f.facts,
+		tips:       make([]chain.CellChain, f.facts.Cells),
+		store:      f.store,
+		mode:       ModeRunning,
+		rate:       1,
+		changed:    make(chan struct{}),
+		txIndex:    map[string]txLoc{},
+		halted:     map[int]bool{},
+		haltReason: map[int]string{},
+		lastMined:  map[int]uint64{},
+		owner:      "test",
+		leader:     true,
+	}
+	for cell := range f.facts.Cells {
+		e.tips[cell] = f.genesisTip(cell)
+	}
+	return e
+}
+
+// TestALocalFailureDoesNotHaltACell is the live bug.
+//
+// chain.ErrNotBroadcast is set immediately before SignAction, and signing is what
+// broadcasts, so it means with certainty that nothing was signed and nothing
+// reached the network. The worker retracted its write-ahead record on it — and
+// then recorded a `failed` row anyway, which is exactly what DeriveTips halts a
+// cell on, permanently and at every startup after. 21 of the live deployment's
+// 128 cells were killed this way by one burst of "sorry, too many clients
+// already" inside CreateAction, every one of them with an empty txid, none of
+// them having spent anything.
+//
+// A database hiccup must cost a retry, not a cell.
+func TestALocalFailureDoesNotHaltACell(t *testing.T) {
+	f := newFixture(t)
+	e := engineOn(t, f)
+	const cell = 4
+
+	// One real generation, so the shape under test is a failure sitting directly
+	// on a tip rather than a cell that has never done anything.
+	good := f.advance(t, cell, f.genesisTip(cell), history.StatusBroadcast)
+	e.mu.Lock()
+	e.tips[cell] = good
+	// Unreadable stored bytes: a local fault that stops AdvanceCell before it can
+	// sign. WHICH local fault does not matter — CreateAction failing on a database
+	// connection is the one that happened — only that it comes back wrapped in
+	// ErrNotBroadcast, which is the claim being acted on.
+	e.tips[cell].RawTxHex = "not hex"
+	e.target = good.Generation + 1
+	e.mu.Unlock()
+
+	e.advanceCell(t.Context(), cell)
+
+	// The failure is still visible to whoever is watching...
+	e.mu.RLock()
+	lastErr, halted := e.lastError, e.halted[cell]
+	e.mu.RUnlock()
+	if !strings.Contains(lastErr, chain.ErrNotBroadcast.Error()) {
+		t.Errorf("lastError = %q, want the failure surfaced", lastErr)
+	}
+	if halted {
+		t.Error("the cell was halted in memory for a failure that never reached the network")
+	}
+	if !e.turnReady(cell) {
+		t.Error("the cell is not free to try that generation again on its next turn")
+	}
+
+	// ...and nothing durable was written. This is the assertion that matters: a
+	// restart must not find a reason to halt.
+	p := f.derive(t)[cell]
+	if p.Halted || p.Unknown {
+		t.Fatalf("cell %d came back halted after a purely local failure: %+v", cell, p)
+	}
+	if p.Tip.TxID != good.TxID || p.Tip.Generation != good.Generation {
+		t.Errorf("tip = %s at generation %d, want the unchanged %s at %d",
+			p.Tip.TxID, p.Tip.Generation, good.TxID, good.Generation)
+	}
+	tips, err := f.store.CellTips(t.Context(), f.facts.Cells, tipDepth)
+	if err != nil {
+		t.Fatalf("cell tips: %v", err)
+	}
+	for _, row := range tips[cell] {
+		if row.Generation > good.Generation {
+			t.Errorf("the store holds a %q row at generation %d above the tip; the write-ahead record "+
+				"must be retracted and no failure recorded", row.Status, row.Generation)
+		}
+	}
+
+	// And the cell really does go on to make the generation it failed at.
+	next := f.advance(t, cell, p.Tip, history.StatusBroadcast)
+	again := f.derive(t)[cell]
+	if again.Halted || again.Tip.TxID != next.TxID {
+		t.Errorf("cell %d = %+v, want advanced onto %s", cell, again, next.TxID)
+	}
+}
+
+// TestAFailureThatMayHaveBroadcastStillHaltsTheCell is the other half, and the
+// half that must not move.
+//
+// This error carries no sentinel, so it comes from at or after SignAction — the
+// point past which the transaction may exist on the network whatever the error
+// says. Retrying that generation would be a second transaction spending an
+// output the network may already have consumed, which is the double spend the
+// whole of this design exists to avoid. The cell halts, durably, and a human or
+// `rule110 recover` decides.
+func TestAFailureThatMayHaveBroadcastStillHaltsTheCell(t *testing.T) {
+	f := newFixture(t)
+	e := engineOn(t, f)
+	const cell = 4
+
+	good := f.advance(t, cell, f.genesisTip(cell), history.StatusBroadcast)
+	e.mu.Lock()
+	e.tips[cell] = good
+	e.mu.Unlock()
+
+	gen := good.Generation + 1
+	if !e.persist(history.CellTx{Generation: gen, Cell: cell, Status: history.StatusAttempting}) {
+		t.Fatal("write-ahead record could not be written")
+	}
+	e.transitionFailed(t.Context(), gen, cell, errors.New(
+		"chain: sign step action for cell 4: rpc error: connection reset by peer"))
+
+	p := f.derive(t)[cell]
+	if !p.Halted {
+		t.Fatal("a cell whose transition may have been signed came back running; " +
+			"it would re-spend an output the network may already hold")
+	}
+	if p.Tip.TxID != good.TxID {
+		t.Errorf("tip = %s, want it left at the last transaction actually broadcast (%s)",
+			p.Tip.TxID, good.TxID)
+	}
+	if !strings.Contains(p.HaltReason, "connection reset") {
+		t.Errorf("the halt should carry the failure that caused it, got: %q", p.HaltReason)
 	}
 }
 

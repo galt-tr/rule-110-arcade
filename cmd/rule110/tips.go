@@ -129,6 +129,14 @@ func cmdRecover(args []string) error {
 	network := bindCommon(fs, &cfg)
 	apply := fs.Bool("apply", false,
 		"write the decisions to the history store; without this it is a dry run")
+	// Opt-in, and separate from -apply, because it is a different KIND of
+	// decision rather than a stronger one. Every other repair resumes a cell on
+	// evidence about what happened to it; this one resumes on the fact that a
+	// refused transaction spends nothing, which makes the retry safe without
+	// saying it will work or why it failed. An operator should have to ask.
+	retryRefused := fs.Bool("retry-refused", false,
+		"also rebuild generations the network refused for an unexplained reason (safe — a refused "+
+			"transaction spends nothing — but it is not a diagnosis)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -158,18 +166,22 @@ func cmdRecover(args []string) error {
 	}
 
 	_, decisions, err := engine.Recover(ctx, d.chain, d.chain.Oracle, d.compiled, d.facts, d.store,
-		positions, *apply)
+		positions, engine.RecoverOptions{Apply: *apply, RetryRefused: *retryRefused})
 	if err != nil {
 		return err
 	}
 	if len(decisions) == 0 {
 		fmt.Println("no cell has an unresolved transition, a tip spent out from under it, or a " +
-			"rejection directly above its tip; nothing to recover")
+			"failure directly above its tip; nothing to recover")
 		return nil
 	}
 
 	if !*apply {
 		fmt.Println("DRY RUN — nothing has been written. Re-run with -apply to act on this.")
+	}
+	if *retryRefused {
+		fmt.Println("-retry-refused is ON: cells refused for an unexplained reason will rebuild that " +
+			"generation. That is safe (a refused transaction spends nothing) but it is not a diagnosis.")
 	}
 	fmt.Println()
 	for _, dec := range decisions {

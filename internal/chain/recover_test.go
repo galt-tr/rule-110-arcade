@@ -908,6 +908,272 @@ func TestStaleRejectionRefusesANonAdjacentRejection(t *testing.T) {
 	}
 }
 
+// aLocalFailure is what 21 cells of the live deployment were halted by: a
+// transition that died inside CreateAction, before anything was signed, when the
+// wallet's own database ran out of connections.
+//
+// The sentinel at the front is AdvanceCell's, wrapped in immediately before
+// SignAction, and it is the whole of what makes this record readable as "nothing
+// reached the network".
+const aLocalFailure = "chain: not broadcast: chain: create step action for cell 75: create action " +
+	"failed: failed to create action: storage: fund: failed to connect to `user=postgres " +
+	"database=rule110`: server error: FATAL: sorry, too many clients already (SQLSTATE 53300)"
+
+// TestNotBroadcastResumesOnBothFactsAndNothingLess is the repair for the 21, and
+// the four ways it must refuse.
+//
+// Resuming rebuilds the generation over the SAME tip, so it is a decision to
+// spend: it may only be reached when the record says twice over that nothing was
+// signed — our own sentinel at the front of the error, and no transaction named.
+func TestNotBroadcastResumesOnBothFactsAndNothingLess(t *testing.T) {
+	_, _, tip, _ := aGenesisTip(t)
+	gen := tip.Generation + 1
+
+	rec, err := RecoverNotBroadcast(tip, gen, "", aLocalFailure)
+	if err != nil {
+		t.Fatalf("RecoverNotBroadcast: %v", err)
+	}
+	if rec.Verdict != VerdictResume {
+		t.Fatalf("verdict = %s for a failure that never reached the network, want resume: %s",
+			rec.Verdict, rec.Reason)
+	}
+	if rec.Tip != tip {
+		t.Errorf("resume moved the tip to %+v; nothing here justifies moving it from %+v", rec.Tip, tip)
+	}
+	if len(rec.Steps) != 0 {
+		t.Errorf("steps = %+v; a resume adopts nothing", rec.Steps)
+	}
+	// The operator gets the failure that was set aside, not a summary of it: this
+	// is the only place the reason for a cell's lost generation is written down
+	// once the row is retracted.
+	if !strings.Contains(rec.Reason, "too many clients already") {
+		t.Errorf("the reason should quote the failure it set aside, got: %s", rec.Reason)
+	}
+
+	t.Run("a txid beside the sentinel is a contradiction", func(t *testing.T) {
+		// The sentinel says nothing was signed; a txid says something was. Both
+		// cannot be true, and the actionable half must not win by default: if
+		// something WAS signed, rebuilding this generation is a second transaction
+		// over a live output.
+		rec, err := RecoverNotBroadcast(tip, gen, strings.Repeat("cc", 32), aLocalFailure)
+		if err != nil {
+			t.Fatalf("RecoverNotBroadcast: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s for a not-broadcast record naming a transaction, want halt: %s",
+				rec.Verdict, rec.Reason)
+		}
+		if !strings.Contains(rec.Reason, "cannot both be true") {
+			t.Errorf("the reason should name the contradiction, got: %s", rec.Reason)
+		}
+	})
+
+	t.Run("a rejection is not a local failure", func(t *testing.T) {
+		// Arcade's own refusals reach the record by the same column and must never
+		// be read as "nothing was signed": the network was asked, and answered.
+		for _, recorded := range []string{
+			aRefusal,
+			"arcade: REJECTED: PROCESSING (4): [ProcessTransaction][8b1f] failed to validate transaction",
+			"",
+			// A message that merely CONTAINS the sentinel somewhere inside it. Only
+			// our own wrap puts it at the very front, so a substring match here
+			// would let an arcade message that quotes an error decide the cell.
+			"arcade: REJECTED: PROCESSING (4): upstream said \"chain: not broadcast: whatever\"",
+		} {
+			rec, err := RecoverNotBroadcast(tip, gen, "", recorded)
+			if err != nil {
+				t.Fatalf("RecoverNotBroadcast: %v", err)
+			}
+			if rec.Verdict != VerdictHalt {
+				t.Fatalf("verdict = %s for %q, want halt: %s", rec.Verdict, recorded, rec.Reason)
+			}
+			if IsNotBroadcast(recorded) {
+				t.Errorf("the selection predicate matched %q; it must anchor on the front", recorded)
+			}
+		}
+		if !IsNotBroadcast(aLocalFailure) {
+			t.Error("the selection predicate missed the record it exists for")
+		}
+	})
+
+	t.Run("a failure above the tip's own successor is a cascade", func(t *testing.T) {
+		for _, at := range []uint64{tip.Generation, gen + 1, gen + 170} {
+			rec, err := RecoverNotBroadcast(tip, at, "", aLocalFailure)
+			if err != nil {
+				t.Fatalf("RecoverNotBroadcast: %v", err)
+			}
+			if rec.Verdict != VerdictHalt {
+				t.Fatalf("verdict = %s for a failure at generation %d over a tip at %d, want halt: %s",
+					rec.Verdict, at, tip.Generation, rec.Reason)
+			}
+			if !strings.Contains(rec.Reason, "cascade") {
+				t.Errorf("the reason should say why non-adjacency matters, got: %s", rec.Reason)
+			}
+		}
+	})
+}
+
+// aProcessingRefusal is the message holding 13 cells of the live deployment
+// down. Nobody has explained it: it names the transaction that was refused and
+// says nothing about which input or rule was at fault.
+const aProcessingRefusal = "arcade: REJECTED: PROCESSING (4): " +
+	"[ProcessTransaction][8b1f0c] failed to validate transaction"
+
+// TestRetryRefusalIsSafetyNotDiagnosis is the opt-in repair, and the point is
+// what it claims.
+//
+// It resumes without establishing anything about why the transaction was
+// refused. The one fact it rests on is that a refused transaction spends
+// nothing, so the tip it was built on is still unspent and rebuilding cannot
+// double spend. That fact is only in evidence if the refused transaction really
+// did spend THIS tip, which is why the bytes are read.
+func TestRetryRefusalIsSafetyNotDiagnosis(t *testing.T) {
+	ctx := context.Background()
+	compiled, l, tip, row2, _ := aRepairedTip(t)
+
+	refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
+	txid := refused.TxID().String()
+	l.raw[txid] = refused.Bytes()
+
+	rec, err := RetryRefusal(ctx, l, tip, tip.Generation+1, txid, aProcessingRefusal)
+	if err != nil {
+		t.Fatalf("RetryRefusal: %v", err)
+	}
+	if rec.Verdict != VerdictResume {
+		t.Fatalf("verdict = %s for a refusal of a transaction that spent the tip, want resume: %s",
+			rec.Verdict, rec.Reason)
+	}
+	if rec.Tip != tip {
+		t.Errorf("resume moved the tip to %+v; a retry rebuilds the same generation from %+v", rec.Tip, tip)
+	}
+	if len(rec.Steps) != 0 {
+		t.Errorf("steps = %+v; a resume adopts nothing", rec.Steps)
+	}
+	// The distinction is the whole of what makes this different from the other
+	// resumes, so it has to survive into what the operator reads.
+	for _, want := range []string{"spends nothing", "NOT established", aProcessingRefusal} {
+		if !strings.Contains(rec.Reason, want) {
+			t.Errorf("the reason does not say %q — a retry must not read as an explanation:\n%s",
+				want, rec.Reason)
+		}
+	}
+}
+
+// TestRetryRefusalHaltsOnEveryOtherShape: the retry is safe only because the
+// refusal is known to be about the generation being rebuilt. Everything that
+// leaves that in doubt — and everything that belongs to a repair with real
+// evidence behind it — must halt instead.
+func TestRetryRefusalHaltsOnEveryOtherShape(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("it was built on a parent the cell no longer has", func(t *testing.T) {
+		// This is the superseded-parent case, which resumes on positive evidence
+		// and needs no flag. Answering it here would answer the wrong question.
+		compiled, l, tip, row2, phantomOut := aRepairedTip(t)
+		doomed := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomOut)
+		l.raw[doomed.TxID().String()] = doomed.Bytes()
+
+		rec, err := RetryRefusal(ctx, l, tip, tip.Generation+1, doomed.TxID().String(), aRefusal)
+		if err != nil {
+			t.Fatalf("RetryRefusal: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s, want halt: %s", rec.Verdict, rec.Reason)
+		}
+		if !strings.Contains(rec.Reason, "does not spend this cell's tip") {
+			t.Errorf("the reason should say the refusal was about another parent, got: %s", rec.Reason)
+		}
+	})
+
+	t.Run("the refusal is a UTXO_SPENT", func(t *testing.T) {
+		// The tip fix owns those, and its halt means the transaction it named could
+		// not be verified as ours — possibly a genuine foreign double spend, where
+		// the cell's chain is over and re-spending would churn for ever while
+		// burying the one signal an operator needs.
+		compiled, l, tip, row2, _ := aRepairedTip(t)
+		refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
+		txid := refused.TxID().String()
+		l.raw[txid] = refused.Bytes()
+
+		rec, err := RetryRefusal(ctx, l, tip, tip.Generation+1, txid,
+			liveRejection(tip, strings.Repeat("ee", 32)))
+		if err != nil {
+			t.Fatalf("RetryRefusal: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s for a UTXO_SPENT, want halt: %s", rec.Verdict, rec.Reason)
+		}
+	})
+
+	t.Run("the record names no transaction", func(t *testing.T) {
+		_, l, tip, _, _ := aRepairedTip(t)
+		rec, err := RetryRefusal(ctx, l, tip, tip.Generation+1, "", aProcessingRefusal)
+		if err != nil {
+			t.Fatalf("RetryRefusal: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s with nothing to read, want halt: %s", rec.Verdict, rec.Reason)
+		}
+	})
+
+	t.Run("the bytes cannot be fetched", func(t *testing.T) {
+		compiled, l, tip, row2, _ := aRepairedTip(t)
+		refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
+		l.raw[refused.TxID().String()] = refused.Bytes()
+		l.rawErr = errors.New("timeout")
+
+		rec, err := RetryRefusal(ctx, l, tip, tip.Generation+1, refused.TxID().String(), aProcessingRefusal)
+		if err != nil {
+			t.Fatalf("RetryRefusal: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s when the bytes could not be read, want halt: %s", rec.Verdict, rec.Reason)
+		}
+	})
+
+	t.Run("the bytes hash to a different transaction", func(t *testing.T) {
+		// Neither the wallet nor arcade is authenticated, so unchecked bytes served
+		// under this txid could claim to spend anything at all.
+		compiled, l, tip, row2, _ := aRepairedTip(t)
+		refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
+		recorded := strings.Repeat("5c", 32)
+		l.raw[recorded] = refused.Bytes()
+
+		rec, err := RetryRefusal(ctx, l, tip, tip.Generation+1, recorded, aProcessingRefusal)
+		if err != nil {
+			t.Fatalf("RetryRefusal: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s for bytes that hash elsewhere, want halt: %s", rec.Verdict, rec.Reason)
+		}
+	})
+
+	t.Run("the refusal is not adjacent to the tip", func(t *testing.T) {
+		// Cells 34, 51, 64 and 91 carry about 170 stacked refusals each. Every one
+		// of them is a transaction that spends the previous refused one, not the
+		// tip — but the adjacency test is checked here as well as in derivation,
+		// because neither may be safe only by virtue of the other being careful.
+		compiled, l, tip, row2, _ := aRepairedTip(t)
+		refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
+		txid := refused.TxID().String()
+		l.raw[txid] = refused.Bytes()
+
+		for _, at := range []uint64{tip.Generation, tip.Generation + 2, tip.Generation + 170} {
+			rec, err := RetryRefusal(ctx, l, tip, at, txid, aProcessingRefusal)
+			if err != nil {
+				t.Fatalf("RetryRefusal: %v", err)
+			}
+			if rec.Verdict != VerdictHalt {
+				t.Fatalf("verdict = %s for a refusal at generation %d over a tip at %d, want halt: %s",
+					rec.Verdict, at, tip.Generation, rec.Reason)
+			}
+			if !strings.Contains(rec.Reason, "cascade") {
+				t.Errorf("the reason should say why non-adjacency matters, got: %s", rec.Reason)
+			}
+		}
+	})
+}
+
 // TestSpentByReadsTheDoubledPrefix covers the parser on its own, because the
 // message it reads is the only surviving pointer to a lost tip and getting it
 // wrong in either direction is expensive: a missed parse leaves a recoverable

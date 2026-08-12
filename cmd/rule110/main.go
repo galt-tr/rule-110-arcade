@@ -114,9 +114,10 @@ Also:
   rule110 depth-probe                measure how deep an unconfirmed chain this
                                      network accepts (destroys the cell it probes)
   rule110 recover                    resolve cells whose tip is unknown after an
-                                     unclean shutdown, or whose tip was spent by a
-                                     transition we lost the record of (dry run
-                                     unless -apply)
+                                     unclean shutdown, whose tip was spent by a
+                                     transition we lost the record of, or that a
+                                     local failure halted without anything ever
+                                     reaching the network (dry run unless -apply)
   rule110 import-tips                backfill the history store from a legacy
                                      state.json (dry run unless -apply)
   rule110 prune                      reclaim wallet payload that can no longer be

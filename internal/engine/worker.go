@@ -22,6 +22,23 @@ const starvationGrace = 20 * time.Second
 // funding shortfall. Short enough to resume promptly, long enough not to spin.
 const backpressurePause = 25 * time.Millisecond
 
+// retryPause is how long a cell waits before re-attempting a generation whose
+// transition failed before anything could be signed.
+//
+// It exists because such a failure no longer halts the cell — see
+// transitionFailed — so nothing else bounds the retry. The tip has not moved, so
+// turnReady is true again the instant this returns, and the worker would
+// otherwise re-attempt at the speed the error comes back: 128 goroutines
+// reconnecting as fast as they can to the database that just answered "sorry,
+// too many clients already", which is the one response guaranteed to keep it
+// saying that.
+//
+// Half a second bounds a whole ring in trouble to a couple of hundred attempts
+// a second, and one stuck cell to two — which is also what keeps
+// transitionFailed's log line from becoming the outage. It is backpressure, not
+// a cure: the cure is an operator reading lastError.
+const retryPause = 500 * time.Millisecond
+
 // Run starts the clock, the status pipeline, and one worker per cell.
 //
 // There is no per-generation barrier. Cells advance independently and a slow
@@ -202,22 +219,7 @@ func (e *Engine) advanceCell(ctx context.Context, cell int) {
 
 	res, err := e.chain.AdvanceCell(ctx, e.compiled, tip, cells, rule)
 	if err != nil {
-		// Nothing reached the network, so the write-ahead record is a false
-		// alarm and has to go: leaving it would make the next startup treat a
-		// perfectly healthy cell as having an unknown tip. Shortfalls are the
-		// common case, and they all land here.
-		if errors.Is(err, chain.ErrNotBroadcast) {
-			e.retractAttempt(tip.Generation+1, cell)
-		}
-		if ctx.Err() != nil {
-			return
-		}
-		if isFundingShortfall(err) {
-			e.onShortfall(ctx, cell)
-			return
-		}
-		e.doneWaiting(cell)
-		e.recordCell(tip.Generation+1, cell, nil, err)
+		e.transitionFailed(ctx, tip.Generation+1, cell, err)
 		return
 	}
 
@@ -225,6 +227,69 @@ func (e *Engine) advanceCell(ctx context.Context, cell int) {
 	e.clearStarvation()
 	e.ensureGeneration(ctx, res.Generation, res.RowHex)
 	e.recordCell(res.Generation, cell, res, nil)
+}
+
+// transitionFailed decides what a transition that did not complete leaves
+// behind, which is really the question of whether the cell survives it.
+//
+// # A failure that never reached the network must not be durable
+//
+// chain.ErrNotBroadcast is set immediately BEFORE SignAction, and signing is
+// what broadcasts. So it says, with certainty, that nothing was signed and
+// nothing reached the network: the cell's tip is untouched and re-attempting the
+// same generation cannot double spend. Two things follow.
+//
+// The write-ahead record is retracted, because it now describes an attempt that
+// provably never happened and the next startup would otherwise read it as "this
+// cell's tip is UNKNOWN".
+//
+// And no `failed` row is written. That row is not a note for a human — it is
+// what DeriveTips reads to halt a cell, permanently, at this startup and every
+// one after it. Writing one for a local error means a database hiccup costs a
+// cell for good: 21 of the live deployment's 128 were halted by a single burst
+// of "sorry, too many clients already" inside CreateAction, every one of them
+// with an empty txid, none of them having spent anything. Nothing is lost by
+// staying quiet in the store, because the row would say nothing an operator can
+// act on that lastError, the cell's state in the UI and the log line below do
+// not already say — and unlike them it would outlive the problem it describes.
+//
+// # Everything else stays durable
+//
+// Past that line a transaction may exist on the network whatever the error says,
+// so the failure is recorded exactly as before and the cell halts until a human
+// or `rule110 recover` decides. A rejection is the network's verdict on a
+// transition that WAS offered to it, and rebuilding that generation unattended
+// is the double spend the whole of this design exists to avoid.
+//
+// Funding shortfalls are neither: they are ordinary backpressure, they return
+// early, and the automaton's own starvation handling owns them.
+func (e *Engine) transitionFailed(ctx context.Context, generation uint64, cell int, err error) {
+	notBroadcast := errors.Is(err, chain.ErrNotBroadcast)
+	if notBroadcast {
+		e.retractAttempt(generation, cell)
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if isFundingShortfall(err) {
+		e.onShortfall(ctx, cell)
+		return
+	}
+	e.doneWaiting(cell)
+
+	if notBroadcast {
+		// Visible, but not halting: the cell re-attempts this same generation on
+		// its next turn.
+		e.noteFailure(generation, cell, err)
+		e.logger.WarnContext(ctx, "cell transition failed before anything was signed; retrying",
+			"cell", cell, "generation", generation, "err", err)
+		select {
+		case <-ctx.Done():
+		case <-time.After(retryPause):
+		}
+		return
+	}
+	e.recordCell(generation, cell, nil, err)
 }
 
 // ensureGeneration makes sure a generation exists in the window and the store.
@@ -399,26 +464,20 @@ func (e *Engine) clearStarvation() {
 	e.notify()
 }
 
-// recordCell stores one cell's outcome and updates its chain tip.
+// recordCell stores one cell's outcome durably and updates its chain tip.
 //
-// generation is the generation NUMBER, resolved to a slice index here under the
-// lock. A cell can finish long after its generation was created, and the history
-// trim shifts every index, so an index captured earlier would address the wrong
-// row by the time the result lands.
+// generation is the generation NUMBER, resolved to a slice index under the lock.
+// A cell can finish long after its generation was created, and the history trim
+// shifts every index, so an index captured earlier would address the wrong row
+// by the time the result lands.
 func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, err error) {
-	e.mu.Lock()
-
-	// The store is the durable record and does not depend on the window, so it
-	// is written whether or not the generation is still displayable.
-	genIdx := indexOfGeneration(e.history, generation)
-
 	if err != nil {
-		if genIdx >= 0 {
-			e.history[genIdx].Cells[cell] = CellTx{Cell: cell, State: TxFailed, Err: err.Error()}
-		}
-		e.lastError = err.Error()
-		e.notify()
-		e.mu.Unlock()
+		e.noteFailure(generation, cell, err)
+		// The store is the durable record and does not depend on the window, so
+		// it is written whether or not the generation is still displayable. This
+		// row is also what halts the cell at the next startup, which is why
+		// transitionFailed keeps failures that never reached the network away
+		// from here.
 		e.persist(history.CellTx{
 			Generation: generation, Cell: cell,
 			Status: history.StatusFailed, Err: err.Error(),
@@ -426,6 +485,8 @@ func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, 
 		return
 	}
 
+	e.mu.Lock()
+	genIdx := indexOfGeneration(e.history, generation)
 	if genIdx >= 0 {
 		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
 	}
@@ -454,6 +515,28 @@ func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, 
 		Generation: generation, Cell: cell,
 		TxID: res.TxID, Status: history.StatusBroadcast,
 	})
+}
+
+// noteFailure shows one cell's failure to whoever is watching, and writes
+// nothing durable.
+//
+// Split out of recordCell because the two halves answer different questions. The
+// UI's copy and lastError describe what is happening NOW and are replaced by the
+// next thing that happens; the store's `failed` row is a verdict that outlives
+// the process and halts the cell. A failure that never reached the network earns
+// the first and must not earn the second. See transitionFailed.
+func (e *Engine) noteFailure(generation uint64, cell int, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Resolved to a slice index here under the lock: a cell can finish long after
+	// its generation was created, and the history trim shifts every index, so an
+	// index captured earlier would address the wrong row by the time the result
+	// lands.
+	if genIdx := indexOfGeneration(e.history, generation); genIdx >= 0 {
+		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, State: TxFailed, Err: err.Error()}
+	}
+	e.lastError = err.Error()
+	e.notify()
 }
 
 // wake nudges every waiter without changing anything.

@@ -680,6 +680,233 @@ func RecoverStaleRejection(ctx context.Context, l Ledger, tip CellChain,
 	}, nil
 }
 
+// notBroadcastPrefix is ErrNotBroadcast as it survives into the record.
+//
+// A failure before signing is stored as a STRING — cell_txs.err holds
+// err.Error() — so errors.Is is not available to anything reading it back, and
+// this is how that same question is spelled after the round trip. It is built
+// from the sentinel rather than typed out again so the two cannot drift apart:
+// renaming the sentinel changes what recovery looks for, in one place.
+//
+// The trailing ": " is part of it because AdvanceCell wraps with "%w: %w", so a
+// recorded not-broadcast failure always has a cause after the colon.
+var notBroadcastPrefix = ErrNotBroadcast.Error() + ": "
+
+// IsNotBroadcast reports whether a recorded failure is this program's own "and
+// nothing was signed" sentinel.
+//
+// A PREFIX, and deliberately not a substring and not case-folded — the opposite
+// choice from IsUTXOSpent, for the opposite reason. That predicate reads a
+// message ARCADE wrote, in whatever shape and casing arcade felt like, so it can
+// only match loosely. This one reads a message THIS program wrote: AdvanceCell's
+// deferred wrap puts the sentinel at the very front, lower-cased, always. So the
+// strictest possible match is also the accurate one, and it is what keeps an
+// arcade rejection that happens to quote a wrapped error somewhere in its body
+// from being read as proof that nothing was signed.
+func IsNotBroadcast(recorded string) bool {
+	return strings.HasPrefix(recorded, notBroadcastPrefix)
+}
+
+// RecoverNotBroadcast decides what to do with a cell halted by a failure that
+// happened before anything could be signed.
+//
+// # The damage
+//
+// Until this was fixed, a transition that failed locally was recorded as
+// `failed` just like a network rejection — and derivation halts a cell on a
+// `failed` row directly above its tip, permanently. So a moment of database
+// trouble inside CreateAction, which spends nothing and touches no network, cost
+// a cell for good. 21 of the live deployment's 128 were halted this way at once
+// by one burst of:
+//
+//	chain: not broadcast: chain: create step action for cell 75: create action failed:
+//	failed to create action: storage: fund: failed to connect to `user=postgres
+//	database=rule110`: ... FATAL: sorry, too many clients already (SQLSTATE 53300)
+//
+// The worker no longer writes such a row (see engine.transitionFailed). This is
+// for the ones already written.
+//
+// # Two facts, each sufficient on its own, and both required
+//
+// The verdict is resume only if BOTH hold:
+//
+//  1. the recorded error carries the ErrNotBroadcast prefix. That sentinel is
+//     set immediately before SignAction and signing is what broadcasts, so its
+//     presence means the transaction was never signed;
+//  2. the record names no transaction. A `failed` row with an empty txid was
+//     written by a path that had no txid to write, which again means nothing was
+//     ever signed.
+//
+// Each implies the other in a record this program wrote, which is exactly why
+// both are required: two independent statements of the same fact cannot both be
+// wrong unless the record is not one of ours, and a record that is not one of
+// ours is one to halt on. A message with the prefix but a txid beside it is
+// therefore NOT a near miss to be resolved in favour of the prefix — it is a
+// contradiction, and resuming on it would rebuild a generation over a
+// transaction that may be on the network.
+//
+// # What resuming costs if it is wrong
+//
+// Nothing is adopted and the tip does not move: the cell re-creates the
+// generation it already failed to create. If — contrary to both facts above —
+// something HAD been signed and broadcast, the rebuild would be a second
+// transaction spending a live output. That is why the evidence here has to be
+// positive and doubled rather than merely plausible.
+func RecoverNotBroadcast(tip CellChain, failed uint64, failedTxID, recorded string) (Recovery, error) {
+	cell := tip.Cell
+	if failed != tip.Generation+1 {
+		return halt(fmt.Sprintf(
+			"cell %d: the failure under examination is at generation %d but the tip is at generation %d; "+
+				"only a failure DIRECTLY above the tip describes the transition this cell is trying to "+
+				"make, and anything further up is a cascade this must not touch",
+			cell, failed, tip.Generation)), nil
+	}
+	if !IsNotBroadcast(recorded) {
+		return halt(fmt.Sprintf(
+			"cell %d: generation %d failed for a reason that does not begin with %q, so there is no "+
+				"evidence here that nothing was signed: %s",
+			cell, failed, ErrNotBroadcast.Error(), orNoReason(recorded))), nil
+	}
+	if failedTxID != "" {
+		return halt(fmt.Sprintf(
+			"cell %d: generation %d is recorded as having failed before anything was signed, but the same "+
+				"record names transaction %s — those cannot both be true, and a record we do not "+
+				"understand is not one to rebuild a generation on. A human decides. Recorded: %s",
+			cell, failed, failedTxID, orNoReason(recorded))), nil
+	}
+
+	return Recovery{
+		Verdict: VerdictResume, Tip: tip,
+		Reason: fmt.Sprintf(
+			"cell %d: generation %d failed before anything was signed — the error carries the %q sentinel, "+
+				"which is set before SignAction, and the record names no transaction — so nothing reached "+
+				"the network and this cell's tip %s:%d is untouched. Resuming from generation %d; the cell "+
+				"re-creates generation %d. What failed: %s",
+			cell, failed, ErrNotBroadcast.Error(), tip.TxID, tip.Vout, tip.Generation, failed,
+			orNoReason(recorded)),
+	}, nil
+}
+
+// RetryRefusal decides whether a cell halted by a refusal nobody has explained
+// may rebuild the generation that was refused.
+//
+// # What this proves, and what it does not
+//
+// It proves the retry is SAFE. It does not prove the retry will work, and
+// nothing in here should be read as a diagnosis. That is why it is opt-in: every
+// other path in this file resumes or adopts on evidence about what actually
+// happened, and this one resumes on evidence about what CANNOT happen.
+//
+// 13 cells of the live deployment are halted by:
+//
+//	arcade: REJECTED: PROCESSING (4): [ProcessTransaction][<txid>] failed to validate transaction
+//
+// We have never established why. The message names the transaction that was
+// refused and says nothing whatever about which of its inputs, or which rule,
+// was at fault — so there is nothing in it to reason from, and this does not try
+// to.
+//
+// # Why rebuilding is safe anyway
+//
+// A refused transaction spends nothing. Refusal is the network declining to take
+// it, so the tip it was built on is still unspent and a second transition
+// spending that same output is not a double spend — there is no first spend to
+// double. That is the whole argument, and it does not depend on knowing why the
+// refusal happened.
+//
+// If the record is WRONG about the refusal — if that transaction is on the
+// network after all — then the rebuild is refused in turn with UTXO_SPENT naming
+// it, and RecoverSpentTip adopts it on the next pass. The failure mode repairs
+// itself and costs one wasted transaction, which is the same trade
+// RecoverStaleRejection already makes.
+//
+// # Every condition
+//
+//  1. The refusal sits directly above the tip. Further up is a cascade; see
+//     RecoverStaleRejection.
+//  2. It is not a UTXO_SPENT. Those belong to RecoverSpentTip, and its halts are
+//     specific uncertainties — most importantly a foreign double spend, where
+//     the cell's chain is genuinely over and re-spending would churn forever
+//     while burying the one signal an operator needs.
+//  3. The record names a transaction, its bytes are readable, and they hash to
+//     that name. Without the bytes nothing below can be checked.
+//  4. It SPENDS THIS CELL'S TIP. This is what makes the refusal a verdict on the
+//     generation about to be rebuilt rather than on some other transaction: a
+//     refusal of something built on a parent the cell no longer has is
+//     RecoverStaleRejection's case, which resumes on stronger evidence and
+//     without needing this flag at all. Retrying here would answer the wrong
+//     question about the wrong output.
+func RetryRefusal(ctx context.Context, l Ledger, tip CellChain, rejected uint64,
+	rejectedTxID, rejection string) (Recovery, error) {
+
+	cell := tip.Cell
+	if rejected != tip.Generation+1 {
+		return halt(fmt.Sprintf(
+			"cell %d: the rejection under examination is at generation %d but the tip is at generation %d; "+
+				"only a rejection DIRECTLY above the tip describes a single refused transition, and "+
+				"anything further up is a cascade this must not touch",
+			cell, rejected, tip.Generation)), nil
+	}
+	if IsUTXOSpent(rejection) {
+		return halt(fmt.Sprintf(
+			"cell %d: generation %d was refused as UTXO_SPENT, which is a claim that this cell's output is "+
+				"already gone rather than an unexplained refusal. That is the tip fix's case, and its halt "+
+				"means the transaction named could not be verified as ours — possibly a foreign double "+
+				"spend. Rebuilding would spend against a conflict nobody has identified. Arcade said: %s",
+			cell, rejected, orNoReason(rejection))), nil
+	}
+	if rejectedTxID == "" {
+		return halt(fmt.Sprintf(
+			"cell %d: generation %d is recorded as rejected (%s) but the record names no transaction, so "+
+				"there is nothing to read and no way to tell what was refused",
+			cell, rejected, orNoReason(rejection))), nil
+	}
+
+	// The bytes are the evidence and the hash is what makes them evidence, for
+	// the same reason as everywhere else in this file: nothing that serves them
+	// is authenticated.
+	raw, err := l.RawTx(ctx, rejectedTxID)
+	if err != nil {
+		return halt(fmt.Sprintf(
+			"cell %d: generation %d was rejected as %s, but that transaction's bytes could not be read, so "+
+				"whether it was even about this tip is unknown: %v", cell, rejected, rejectedTxID, err)), nil
+	}
+	tx, err := parseTip(cell, rejectedTxID, raw)
+	if err != nil {
+		return halt(fmt.Sprintf(
+			"cell %d: the bytes offered for the rejected transaction at generation %d are not that "+
+				"transaction: %v", cell, rejected, err)), nil
+	}
+
+	spendsTip := false
+	for _, in := range tx.Inputs {
+		if in.SourceTXID != nil && in.SourceTXID.String() == tip.TxID && in.SourceTxOutIndex == tip.Vout {
+			spendsTip = true
+			break
+		}
+	}
+	if !spendsTip {
+		return halt(fmt.Sprintf(
+			"cell %d: the rejected transaction %s at generation %d does not spend this cell's tip %s:%d, so "+
+				"its refusal was about some other parent and rebuilding this generation is not what that "+
+				"refusal is evidence about. That is the superseded-parent case, which resumes on its own "+
+				"evidence and needs no retry flag",
+			cell, rejectedTxID, rejected, tip.TxID, tip.Vout)), nil
+	}
+
+	return Recovery{
+		Verdict: VerdictResume, Tip: tip,
+		Reason: fmt.Sprintf(
+			"cell %d: generation %d (%s) spends this cell's tip %s:%d and the network REFUSED it. Why is "+
+				"NOT established — this is \"safe to try again\", not \"we know what went wrong\". It is "+
+				"safe because a refused transaction spends nothing, so the tip is still unspent and "+
+				"rebuilding cannot double spend; and if the tip has in fact been spent, the rebuild is "+
+				"refused as UTXO_SPENT naming the spender, which the tip fix then adopts. Retracting the "+
+				"refusal so the cell re-creates generation %d. Arcade said: %s",
+			cell, rejected, rejectedTxID, tip.TxID, tip.Vout, rejected, orNoReason(rejection)),
+	}, nil
+}
+
 // acceptedByNetwork reports whether arcade's verdict is that the network took
 // this transaction.
 //

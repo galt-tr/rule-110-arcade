@@ -94,7 +94,8 @@ func TestRecoverAdoptsIntoTheStore(t *testing.T) {
 		t.Fatalf("cell 4 = %+v, want an unknown tip before recovery", positions[4])
 	}
 
-	out, decisions, err := Recover(t.Context(), l, noArcade, f.compiled, f.facts, f.store, positions, true)
+	out, decisions, err := Recover(t.Context(), l, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -126,7 +127,8 @@ func TestRecoverRetractsAnUnsignedAttempt(t *testing.T) {
 	}}
 
 	positions := f.derive(t)
-	out, decisions, err := Recover(t.Context(), l, noArcade, f.compiled, f.facts, f.store, positions, true)
+	out, decisions, err := Recover(t.Context(), l, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -155,9 +157,12 @@ func TestRecoverDryRunWritesNothing(t *testing.T) {
 	}}
 
 	positions := f.derive(t)
-	if _, decisions, err := Recover(t.Context(), l, noArcade, f.compiled, f.facts, f.store, positions, false); err != nil {
+	_, decisions, err := Recover(t.Context(), l, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{})
+	if err != nil {
 		t.Fatalf("Recover: %v", err)
-	} else if len(decisions) != 1 {
+	}
+	if len(decisions) != 1 {
 		t.Fatalf("decisions = %+v, want one", decisions)
 	}
 
@@ -189,7 +194,7 @@ func TestRecoverWillNotResumeAGenuineRejection(t *testing.T) {
 
 	positions := f.derive(t)
 	out, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
-		positions, true)
+		positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -266,7 +271,7 @@ func TestRecoverResumesOverASupersededRejection(t *testing.T) {
 	}
 
 	out, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
-		positions, true)
+		positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -308,7 +313,7 @@ func TestRecoverStaleRejectionDryRunWritesNothing(t *testing.T) {
 
 	positions := f.derive(t)
 	_, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
-		positions, false)
+		positions, RecoverOptions{})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -356,7 +361,7 @@ func TestRecoverResumesWhenTheSpentUTXOWasNotTheTip(t *testing.T) {
 	}
 
 	out, decisions, err := Recover(t.Context(), f.ledger, mined{foreign: true}, f.compiled,
-		f.facts, f.store, positions, true)
+		f.facts, f.store, positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -429,7 +434,7 @@ func TestRecoverAdoptsATipSpentByOurOwnTransaction(t *testing.T) {
 	}
 
 	out, decisions, err := Recover(t.Context(), f.ledger, mined{lost.TxID: true}, f.compiled,
-		f.facts, f.store, positions, true)
+		f.facts, f.store, positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -473,7 +478,7 @@ func TestRecoverSpentTipDryRunWritesNothing(t *testing.T) {
 
 	positions := f.derive(t)
 	_, decisions, err := Recover(t.Context(), f.ledger, mined{lost.TxID: true}, f.compiled,
-		f.facts, f.store, positions, false)
+		f.facts, f.store, positions, RecoverOptions{})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -510,7 +515,7 @@ func TestRecoverWillNotAdoptAForeignSpend(t *testing.T) {
 
 	positions := f.derive(t)
 	out, decisions, err := Recover(t.Context(), f.ledger, mined{foreign: true}, f.compiled,
-		f.facts, f.store, positions, true)
+		f.facts, f.store, positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -551,7 +556,7 @@ func TestRecoverWillNotAdoptATransactionWeAlreadyHold(t *testing.T) {
 
 	positions := f.derive(t)
 	out, decisions, err := Recover(t.Context(), f.ledger, mined{good.TxID: true}, f.compiled,
-		f.facts, f.store, positions, true)
+		f.facts, f.store, positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -564,6 +569,315 @@ func TestRecoverWillNotAdoptATransactionWeAlreadyHold(t *testing.T) {
 	}
 	if !out[1].Halted || out[1].Tip.TxID != good.TxID {
 		t.Errorf("cell 1 = %+v, want left exactly where it was", out[1])
+	}
+}
+
+// aLocalFailure is the record 21 cells of the live deployment were halted by: a
+// transition that died inside CreateAction when the wallet's database ran out of
+// connections, wrapped in the sentinel that is set before SignAction and
+// recorded with no txid, because there was never a transaction to name.
+const aLocalFailure = "chain: not broadcast: chain: create step action for cell 75: create action " +
+	"failed: failed to create action: storage: fund: failed to connect to `user=postgres " +
+	"database=rule110`: server error: FATAL: sorry, too many clients already (SQLSTATE 53300)"
+
+// aNeverBroadcastFailure halts one cell exactly as the old worker did: a `failed`
+// row directly above a healthy tip, for a transition that never reached the
+// network. It returns the tip the cell is left on.
+func aNeverBroadcastFailure(t *testing.T, f *fixture, cell int, txid string) chain.CellChain {
+	t.Helper()
+	tip := f.advance(t, cell, f.genesisTip(cell), history.StatusMined)
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Generation: tip.Generation + 1, Cell: cell, TxID: txid,
+		Status: history.StatusFailed, Err: aLocalFailure,
+	}); err != nil {
+		t.Fatalf("record the failure: %v", err)
+	}
+	return tip
+}
+
+// TestRecoverResumesANeverBroadcastFailure is the repair for the cells the live
+// bug already halted, end to end and through a restart.
+//
+// Nothing is adopted and the tip does not move. The cell simply stops being held
+// down by a record of something that never happened, and re-creates the
+// generation itself.
+func TestRecoverResumesANeverBroadcastFailure(t *testing.T) {
+	f := newFixture(t)
+	const cell = 3
+	tip := aNeverBroadcastFailure(t, f, cell, "")
+
+	positions := f.derive(t)
+	p := positions[cell]
+	if !p.Halted || p.Unknown {
+		t.Fatalf("cell %d = %+v, want halted by a failure rather than flagged unknown", cell, p)
+	}
+	if !p.Rejected || p.RejectionTxID != "" {
+		t.Fatalf("cell %d was not offered as a never-broadcast candidate: %+v", cell, p)
+	}
+
+	out, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{Apply: true})
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictResume {
+		t.Fatalf("decisions = %+v, want a single resume", decisions)
+	}
+	if out[cell].Halted || out[cell].Tip.TxID != tip.TxID || out[cell].Tip.Generation != tip.Generation {
+		t.Errorf("cell %d = %+v, want released on its unchanged tip %s at generation %d",
+			cell, out[cell], tip.TxID, tip.Generation)
+	}
+
+	// The same verdict vocabulary as every other path, and the failure it set
+	// aside quoted in full: once the row is retracted this line is the only place
+	// the reason survives.
+	line := FormatRecovery(decisions[0])
+	for _, want := range []string{"resume", "too many clients already", "nothing reached the network"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the report does not mention %q:\n%s", want, line)
+		}
+	}
+
+	// Surviving the restart is the only thing that matters: derivation halts a
+	// cell from the same rows the tip comes from, so a failure left in the store
+	// would halt this cell again at every startup, for ever.
+	again := f.derive(t)
+	if again[cell].Halted {
+		t.Fatalf("cell %d came back halted after recovery: %s", cell, again[cell].HaltReason)
+	}
+	if again[cell].Tip.TxID != tip.TxID || again[cell].Tip.Generation != tip.Generation {
+		t.Errorf("re-derived tip = %s at generation %d, want the unchanged %s at %d",
+			again[cell].Tip.TxID, again[cell].Tip.Generation, tip.TxID, tip.Generation)
+	}
+}
+
+// A dry run over this path must change nothing either. It is the flag an operator
+// uses to read a decision about 128 live UTXO chains before allowing it to act.
+func TestRecoverNotBroadcastDryRunWritesNothing(t *testing.T) {
+	f := newFixture(t)
+	const cell = 3
+	aNeverBroadcastFailure(t, f, cell, "")
+
+	positions := f.derive(t)
+	_, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{})
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictResume {
+		t.Fatalf("decisions = %+v, want a single resume to be REPORTED", decisions)
+	}
+	if again := f.derive(t); !again[cell].Halted {
+		t.Error("a dry run released the cell; it must only report what it would do")
+	}
+}
+
+// TestRecoverWillNotResumeANotBroadcastRecordThatNamesATransaction is the
+// contradiction, and it must stay halted.
+//
+// The sentinel says nothing was signed. The txid beside it says something was.
+// Both cannot be true, and resolving that in favour of the actionable half would
+// rebuild a generation over a transaction that may be on the network.
+func TestRecoverWillNotResumeANotBroadcastRecordThatNamesATransaction(t *testing.T) {
+	f := newFixture(t)
+	const cell = 3
+	tip := aNeverBroadcastFailure(t, f, cell, strings.Repeat("cc", 32))
+
+	positions := f.derive(t)
+	out, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{Apply: true, RetryRefused: true})
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	// EXAMINED — an operator must find the cell they came to look at — and halted,
+	// with a reason that names the contradiction rather than the generic halt.
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictHalt {
+		t.Fatalf("decisions = %+v, want a single halt", decisions)
+	}
+	if !strings.Contains(decisions[0].Reason, "cannot both be true") {
+		t.Errorf("the reason should name the contradiction, got: %s", decisions[0].Reason)
+	}
+	if !out[cell].Halted || out[cell].Tip.TxID != tip.TxID {
+		t.Errorf("cell %d = %+v, want left exactly where it was", cell, out[cell])
+	}
+	// And the row is still there, so the halt survives the restart.
+	if again := f.derive(t); !again[cell].Halted {
+		t.Error("the record was retracted on a halt")
+	}
+}
+
+// TestUnsignedRejectionDeleteIsExact pins the scope of the one delete that
+// cannot key on a txid.
+//
+// Retracting a row is how a cell is released, so a delete that matched more
+// broadly would release cells nothing has decided about — silently, and for the
+// whole ring at once. The clauses are (generation, cell, status=failed, no
+// txid), and every one of them has to be doing work.
+func TestUnsignedRejectionDeleteIsExact(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+
+	rows := []history.CellTx{
+		{Generation: 5, Cell: 1, Status: history.StatusFailed, Err: aLocalFailure},         // the target
+		{Generation: 5, Cell: 2, Status: history.StatusFailed, Err: aLocalFailure},         // another cell
+		{Generation: 6, Cell: 1, Status: history.StatusFailed, Err: aLocalFailure},         // another generation
+		{Generation: 7, Cell: 1, TxID: "abc", Status: history.StatusFailed, Err: aRefusal}, // names a transaction
+		{Generation: 8, Cell: 1, TxID: "def", Status: history.StatusBroadcast},             // a real transaction
+	}
+	for _, r := range rows {
+		if err := f.store.RecordTx(ctx, r); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+
+	if err := f.store.DeleteUnsignedRejection(ctx, 5, 1); err != nil {
+		t.Fatalf("DeleteUnsignedRejection: %v", err)
+	}
+
+	left, err := f.store.CellTips(ctx, f.facts.Cells, tipDepth)
+	if err != nil {
+		t.Fatalf("cell tips: %v", err)
+	}
+	got := map[string]bool{}
+	for cell, tips := range left {
+		for _, tip := range tips {
+			got[fmt.Sprintf("%d/%d", cell, tip.Generation)] = true
+		}
+	}
+	if got["1/5"] {
+		t.Error("the row it was asked about survived")
+	}
+	for _, want := range []string{"2/5", "1/6", "1/7", "1/8"} {
+		if !got[want] {
+			t.Errorf("cell/generation %s was deleted too; the delete must match one row", want)
+		}
+	}
+}
+
+// aRefusal is arcade refusing a transaction for a reason we have never explained.
+// It names the transaction and nothing else: not which input, not which rule.
+// 13 cells of the live deployment are halted by exactly this.
+const aRefusal = "arcade: REJECTED: PROCESSING (4): " +
+	"[ProcessTransaction][8b1f0c] failed to validate transaction"
+
+// TestRefusedGenerationIsOnlyRetriedWhenAskedFor is the opt-in repair, and the
+// gate is as much the point as the repair.
+//
+// The refused transaction really did spend this cell's tip, so nothing in the
+// record explains anything: the stale-rejection check reads its bytes, finds the
+// tip in its inputs and halts, correctly. What is left is the one fact that
+// holds regardless — a refused transaction spends nothing, so the tip is still
+// unspent and rebuilding cannot double spend. That makes the retry SAFE, not
+// warranted, which is why it happens only when an operator asks.
+func TestRefusedGenerationIsOnlyRetriedWhenAskedFor(t *testing.T) {
+	f := newFixture(t)
+	const cell = 6
+	tip := f.advance(t, cell, f.genesisTip(cell), history.StatusMined)
+
+	refused := f.build(t, cell, tip, 3)
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Generation: refused.Generation, Cell: cell, TxID: refused.TxID,
+		Status: history.StatusFailed, Err: aRefusal,
+	}); err != nil {
+		t.Fatalf("record the refusal: %v", err)
+	}
+
+	positions := f.derive(t)
+	if !positions[cell].Rejected || positions[cell].RejectionTxID != refused.TxID {
+		t.Fatalf("cell %d was not offered with the refused transaction to examine: %+v",
+			cell, positions[cell])
+	}
+
+	// Off by default, including under -apply: this is the shape TestRecover-
+	// WillNotResumeAGenuineRejection halts, and it must keep halting unless asked.
+	out, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{Apply: true})
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictHalt {
+		t.Fatalf("decisions = %+v, want a single halt without the flag", decisions)
+	}
+	if !out[cell].Halted {
+		t.Error("a refusal of a transaction that spent the tip released the cell unasked")
+	}
+	if again := f.derive(t); !again[cell].Halted {
+		t.Fatal("the refusal was retracted without the flag")
+	}
+
+	// Asked for, it resumes: the tip is unchanged and the cell re-creates the
+	// generation that was refused.
+	out, decisions, err = Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{Apply: true, RetryRefused: true})
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictResume {
+		t.Fatalf("decisions = %+v, want a single resume with -retry-refused", decisions)
+	}
+	if out[cell].Halted || out[cell].Tip.TxID != tip.TxID || out[cell].Tip.Generation != tip.Generation {
+		t.Errorf("cell %d = %+v, want released on its unchanged tip %s at generation %d",
+			cell, out[cell], tip.TxID, tip.Generation)
+	}
+
+	// What the operator reads must not read as a diagnosis.
+	line := FormatRecovery(decisions[0])
+	for _, want := range []string{"resume", refused.TxID, "spends nothing", "NOT established"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the report does not say %q:\n%s", want, line)
+		}
+	}
+
+	again := f.derive(t)
+	if again[cell].Halted {
+		t.Fatalf("cell %d came back halted after the retry was applied: %s", cell, again[cell].HaltReason)
+	}
+	if again[cell].Tip.TxID != tip.TxID {
+		t.Errorf("re-derived tip = %s, want the unchanged %s", again[cell].Tip.TxID, tip.TxID)
+	}
+}
+
+// TestRetryNeverReachesACascade keeps the newest repair away from the four cells
+// that must be untangled by hand.
+//
+// Cells 34, 51, 64 and 91 carry about 170 stacked refusals each over tips near
+// generation 300. Nothing here may touch them — resuming would achieve nothing
+// anyway, since the rejections underneath the newest would halt the cell again
+// at the next startup — and the guard is derivation refusing to flag a rejection
+// that is not directly above the tip. The flag must not be a way around it.
+func TestRetryNeverReachesACascade(t *testing.T) {
+	f := newFixture(t)
+	const cell = 5
+	tip := f.advance(t, cell, f.genesisTip(cell), history.StatusMined)
+
+	// The first refusal spent the tip; everything after it spent the refusal.
+	parent := f.build(t, cell, tip, 9)
+	newest := parent
+	for range tipDepth + 4 {
+		if err := f.store.RecordTx(t.Context(), history.CellTx{
+			Generation: newest.Generation, Cell: cell, TxID: newest.TxID,
+			Status: history.StatusFailed, Err: aRefusal,
+		}); err != nil {
+			t.Fatalf("record refusal at %d: %v", newest.Generation, err)
+		}
+		parent = newest
+		newest = f.build(t, cell, parent, 0)
+	}
+
+	positions := f.derive(t)
+	if positions[cell].Rejected {
+		t.Fatalf("a cascade was offered for examination: %+v", positions[cell])
+	}
+	_, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, RecoverOptions{Apply: true, RetryRefused: true})
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 0 {
+		t.Fatalf("recovery considered a cascaded cell with -retry-refused: %+v", decisions)
+	}
+	if again := f.derive(t); !again[cell].Halted || again[cell].Tip.TxID != tip.TxID {
+		t.Errorf("cell %d = %+v, want left exactly where it was", cell, again[cell])
 	}
 }
 
@@ -592,7 +906,7 @@ func TestRecoverIgnoresACascadeRejection(t *testing.T) {
 		t.Errorf("a cascade was offered to recovery as a lost transition: %q", positions[1].RejectionErr)
 	}
 	_, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
-		positions, true)
+		positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -647,7 +961,7 @@ func TestCascadeIsNeverOfferedToTheStaleRejectionCheck(t *testing.T) {
 	}
 
 	_, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
-		positions, true)
+		positions, RecoverOptions{Apply: true})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}

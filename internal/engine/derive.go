@@ -44,8 +44,12 @@ type CellPosition struct {
 	Attempted uint64
 	Unknown   bool
 
-	// Rejected is set when the generation DIRECTLY above the tip was refused by
-	// the network, and RejectionErr is arcade's own words for why.
+	// Rejected is set when the generation DIRECTLY above the tip FAILED, and
+	// RejectionErr is the recorded reason — usually arcade's own words for why,
+	// but not always: a transition that died locally before it could be signed
+	// used to be recorded here too, carrying our own chain.ErrNotBroadcast
+	// sentinel instead. See chain.RecoverNotBroadcast, which is what those cells
+	// are recovered by.
 	//
 	// "Directly above" is the whole of the condition. A rejection one generation
 	// past the tip is a single refused transition with a reason attached, and its
@@ -63,8 +67,9 @@ type CellPosition struct {
 	// it is carried for a reason the message alone cannot serve: the rejection may
 	// be about a parent this cell no longer has, and the only way to tell is to
 	// fetch that transaction's bytes and look at what it SPENDS. See
-	// chain.RecoverStaleRejection. It is empty when the rejection was recorded
-	// before anything was signed, which is a cell this cannot reason about.
+	// chain.RecoverStaleRejection. It is empty when the failure was recorded
+	// before anything was signed, and that emptiness is itself evidence: it is
+	// the second of the two facts chain.RecoverNotBroadcast requires.
 	Rejected      bool
 	RejectionErr  string
 	RejectionTxID string
