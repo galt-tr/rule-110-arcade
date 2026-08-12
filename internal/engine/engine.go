@@ -140,6 +140,14 @@ type Snapshot struct {
 	// sits high, the fuel pool is the bottleneck, not the chain.
 	WaitingOnCoin int `json:"waitingOnCoin"`
 
+	// Bootstrap is present ONLY while a cold deployment is being brought up,
+	// and absent once generation 0 exists. The engine never sets it — see
+	// package boot, which serves this shape before there is an engine at all.
+	//
+	// It is a field on the snapshot rather than its own endpoint so the browser
+	// keeps one payload, one fetch and one stream across the handover.
+	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
+
 	// Locked reports that the clock cannot be driven from outside: no play,
 	// pause, step or rate change, for the life of the process.
 	//
@@ -148,6 +156,25 @@ type Snapshot struct {
 	// engine's own setters and the HTTP handler each refuse independently,
 	// because a control surface that is only hidden is not locked at all.
 	Locked bool `json:"locked"`
+}
+
+// Bootstrap is how far a cold deployment has got towards existing.
+//
+// It carries the funding address and the shortfall because that is the only
+// thing a visitor can act on: an automaton with no coin has nothing to show and
+// exactly one thing to ask for.
+type Bootstrap struct {
+	// Phase is one of waiting, funding, fuel, genesis.
+	Phase string `json:"phase"`
+	// Address is where to send coin, and Network which chain it is on.
+	Address string `json:"address"`
+	Network string `json:"network"`
+	// MinSatoshis is what must arrive before anything is spent; Have is what
+	// has arrived.
+	MinSatoshis uint64 `json:"minSatoshis"`
+	Have        uint64 `json:"have"`
+	// Err is the last failure, if the machine is retrying.
+	Err string `json:"err,omitempty"`
 }
 
 // maxHistory bounds how many generations the UI keeps.
@@ -492,7 +519,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		retries:       make(map[int]retryState),
 		statusWrites:  make(chan history.StatusUpdate, statusWriteQueue),
 		store:         store,
-		owner:         instanceOwner(),
+		owner:         InstanceOwner(),
 		// Nothing may advance until the tips have been re-derived while this
 		// instance actually holds the writer lease. They are derived here too,
 		// so the UI has something true to show immediately, but between here and
@@ -936,11 +963,17 @@ func (e *Engine) haltCell(cell int, reason string) {
 	e.notify()
 }
 
-// instanceOwner is this process's identity in the single-writer election.
+// InstanceOwner is this process's identity in the single-writer election.
 //
 // The hostname is the pod name under Kubernetes, which makes the lease row
 // legible to an operator; the suffix keeps two processes on one host distinct.
-func instanceOwner() string {
+//
+// Exported because the cold start takes the SAME lease before the engine
+// exists — see package boot. It has to be the same string: a bootstrapper that
+// claimed under a different owner would hold the lease against the engine that
+// follows it in the same process, and the engine would sit out the full TTL
+// waiting for itself.
+func InstanceOwner() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown"

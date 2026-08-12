@@ -87,6 +87,16 @@ func FundingAddress(id *Identity, network defs.BSVNetwork) (*FundingTarget, erro
 	}, nil
 }
 
+// FundingTarget derives this deployment's funding target.
+//
+// A method as well as the package function because the two callers that need it
+// most — the HTTP funding endpoint and the cold start — hold a Chain and should
+// not have to know that the derivation takes an identity and a network, nor be
+// able to pass the wrong pair.
+func (c *Chain) FundingTarget() (*FundingTarget, error) {
+	return FundingAddress(c.Identity, c.Config.Network)
+}
+
 // InternalizeResult reports what a payment credited.
 type InternalizeResult struct {
 	TxID string

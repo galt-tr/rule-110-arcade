@@ -593,18 +593,22 @@ func (e *Engine) wake() {
 // definition removes the way to get it wrong.
 const LeaseName = "rule110-engine"
 
+// LeaseTTL and LeaseRenew are exported for the same reason LeaseName is: the
+// cold start holds this lease before there is an engine, and a bootstrapper
+// using different timings would either lose the claim under it or hold it past
+// its own death.
 const (
-	// leaseTTL is how long a lease survives without renewal.
+	// LeaseTTL is how long a lease survives without renewal.
 	//
 	// The TTL is the failover delay: a pod that dies without releasing keeps the
 	// automaton stopped for this long. Short enough that a crash is not an
 	// outage, long enough that a slow renewal does not hand the chains to a
 	// second writer while the first is still using them.
-	leaseTTL = 30 * time.Second
+	LeaseTTL = 30 * time.Second
 
-	// leaseRenew must be comfortably shorter than leaseTTL so a transient
+	// LeaseRenew must be comfortably shorter than LeaseTTL so a transient
 	// database hiccup does not cost the lease.
-	leaseRenew = 10 * time.Second
+	LeaseRenew = 10 * time.Second
 )
 
 // holdLease keeps this instance's claim on being the single writer.
@@ -615,11 +619,11 @@ const (
 // deployment behaviour. An instance without the lease still serves the UI and
 // still applies statuses; it just does not advance anything.
 func (e *Engine) holdLease(ctx context.Context) {
-	tick := time.NewTicker(leaseRenew)
+	tick := time.NewTicker(LeaseRenew)
 	defer tick.Stop()
 
 	for {
-		held, err := e.store.AcquireLease(ctx, LeaseName, e.owner, leaseTTL)
+		held, err := e.store.AcquireLease(ctx, LeaseName, e.owner, LeaseTTL)
 		if err != nil {
 			// Treat an unreachable store as not holding it. Advancing on the
 			// assumption that we still do is the one outcome worth avoiding.

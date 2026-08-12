@@ -33,7 +33,7 @@ func newFunder(c *chain.Chain, suggested uint64) *funder {
 }
 
 func (f *funder) Target() (web.FundingTarget, error) {
-	target, err := chain.FundingAddress(f.chain.Identity, f.chain.Config.Network)
+	target, err := f.chain.FundingTarget()
 	if err != nil {
 		return web.FundingTarget{}, err
 	}

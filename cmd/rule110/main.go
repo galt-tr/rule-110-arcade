@@ -31,6 +31,7 @@ import (
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 
+	"github.com/dymurray/rule-110-arcade/internal/boot"
 	"github.com/dymurray/rule-110-arcade/internal/ca"
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
@@ -514,20 +515,88 @@ func cmdRun(args []string) error {
 	}
 	defer func() { _ = c.Close(context.Background()) }()
 
-	d, err := c.LoadDeployment()
-	if err != nil {
-		return fmt.Errorf("%w\n(run \"rule110 genesis\" first to create generation 0)", err)
-	}
-	compiled, err := cellscript.Compile(d.Cells, d.Rule)
-	if err != nil {
-		return err
-	}
+	// Take the VALIDATED configuration back.
+	//
+	// Open receives a Config by value and validates its own copy, and Validate
+	// is not only a check — it fills in the settings derived from others
+	// (MinPaymentSatoshis from the fuel denomination, FirstFuelCoins from the
+	// ring size) and normalises the arcade URL. Reading those off the local
+	// copy gets zeroes, and a zero here is silent in the worst way: the cold
+	// start would ask the fan-out for no coins and advertise a minimum payment
+	// of nothing.
+	cfg = c.Config
 
 	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
+
+	// The ring's shape comes from the deployment when there is one, and from the
+	// configuration when there is not. Only the first case is a fact; the second
+	// is a proposal, which the cold start is about to turn into one.
+	cells, rule := cfg.Cells, cfg.Rule
+	if existing, lerr := c.LoadDeployment(); lerr == nil {
+		cells, rule = existing.Cells, existing.Rule
+	}
+	compiled, err := cellscript.Compile(cells, rule)
+	if err != nil {
+		return err
+	}
+	seed, err := seedFor(cells)
+	if err != nil {
+		return err
+	}
+	genesisSize, err := chain.GenesisBytes(compiled, seed)
+	if err != nil {
+		return err
+	}
+
+	// Serve the UI BEFORE there is anything to show.
+	//
+	// This is the whole point of the cold start being in-process: a fresh volume
+	// has no coin, and the only way to get some is to ask — which needs a page,
+	// which needs a server. `run` used to fail here telling the operator to go
+	// run three other subcommands, which a container simply restarts and says
+	// again.
+	boots := boot.New(c, compiled, boot.Options{
+		Seed:             seed,
+		Throughput:       cfg.Throughput,
+		FuelDenomination: cfg.FuelDenomination,
+		FirstFuelCoins:   cfg.FirstFuelCoins,
+		MinBootstrap:     cfg.BootstrapMinimum(genesisSize),
+		Network:          string(cfg.Network),
+		LockControls:     cfg.LockControls,
+		Leader:           leaseHolder(ctx, store, logger),
+	}, logger)
+
+	var webOpts []web.Option
+	if cfg.PublicFunding {
+		webOpts = append(webOpts, web.WithFunder(newFunder(c, cfg.BootstrapMinimum(genesisSize))))
+	}
+	srv := web.New(boots, logger, webOpts...)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ctx, *addr) }()
+
+	printBanner(cfg, compiled, *addr)
+
+	d, err := boots.Run(ctx)
+	if err != nil {
+		// A cancelled context on the way up is a clean shutdown, not a failure.
+		if ctx.Err() != nil {
+			return <-serveErr
+		}
+		return err
+	}
+
+	// The cold start may have created a ring of a different shape than the one
+	// compiled above — it cannot, today, but the deployment is the authority and
+	// compiling against anything else would bind cells to the wrong script.
+	if d.Cells != cells || d.Rule != rule {
+		if compiled, err = cellscript.Compile(d.Cells, d.Rule); err != nil {
+			return err
+		}
+	}
 
 	// The clock's starting state is configuration, not a command: -lock-controls
 	// turns SetRate and SetMode into no-ops, so setting the rate by calling the
@@ -542,6 +611,10 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Hand every reader over to the engine. Anyone streaming during the cold
+	// start is holding the bootstrapper's change channel, so Adopt notifies once
+	// — without it they would block on a channel nothing closes again.
+	boots.Adopt(eng)
 
 	if st, err := store.Stats(ctx); err == nil {
 		fmt.Printf("history: %d generations, %d transactions recorded (%d still settling)\n",
@@ -573,40 +646,11 @@ func cmdRun(args []string) error {
 		}
 	}()
 
-	fmt.Printf("rule 110 · %d cells · generation %d\n", d.Cells, eng.Snapshot().Generation)
-	fmt.Printf("arcade:  %s\n", cfg.ArcadeURL)
+	fmt.Printf("running · %d cells · generation %d\n", d.Cells, eng.Snapshot().Generation)
 	fmt.Printf("genesis: %s\n", d.GenesisTxID)
-	if basket, denom, target, on := cfg.FuelPool(); on {
-		fmt.Printf("fuel:    %d x %d sat in %q, kept topped up\n", target, denom, basket)
-	}
-	var opts []web.Option
-	if cfg.PublicFunding {
-		// Suggest what a cold start would have cost. For a deployment that is
-		// already running it is not a threshold — any payment helps — but it is
-		// a figure with a meaning behind it rather than a round number, and it
-		// buys a visible amount of runtime.
-		seed, err := d.Seed()
-		if err != nil {
-			return err
-		}
-		size, err := chain.GenesisBytes(compiled, seed)
-		if err != nil {
-			return err
-		}
-		opts = append(opts, web.WithFunder(newFunder(c, cfg.BootstrapMinimum(size))))
 
-		target, err := chain.FundingAddress(c.Identity, cfg.Network)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("funding: public, to %s (minimum %d sat)\n", target.Address, cfg.MinPaymentSatoshis)
-	}
-	if cfg.LockControls {
-		fmt.Printf("controls: LOCKED at %.2f gen/s\n", eng.Snapshot().Rate)
-	}
-	fmt.Printf("\n  UI ready at %s\n\n", uiURL(*addr))
-
-	return web.New(eng, logger, opts...).Serve(ctx, *addr)
+	// The server is already up; block on it, as this function used to.
+	return <-serveErr
 }
 
 func cmdFuel(args []string) error {
