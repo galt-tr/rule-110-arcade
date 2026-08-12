@@ -69,6 +69,8 @@ func run(args []string) error {
 		return cmdRun(args[1:])
 	case "fuel":
 		return cmdFuel(args[1:])
+	case "audit":
+		return cmdAudit(args[1:])
 	case "recover":
 		return cmdRecover(args[1:])
 	case "import-tips":
@@ -104,6 +106,10 @@ The subcommands are a sequence, not a menu. A new deployment runs them in order:
   7  rule110 run                     start the automaton and its web UI
 
 Also:
+  rule110 audit                      re-derive the recorded history and check it against
+                                     the transactions on chain — including the cross-cell
+                                     agreement Script does NOT enforce (read-only; safe to
+                                     run while the automaton is running)
   rule110 step -cell N               advance a single cell by hand
   rule110 depth-probe                measure how deep an unconfirmed chain this
                                      network accepts (destroys the cell it probes)
@@ -151,6 +157,7 @@ Subcommand flags:
   step         -cell
   run          -addr, -rate, -start
   depth-probe  -cell, -max
+  audit        -from, -to, -last, -max-failures, -gaps
 
 The ring size is fixed at genesis, so -cells is a genesis flag only: run, step and
 depth-probe read it back out of the recorded state.
