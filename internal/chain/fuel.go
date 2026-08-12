@@ -95,14 +95,37 @@ func (c *Chain) RunFuelKeeper(ctx context.Context) error {
 	if !enabled {
 		return nil
 	}
-	um, err := c.Config.utxoManagement()
+	cfg, err := c.Config.fuelKeeperConfig()
 	if err != nil {
 		return err
 	}
 
-	cfg := fuelkeeper.FromThroughput(um.Throughput, denom)
-	cfg.Originator = c.Config.Originator
-	cfg.TargetPoolSize = target
+	keeper, err := fuelkeeper.New(c.Wallet, cfg, c.logger)
+	if err != nil {
+		return fmt.Errorf("chain: fuel keeper: %w", err)
+	}
+	c.logger.InfoContext(ctx, "fuel keeper started",
+		"denomination", denom, "target", target, "basket", cfg.PoolBasket,
+		"recycleBasket", cfg.RecycleBasket, "chunkFeeHeadroom", cfg.ChunkFeeHeadroom)
+	keeper.Run(ctx)
+	return nil
+}
+
+// fuelKeeperConfig derives the keeper's tuning from ours.
+//
+// Split out from RunFuelKeeper so the numbers below can be asserted without a
+// wallet, an arcade, or money. Every one of them is a deployment-shaped
+// override of a toolbox default, and the last two were the difference between
+// a pool that sustains 128 cells and one that sawtooths into ModeStarved.
+func (c *Config) fuelKeeperConfig() (fuelkeeper.Config, error) {
+	um, err := c.utxoManagement()
+	if err != nil {
+		return fuelkeeper.Config{}, err
+	}
+
+	cfg := fuelkeeper.FromThroughput(um.Throughput, c.FuelDenomination)
+	cfg.Originator = c.Originator
+	cfg.TargetPoolSize = c.FuelPoolSize
 	// Minting serially cannot match the burn rate of 128 cells; the reference
 	// deployment that sustained ~1,900 TPS used 64.
 	cfg.MintConcurrency = 64
@@ -113,14 +136,77 @@ func (c *Chain) RunFuelKeeper(ctx context.Context) error {
 	cfg.DisableStreamYield = true
 	cfg.StreamLeafCap = 2000
 
-	keeper, err := fuelkeeper.New(c.Wallet, cfg, c.logger)
-	if err != nil {
-		return fmt.Errorf("chain: fuel keeper: %w", err)
-	}
-	c.logger.InfoContext(ctx, "fuel keeper started",
-		"denomination", denom, "target", target, "basket", um.Throughput.PoolBasket)
-	keeper.Run(ctx)
-	return nil
+	// Mint fuel straight out of the change basket, not only out of reserve
+	// chunks. This is the fix for the observed oscillation, and it is worth
+	// spelling out because the mechanism is not visible from any one file.
+	//
+	// A cell transition spends one 1000 satoshi fuel coin, pays ~512 of it in
+	// fee, and returns the ~488 satoshi remainder as change. With
+	// RecycleChangeToPool off — correctly off, see utxoManagement — that change
+	// lands in the DEFAULT basket. So the wallet accrues roughly one 488
+	// satoshi crumb per transition, hundreds a second, and the keeper's chunk
+	// path is the only thing that can spend them: it must aggregate ~220 of
+	// them into a single 100,996 satoshi reserve chunk, one chunk fan-out at a
+	// time, before a leaf can mint 100 fuel coins from it. It cannot get close.
+	// The pool empties, the automaton starves, an operator deposit arrives as
+	// one big claimable coin, chunking runs briefly at full speed, the pool
+	// refills, and the whole thing repeats.
+	//
+	// The direct-recycle path funds each leaf from the change basket itself —
+	// RecycleCount coins per leaf, MintConcurrency leaves at once — so ~18
+	// crumbs become 8 fuel coins in one transaction and 64 of those run in
+	// parallel. The keeper falls back to the chunk path on its own whenever the
+	// change basket holds too few distinct coins to parallelize (bootstrap, or
+	// a fresh deposit), so the reserve is still drained and nothing strands.
+	//
+	// The cost is ancestry. A recycle leaf spends crumbs belonging to ~18
+	// DIFFERENT cells, so it merges 18 unconfirmed chains and every fuel coin
+	// it mints carries that merged history into whichever cell spends it. The
+	// chunk path merges the same ancestry when it consumes crumbs, but in
+	// practice it rarely does — the funder prefers one sufficient coin to two
+	// hundred insufficient ones — so this genuinely makes the unconfirmed
+	// ancestor set larger, not merely differently shaped. We are doing it
+	// anyway because `rule110 depth-probe` found no ancestor limit on this
+	// network to violate, and because the alternative measured on the live
+	// deployment is a pool that cannot be refilled at all. Re-probe before
+	// trusting it on a network we have not measured.
+	cfg.RecycleBasket = string(wdk.BasketNameForChange)
+
+	// Size a reserve chunk to what a leaf fan-out actually costs, rather than
+	// FromThroughput's max(1000, 8 × denomination) heuristic — which the
+	// toolbox itself invites callers to override, and which comes out at 8000
+	// here, sixteen times the real figure.
+	//
+	// The excess does not evaporate. A fan-out's change returns to the basket
+	// that funded it, so a leaf funded from the reserve leaves its unspent
+	// headroom BACK in the reserve, as a coin far too small to fund another
+	// leaf. ensureChunks then counts chunks as reserve-balance ÷ chunk-value —
+	// satoshis, not coins — so fourteen of those crumbs read as one whole chunk
+	// that does not exist, the round provisions for leaves it cannot fund, and
+	// those leaves fail. Reserve coins measured at ~72,000 satoshis on the live
+	// deployment against a 108,000 chunk value is that arithmetic showing.
+	cfg.ChunkFeeHeadroom = c.chunkFeeHeadroom()
+
+	return cfg, nil
+}
+
+// leafFanOutBytes is the serialized size of one leaf fan-out: a single P2PKH
+// input spending a reserve chunk, fanoutPerTx fuel outputs, and the one change
+// output WithRequiredChangeOutput insists on. 8 envelope + 1 input count + 148
+// input + 3 output count + 101 × 34 outputs = 3,594.
+//
+// Every script in it is P2PKH, so unlike a cell transition this estimate is not
+// a guess — there is no covenant to come out longer than planned.
+const leafFanOutBytes = 8 + 1 + 148 + 3 + (fanoutPerTx+1)*34
+
+// chunkFeeHeadroom is what a reserve chunk carries beyond the fuel it mints:
+// the leaf fan-out's fee, plus the dust floor its change has to clear, doubled
+// so a chunk still funds a leaf if the rate or the shape moves a little.
+//
+// At the default 125 sat/kB that is 2 × (450 + 48) = 996, against the toolbox
+// heuristic's 8000. See fuelKeeperConfig for why the difference matters.
+func (c *Config) chunkFeeHeadroom() uint64 {
+	return 2 * (feeForBytes(leafFanOutBytes, c.FeeSatPerKB) + dustFloor(c.FeeSatPerKB))
 }
 
 // ClaimableCoins reports how many coins the funder can currently claim, from

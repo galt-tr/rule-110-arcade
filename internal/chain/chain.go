@@ -132,11 +132,12 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 
 		// One change output is not enough — there must also always BE one. The
 		// funder otherwise drops it whenever the leftover falls under the dust
-		// floor (40 satoshis at 100 sat/kB) and donates it to the miner, which
-		// leaves a one-output transaction the covenant cannot spend. That is not
-		// rare: every transition returns its change as a smaller coin, so the
-		// pool grinds down and the totals land in the sub-dust window more and
-		// more often as the automaton runs.
+		// floor (48 satoshis at our 125 sat/kB — see dustFloor, which is where
+		// that number comes from and why it is not a constant) and donates it to
+		// the miner, which leaves a one-output transaction the covenant cannot
+		// spend. That is not rare: every transition returns its change as a
+		// smaller coin, so the pool grinds down and the totals land in the
+		// sub-dust window more and more often as the automaton runs.
 		storage.WithRequiredChangeOutput(),
 
 		// Bound BEEF assembly to the directly-spent coin instead of walking the

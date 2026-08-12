@@ -109,11 +109,12 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.StringVar(&cfg.PostgresDSN, "postgres-dsn", envOr("RULE110_POSTGRES_DSN", ""),
 		"PostgreSQL DSN; empty uses SQLite (much slower under a wide fan-out)")
 	fs.IntVar(&cfg.MaxDBConns, "max-db-conns", cfg.MaxDBConns, "storage connection pool size")
-	fs.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "how many cells advance at once")
 	fs.BoolVar(&cfg.Chronicle, "chronicle", cfg.Chronicle,
 		"verify with Chronicle-era script rules (required for Rúnar covenants)")
 	fs.Int64Var(&cfg.FeeSatPerKB, "fee-sat-per-kb", cfg.FeeSatPerKB,
 		"fee rate; must exceed arcade's 100 sat/kB floor, which it applies to the extended-format size")
+	fs.Int64Var(&cfg.MinBroadcastFeeRate, "min-broadcast-fee-rate", cfg.MinBroadcastFeeRate,
+		"reject a finished transaction below this sat/kB (0 skips the check); set it to the floor the receiving arcade enforces")
 	fs.BoolVar(&cfg.Throughput, "throughput", cfg.Throughput,
 		"fund from a denominated fuel pool instead of contending for change")
 	fs.Uint64Var(&cfg.FuelDenomination, "fuel-sats", cfg.FuelDenomination,
@@ -138,11 +139,15 @@ func cmdAddress(args []string) error {
 	cfg := chain.DefaultConfig()
 	fs := flag.NewFlagSet("address", flag.ContinueOnError)
 	network := bindCommon(fs, &cfg)
-	rule := fs.Uint("rule", uint(cfg.Rule), "Wolfram rule number")
+	rule := fs.Uint("rule", uint(cfg.Rule), "Wolfram rule number (0-255)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg.Rule = ca.Rule(*rule)
+	parsedRule, err := parseRule(*rule)
+	if err != nil {
+		return err
+	}
+	cfg.Rule = parsedRule
 
 	net, err := parseNetwork(*network)
 	if err != nil {
@@ -232,12 +237,16 @@ func cmdGenesis(args []string) error {
 	cfg := chain.DefaultConfig()
 	fs := flag.NewFlagSet("genesis", flag.ContinueOnError)
 	network := bindCommon(fs, &cfg)
-	rule := fs.Uint("rule", uint(cfg.Rule), "Wolfram rule number")
+	rule := fs.Uint("rule", uint(cfg.Rule), "Wolfram rule number (0-255)")
 	seedHex := fs.String("seed", "", "initial row as hex; empty seeds a single live cell at index 0")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg.Rule = ca.Rule(*rule)
+	parsedRule, err := parseRule(*rule)
+	if err != nil {
+		return err
+	}
+	cfg.Rule = parsedRule
 
 	net, err := parseNetwork(*network)
 	if err != nil {
@@ -485,7 +494,7 @@ func cmdFuel(args []string) error {
 	fs := flag.NewFlagSet("fuel", flag.ContinueOnError)
 	network := bindCommon(fs, &cfg)
 	count := fs.Uint64("count", 300, "how many coins to mint")
-	sats := fs.Uint64("sats", 20000, "value of each coin (must cover one cell transition's fee)")
+	sats := fs.Uint64("sats", 0, "value of each coin; 0 uses the configured fuel denomination")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -494,6 +503,11 @@ func cmdFuel(args []string) error {
 		return err
 	}
 	cfg.Network = net
+
+	value, err := fuelCoinValue(cfg, *sats)
+	if err != nil {
+		return err
+	}
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -509,9 +523,9 @@ func cmdFuel(args []string) error {
 		return err
 	}
 	fmt.Printf("claimable coins before: %d\n", before)
-	fmt.Printf("minting %d coins of %d sat (%d sat total)...\n", *count, *sats, *count**sats)
+	fmt.Printf("minting %d coins of %d sat (%d sat total)...\n", *count, value, *count*value)
 
-	results, err := c.FanOutFuel(ctx, *count, *sats)
+	results, err := c.FanOutFuel(ctx, *count, value)
 	for _, r := range results {
 		fmt.Printf("  %s  %d coins\n", r.TxID, r.Coins)
 	}
@@ -534,6 +548,59 @@ func seedRow(cells int, hexSeed string) (ca.Row, error) {
 		return ca.SeedSingle(cells)
 	}
 	return ca.SeedHex(cells, hexSeed)
+}
+
+// fuelCoinValue resolves what `rule110 fuel` mints. sats is the -sats flag,
+// with 0 meaning "whatever the pool is denominated in".
+//
+// This flag used to default to 20000 against a 1000 satoshi denomination, and
+// the two are not interchangeable. Under the throughput strategy the funder's
+// fast path is utxostore's ClaimExact, which matches the denomination EXACTLY:
+// a 20000 satoshi coin sitting in the fuel basket is invisible to it. Such a
+// coin is not quite dead — the bounded tiered walk that backs up a short pool
+// will eventually pick it — but that walk is the contended selection the whole
+// strategy exists to escape, and it then spends twenty transitions' worth of
+// fuel on one transition and returns the change to the CHANGE basket, not the
+// pool. Meanwhile the keeper measures inventory as pool-balance ÷ denomination,
+// so it reads those coins as twenty times the fuel they can actually buy and
+// idles while the automaton crawls.
+//
+// fuel.go's FanOutFuel already documents this failure ("the coins exist, the
+// balance looks healthy, and every transition still reports not enough funds").
+// A flag default put it back, so a mismatch is refused here rather than
+// documented a third time.
+func fuelCoinValue(cfg chain.Config, sats uint64) (uint64, error) {
+	_, denomination, _, throughput := cfg.FuelPool()
+	if !throughput {
+		// No pool, so nothing to agree with: the funder claims from ordinary
+		// change and any value will do. There is no default to fall back on.
+		if sats == 0 {
+			return 0, fmt.Errorf("-sats is required with -throughput=false: " +
+				"there is no fuel denomination to take the value from")
+		}
+		return sats, nil
+	}
+	if sats == 0 || sats == denomination {
+		return denomination, nil
+	}
+	return 0, fmt.Errorf("-sats %d does not match the fuel denomination %d\n"+
+		"the throughput funder claims fuel by exact value, so coins of any other size "+
+		"never reach its fast path; pass -fuel-sats %d to mint at that denomination, "+
+		"or drop -sats to use the configured one", sats, denomination, sats)
+}
+
+// parseRule bounds a Wolfram rule number.
+//
+// ca.Rule is a uint8 because that is precisely what an elementary rule is: a
+// truth table over eight neighbourhoods, one bit each. But the flag is parsed
+// as a uint, so an unchecked conversion silently took -rule 300 down to rule 44
+// and ran a different automaton without a word.
+func parseRule(n uint) (ca.Rule, error) {
+	if n > 255 {
+		return 0, fmt.Errorf("rule must be 0-255 — an elementary rule is one byte — got %d "+
+			"(which would silently become rule %d)", n, ca.Rule(n))
+	}
+	return ca.Rule(n), nil
 }
 
 // parseNetwork delegates to the toolbox, which is the authority on which
