@@ -19,9 +19,15 @@ func TestFuelPoolReportsWhatTheFunderWillClaim(t *testing.T) {
 		wantDenom   uint64
 		wantTarget  uint64
 	}{
+		// Derived rather than pinned: the assertion that matters here is that
+		// FuelPool hands back the configuration's own numbers instead of the
+		// toolbox's derivation from its expected action shape. Hard-coding them
+		// would make this case fail every time a default is retuned, which
+		// tests the changelog rather than the contract.
 		"defaults": {
 			mutate:      func(*Config) {},
-			wantEnabled: true, wantBasket: "fuel", wantDenom: 1000, wantTarget: 20000,
+			wantEnabled: true, wantBasket: "fuel",
+			wantDenom: DefaultConfig().FuelDenomination, wantTarget: DefaultConfig().FuelPoolSize,
 		},
 		"the denomination and pool size are ours, not the toolbox's derivation": {
 			mutate:      func(c *Config) { c.FuelDenomination = 2500; c.FuelPoolSize = 4096 },
@@ -110,5 +116,74 @@ func TestValidateRejectsSettingsThatFailFarFromTheirCause(t *testing.T) {
 				t.Fatalf("Validate: %v", err)
 			}
 		})
+	}
+}
+
+// TestValidateFillsInTheDerivedAmounts pins the two settings a deployment is
+// not expected to state.
+//
+// Both are derived from numbers that are themselves configurable, so an
+// operator who raises -fuel-sats or the ring size should not have to restate
+// them — and the failure of leaving them at zero is quiet in both directions: a
+// zero minimum accepts dust that cannot buy a single transition, and zero first
+// fuel mints nothing, so genesis lands on an empty pool and the automaton comes
+// up correct and immediately starved.
+func TestValidateFillsInTheDerivedAmounts(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ArcadeURL = "https://arcade.example"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	if cfg.MinPaymentSatoshis <= cfg.FuelDenomination {
+		t.Errorf("minimum payment = %d, not above one fuel coin of %d",
+			cfg.MinPaymentSatoshis, cfg.FuelDenomination)
+	}
+	if cfg.FirstFuelCoins < uint64(cfg.Cells) {
+		t.Errorf("first fuel = %d coins for a ring of %d; genesis would land on a pool "+
+			"that cannot fund even one generation", cfg.FirstFuelCoins, cfg.Cells)
+	}
+}
+
+// An explicitly configured amount must survive validation untouched — the
+// fill-in is for zero, not a correction of the operator.
+func TestValidateKeepsExplicitAmounts(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ArcadeURL = "https://arcade.example"
+	cfg.MinPaymentSatoshis = 777_000
+	cfg.FirstFuelCoins = 9
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.MinPaymentSatoshis != 777_000 {
+		t.Errorf("minimum payment = %d, want the configured 777000", cfg.MinPaymentSatoshis)
+	}
+	if cfg.FirstFuelCoins != 9 {
+		t.Errorf("first fuel = %d, want the configured 9", cfg.FirstFuelCoins)
+	}
+}
+
+// A minimum payment at or below one fuel coin cannot buy a transition once fees
+// are paid, so accepting it costs a broadcast and a row and moves the automaton
+// not at all. Caught here rather than discovered as a pool that never grows.
+func TestValidateRejectsAMinimumBelowOneFuelCoin(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ArcadeURL = "https://arcade.example"
+	cfg.MinPaymentSatoshis = cfg.FuelDenomination
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted a minimum payment that cannot fund a single transition")
+	}
+}
+
+// The depth gate caps the sustained rate at depth / block interval, so a finite
+// default would silently cap the automaton no matter what rate is configured.
+// Teranode enforces no ancestor limit; this pins that the shipped default does
+// not reintroduce one.
+func TestDefaultDepthIsUnbounded(t *testing.T) {
+	if got := DefaultConfig().MaxUnconfirmedDepth; got != 0 {
+		t.Errorf("default max unconfirmed depth = %d, want 0 (unbounded) — a finite value caps "+
+			"the sustained rate at depth / block interval, and teranode enforces no ancestor limit", got)
 	}
 }

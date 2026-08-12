@@ -48,9 +48,10 @@ type Config struct {
 	// PostgresDSN switches storage from SQLite to PostgreSQL.
 	//
 	// This is the single biggest throughput lever. SQLite serialises every
-	// write, so 128 cells advancing at once thrash a single writer lock; the
-	// toolbox's own benchmarks put SQLite at ~57-108 TPS against ~575 for
-	// PostgreSQL. Empty keeps SQLite, which is fine for a small ring.
+	// write, so a whole generation advancing at once thrashes a single writer
+	// lock; the toolbox's own benchmarks put SQLite at ~57-108 TPS against ~575
+	// for PostgreSQL. Empty keeps SQLite, which is fine for a small ring and is
+	// not fine for the 256-cell default.
 	PostgresDSN string
 
 	// MaxDBConns bounds the storage connection pool. The benchmarks pair it
@@ -58,27 +59,31 @@ type Config struct {
 	MaxDBConns int
 
 	// MaxUnconfirmedDepth bounds how far ahead of its newest mined transaction
-	// a cell may run, or 0 for no bound.
+	// a cell may run. It DEFAULTS TO 0, which means no bound, and that is the
+	// correct setting for teranode.
 	//
 	// A cell is an unbroken chain of unconfirmed transactions, so its depth
-	// grows at the generation rate and only falls when a block lands. The
-	// original justification was a mempool ancestor limit: past it the deepest
-	// transaction is rejected and the rejection cascades to every descendant,
-	// which destroys a cell rather than costing a step.
+	// grows at the generation rate and only falls when a block lands. This
+	// field once defaulted to a finite number on the theory of a mempool
+	// ancestor limit: past it the deepest transaction is rejected and the
+	// rejection cascades to every descendant, destroying a cell rather than
+	// costing a step.
 	//
-	// WE COULD NOT FIND THAT LIMIT. `rule110 depth-probe` built 600 consecutive
-	// transactions on a single chain against the dev-ovh-1 scale network,
-	// reaching at least 250 unconfirmed ancestors, with zero rejections. That
-	// matches arcade enforcing no ancestor limit — its LimitAncestorCount is a
-	// dead value with no setter — and teranode's documentation saying ancestor
-	// tracking is not enforced. The cascade recorded in the toolbox benchmarks
-	// may well have had another cause.
+	// THAT LIMIT DOES NOT EXIST HERE. Teranode does not enforce ancestor
+	// tracking; arcade's LimitAncestorCount is a dead value with no setter; and
+	// `rule110 depth-probe` built 600 consecutive transactions on a single chain
+	// with zero rejections. The cascade recorded in the toolbox benchmarks had
+	// another cause. Keeping a finite default was caution about a boundary
+	// nobody could find, and it had a real price: the gate in engine.turnReady
+	// caps the sustained generation rate at depth ÷ block interval, so a
+	// value of 200 against this network's ~755 s blocks silently capped the
+	// automaton at ~0.27 gen/s no matter what rate was configured.
 	//
-	// So this is kept as a deliberate margin, not a proven boundary: the
-	// benchmarks did observe SOME cascade, other networks may differ, and the
-	// bound also usefully caps the in-flight set the status pipeline and
-	// reconciler have to carry. Set it from a probe of the network you are
-	// actually running against rather than trusting this default.
+	// What unbounded depth actually costs is the size of the in-flight set —
+	// cells × rate × block interval transactions that the partial index
+	// cell_txs_inflight, the status pipeline and Unsettled() at startup all
+	// have to carry. That is a sizing question, not a rejection risk. Set a
+	// bound only for a network you have measured and found one on.
 	MaxUnconfirmedDepth uint64
 
 	// MaxLag bounds how far the clock may run ahead of the slowest cell before
@@ -145,6 +150,41 @@ type Config struct {
 	// it, so it defaults on; turn it off only against a Genesis-rules network,
 	// where these transactions will be rejected anyway.
 	Chronicle bool
+
+	// LockControls refuses every play/pause/step/rate request, fixing the
+	// automaton at the configured rate for the life of the process.
+	//
+	// This exists because POST /api/control has no authentication and a public
+	// deployment puts it one HTTP request from anyone. Hiding the buttons in the
+	// browser is not a lock — the endpoint is still reachable — so the refusal
+	// lives in the handler and the UI merely reflects it. There is deliberately
+	// no override header or token: an escape hatch on an unauthenticated
+	// endpoint is just the endpoint again, and changing the rate of a public
+	// exhibit is worth a redeploy.
+	LockControls bool
+
+	// PublicFunding exposes /api/funding and /api/fund so anyone with a BRC-100
+	// wallet can pay this deployment's costs.
+	//
+	// Off by default: it is the only endpoint that makes an anonymous caller
+	// commission wallet and network work, and a private deployment should not
+	// carry that surface for nothing.
+	PublicFunding bool
+
+	// MinPaymentSatoshis is the smallest public payment worth accepting.
+	//
+	// Below one fuel coin plus its fees a payment cannot buy a single cell
+	// transition, so accepting it costs a database row and a broadcast to move
+	// the automaton not at all. Filled in from FuelDenomination when unset.
+	MinPaymentSatoshis uint64
+
+	// FirstFuelCoins is how many fuel coins the cold-start bootstrap mints
+	// before creating generation 0.
+	//
+	// Enough that the automaton visibly RUNS the moment genesis lands, rather
+	// than coming up correct and immediately starved while the keeper catches
+	// up. Filled in from Cells when unset.
+	FirstFuelCoins uint64
 }
 
 // DefaultConfig returns a configuration with everything but ArcadeURL set to a
@@ -156,25 +196,37 @@ func DefaultConfig() Config {
 		Network:      defs.NetworkTSTN,
 		DataDir:      "./data",
 		Originator:   "rule110.arcade.local",
-		Cells:        128,
+		Cells:        256,
 		Rule:         ca.Rule110,
 		CellSatoshis: 1,
 		Chronicle:    true,
-		MaxDBConns:   72,
-		// Below the 250 we measured without a rejection, well above the 64 this
-		// was set to when the limit was still assumed rather than tested.
-		MaxUnconfirmedDepth: 200,
+		// One shared pool serves both the metastore and the utxostore, and the
+		// toolbox sizes it as workers plus margin. There is one worker per cell
+		// and they burst-sign together at the start of a generation.
+		MaxDBConns: 144,
+		// Unbounded. See MaxUnconfirmedDepth: teranode enforces no ancestor
+		// limit, and a finite value here silently caps the generation rate at
+		// depth ÷ block interval.
+		MaxUnconfirmedDepth: 0,
 		MaxLag:              32,
 		FeeSatPerKB:         125,
 		MinBroadcastFeeRate: 100,
 		// A cell transition is ~4.1 kB, so ~512 satoshis of fee at 125 sat/kB.
 		// 1000 leaves comfortable change above the 48 satoshi dust floor (see
 		// dustFloor) while stranding little value per coin.
-		FuelDenomination:  1000,
-		FuelPoolSize:      20000,
+		FuelDenomination: 1000,
+		// The keeper refills from 60% of target, so the usable swing is 40% of
+		// this number and it has to cover the keeper's own measure-and-mint
+		// latency. At 256 cells and 0.5 gen/s the ring burns 128 coins a second,
+		// so 20,000 bought 62 seconds of swing and 60,000 buys 187.
+		FuelPoolSize:      60000,
 		Throughput:        true,
 		FullStatusUpdates: true,
-		ApplyConcurrency:  32,
+		// ~512 status events a second at 128 tx/s with full updates. The toolbox
+		// default of 8 is documented as too low; 32 is adequate only if every
+		// apply is fast, and an applier that cannot drain the hand-off queue
+		// blocks the SSE reader and makes arcade drop events for a slow client.
+		ApplyConcurrency: 48,
 	}
 }
 
@@ -229,6 +281,25 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("chain: apply concurrency must be positive, got %d "+
 			"(a non-positive value is ignored and silently leaves the toolbox default of 8)",
 			c.ApplyConcurrency)
+	}
+	// Both of these are derived from numbers that are themselves configurable,
+	// so they are filled in here rather than in DefaultConfig: a caller who
+	// raises -fuel-sats or -cells should not also have to restate these.
+	if c.MinPaymentSatoshis == 0 {
+		// Ten fuel coins. Below roughly this a payment cannot buy even one cell
+		// transition once fees are paid, so accepting it costs a broadcast and a
+		// database row and moves the automaton not at all.
+		c.MinPaymentSatoshis = 10 * c.FuelDenomination
+	}
+	if c.FirstFuelCoins == 0 {
+		// Two full generations, so the automaton is visibly running the moment
+		// genesis lands while the keeper fills the pool to target behind it.
+		c.FirstFuelCoins = 2 * uint64(c.Cells)
+	}
+	if c.Throughput && c.MinPaymentSatoshis <= c.FuelDenomination {
+		return fmt.Errorf("chain: minimum payment %d must exceed one fuel coin of %d satoshis, "+
+			"or an accepted payment cannot fund a single transition",
+			c.MinPaymentSatoshis, c.FuelDenomination)
 	}
 	if c.Originator == "" {
 		return fmt.Errorf("chain: originator is required")

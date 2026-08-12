@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -210,6 +211,14 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 		"monitor workers applying arcade status batches")
 	fs.BoolVar(&cfg.FullStatusUpdates, "full-status", cfg.FullStatusUpdates,
 		"subscribe to every status transition (~4x the events; turn off above ~3 gen/s)")
+	fs.BoolVar(&cfg.LockControls, "lock-controls", envBool("RULE110_LOCK_CONTROLS", cfg.LockControls),
+		"refuse every play/pause/step/rate request; /api/control is unauthenticated, so this is the lock")
+	fs.BoolVar(&cfg.PublicFunding, "public-funding", envBool("RULE110_PUBLIC_FUNDING", cfg.PublicFunding),
+		"expose /api/funding and /api/fund so any BRC-100 wallet can pay this deployment's costs")
+	fs.Uint64Var(&cfg.MinPaymentSatoshis, "min-payment", cfg.MinPaymentSatoshis,
+		"smallest public payment worth accepting; 0 derives it from -fuel-sats")
+	fs.Uint64Var(&cfg.FirstFuelCoins, "first-fuel", cfg.FirstFuelCoins,
+		"fuel coins the cold-start bootstrap mints before genesis; 0 derives it from the ring size")
 
 	network := fs.String("network", envOr("RULE110_NETWORK", string(defs.NetworkTSTN)),
 		"main | test | ttn (Teranode test net) | tstn (private scaling test net)")
@@ -731,4 +740,21 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envBool is envOr for a flag.
+//
+// An unparseable value falls back rather than failing, because these come from
+// a Kubernetes ConfigMap where the difference between "true" and "True" should
+// not crash-loop a pod — strconv.ParseBool accepts both, along with 1/0/t/f.
+func envBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
