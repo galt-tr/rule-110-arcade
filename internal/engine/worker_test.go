@@ -13,12 +13,12 @@ import (
 func atGeneration(e *Engine, g uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for i := range e.state.Chains {
-		e.state.Chains[i].Cell = i
-		e.state.Chains[i].Generation = g
+	for i := range e.tips {
+		e.tips[i].Cell = i
+		e.tips[i].Generation = g
 		e.lastMined[i] = g
 	}
-	e.state.Generation = g
+	e.generation = g
 	e.target = g
 }
 
@@ -30,10 +30,10 @@ func TestFrontierIsTheSlowestCell(t *testing.T) {
 	atGeneration(e, 10)
 
 	e.mu.Lock()
-	e.state.Chains[0].Generation = 14
-	e.state.Chains[1].Generation = 12
-	e.state.Chains[2].Generation = 11 // the laggard
-	e.state.Chains[3].Generation = 13
+	e.tips[0].Generation = 14
+	e.tips[1].Generation = 12
+	e.tips[2].Generation = 11 // the laggard
+	e.tips[3].Generation = 13
 	got := e.frontierLocked()
 	e.mu.Unlock()
 
@@ -49,7 +49,7 @@ func TestFrontierIgnoresHaltedCells(t *testing.T) {
 	atGeneration(e, 10)
 
 	e.mu.Lock()
-	e.state.Chains[2].Generation = 3
+	e.tips[2].Generation = 3
 	e.halted[2] = true
 	got := e.frontierLocked()
 	e.mu.Unlock()
@@ -71,8 +71,8 @@ func TestDepthGateBlocksAndReleases(t *testing.T) {
 
 	e.mu.Lock()
 	e.mode = ModeRunning
-	e.target = 1000                  // the clock wants far more
-	e.state.Chains[0].Generation = 5 // already 5 deep, nothing mined
+	e.target = 1000          // the clock wants far more
+	e.tips[0].Generation = 5 // already 5 deep, nothing mined
 	e.lastMined[0] = 0
 	e.mu.Unlock()
 
@@ -156,7 +156,7 @@ func TestSnapshotReportsBackpressure(t *testing.T) {
 
 	e.mu.Lock()
 	e.target = 30
-	e.state.Chains[0].Generation = 22
+	e.tips[0].Generation = 22
 	e.lastMined[0] = 4
 	e.mu.Unlock()
 
@@ -234,7 +234,9 @@ func TestStepAdvancesTheTargetByOne(t *testing.T) {
 // generation behind, re-spend an output the network had already consumed, and
 // lose the cell to a rejection indistinguishable from a real failure.
 //
-// The write-ahead record turns that into a cell the operator can see.
+// The write-ahead record turns that into a cell the operator can see: the
+// newest record for the cell is the unresolved attempt, which is what marks its
+// tip UNKNOWN at the next start.
 func TestWriteAheadSurvivesACrash(t *testing.T) {
 	e := newTestEngine(t, 4)
 	ctx := t.Context()
@@ -247,12 +249,13 @@ func TestWriteAheadSurvivesACrash(t *testing.T) {
 	}
 	// ...and the process dies here, before the result is known.
 
-	uncertain, err := e.store.UnresolvedAttempts(ctx)
+	tips, err := e.store.CellTips(ctx, 4, tipDepth)
 	if err != nil {
-		t.Fatalf("unresolved attempts: %v", err)
+		t.Fatalf("cell tips: %v", err)
 	}
-	if got, ok := uncertain[2]; !ok || got != 300 {
-		t.Fatalf("unresolved attempts = %v, want cell 2 at generation 300", uncertain)
+	got := tips[2]
+	if len(got) != 1 || got[0].Generation != 300 || got[0].Status != history.StatusAttempting {
+		t.Fatalf("cell 2 tips = %v, want one unresolved attempt at generation 300", got)
 	}
 }
 
@@ -270,12 +273,13 @@ func TestResolvedAttemptIsNotFlagged(t *testing.T) {
 		}
 	}
 
-	uncertain, err := e.store.UnresolvedAttempts(ctx)
+	tips, err := e.store.CellTips(ctx, 4, tipDepth)
 	if err != nil {
-		t.Fatalf("unresolved attempts: %v", err)
+		t.Fatalf("cell tips: %v", err)
 	}
-	if len(uncertain) != 0 {
-		t.Errorf("unresolved attempts = %v, want none once the attempt resolved", uncertain)
+	got := tips[2]
+	if len(got) != 1 || got[0].Status != history.StatusBroadcast {
+		t.Fatalf("cell 2 tips = %v, want the resolved broadcast record to have replaced the attempt", got)
 	}
 }
 
@@ -293,12 +297,12 @@ func TestRetractedAttemptIsNotFlagged(t *testing.T) {
 	}
 	e.retractAttempt(300, 2)
 
-	uncertain, err := e.store.UnresolvedAttempts(ctx)
+	tips, err := e.store.CellTips(ctx, 4, tipDepth)
 	if err != nil {
-		t.Fatalf("unresolved attempts: %v", err)
+		t.Fatalf("cell tips: %v", err)
 	}
-	if len(uncertain) != 0 {
-		t.Errorf("unresolved attempts = %v, want none after retraction", uncertain)
+	if len(tips[2]) != 0 {
+		t.Errorf("cell 2 tips = %v, want none after retraction", tips[2])
 	}
 }
 
@@ -365,9 +369,56 @@ func TestNonLeaderNeverAdvances(t *testing.T) {
 		t.Error("a starved non-leader probed anyway; the probe broadcasts a real transaction")
 	}
 
+	// Gaining the lease is not on its own permission to advance: see
+	// TestReacquiringTheLeaseForcesARederive.
 	e.setLeader(true)
+	if e.turnReady(0) {
+		t.Error("a leader advanced before re-deriving its tips under the lease it now holds")
+	}
+	e.mu.Lock()
+	e.needsRederive = false
+	e.mu.Unlock()
 	if !e.turnReady(0) {
-		t.Error("the leader must advance once it holds the lease")
+		t.Error("the leader must advance once it holds the lease and has re-derived")
+	}
+}
+
+// TestReacquiringTheLeaseForcesARederive is bug 9b.
+//
+// holdLease flips leader back to true after any store error, and it cannot tell
+// a database hiccup from a lease that genuinely expired while another writer
+// took over and advanced all 128 chains. In the second case every tip in memory
+// is stale, so resuming from them double-spends the whole ring at once. The
+// engine therefore treats every acquisition as the second case and refuses to
+// advance until the tips have been re-derived from the store.
+func TestReacquiringTheLeaseForcesARederive(t *testing.T) {
+	e := newTestEngine(t, 4)
+	atGeneration(e, 10)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 1000
+	e.needsRederive = false // settled: this instance has been advancing happily
+	e.mu.Unlock()
+
+	if !e.turnReady(0) {
+		t.Fatal("a settled leader should be advancing")
+	}
+
+	// The store blinks; the next renewal succeeds.
+	e.setLeader(false)
+	e.setLeader(true)
+
+	e.mu.RLock()
+	needs := e.needsRederive
+	e.mu.RUnlock()
+	if !needs {
+		t.Fatal("re-acquiring the lease must force a re-derivation, or a stale tip is spent")
+	}
+	for cell := range 4 {
+		if e.turnReady(cell) {
+			t.Fatalf("cell %d advanced on tips that were never re-derived under the new lease", cell)
+		}
 	}
 }
 
@@ -404,5 +455,42 @@ func TestLeaseIsExclusiveAndReclaimable(t *testing.T) {
 	}
 	if held, err := e.store.AcquireLease(ctx, "l", "pod-a", time.Minute); err != nil || !held {
 		t.Fatalf("a released lease was not available: held=%v err=%v", held, err)
+	}
+}
+
+// TestPersistFailureHaltsTheCell is bug 9d.
+//
+// The history store is now the ONLY record of where a cell is — there is no
+// state file behind it. A row that cannot be written therefore means the next
+// startup derives the tip one generation back and spends an output the network
+// has already consumed, which is the same double spend this whole rework exists
+// to prevent, arrived at from the other direction. Logging and carrying on is
+// not an option any more.
+func TestPersistFailureHaltsTheCell(t *testing.T) {
+	e := newTestEngine(t, 4)
+	atGeneration(e, 10)
+
+	// Break the store the way a lost connection does.
+	if err := e.store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	e.persist(history.CellTx{
+		Generation: 11, Cell: 2, TxID: "abc", Status: history.StatusBroadcast,
+	})
+
+	e.mu.RLock()
+	halted, reason, lastErr := e.halted[2], e.haltReason[2], e.lastError
+	e.mu.RUnlock()
+
+	if !halted {
+		t.Fatal("a cell whose transaction could not be recorded kept advancing; " +
+			"its next start would re-spend a spent output")
+	}
+	if reason == "" || lastErr == "" {
+		t.Errorf("the halt must be explained (reason=%q lastError=%q)", reason, lastErr)
+	}
+	if e.turnReady(2) {
+		t.Error("a halted cell must not be ready to advance")
 	}
 }

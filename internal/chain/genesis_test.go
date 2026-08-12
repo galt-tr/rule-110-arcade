@@ -68,39 +68,39 @@ func TestTipBEEFRejectsAnEmptyTip(t *testing.T) {
 	}
 }
 
-// TestLoadStateMigratesLegacyBEEF covers automata written before RawTxHex
-// existed: the tip transaction is the subject of its own atomic BEEF, so the
-// conversion is lossless and the automaton keeps running rather than needing a
-// fresh genesis.
-func TestLoadStateMigratesLegacyBEEF(t *testing.T) {
+// TestMigrateLegacyBEEF covers automata written before RawTxHex existed: the tip
+// transaction is the subject of its own atomic BEEF, so the conversion is
+// lossless and `import-tips` can still read those bytes rather than the
+// deployment needing a fresh genesis.
+func TestMigrateLegacyBEEF(t *testing.T) {
 	tx, raw := aTransaction(t)
 	legacy, err := tx.AtomicBEEF(true)
 	if err != nil {
 		t.Fatalf("AtomicBEEF: %v", err)
 	}
 
-	s := &State{Chains: []CellChain{
+	tips := []CellChain{
 		{Cell: 0, LegacyBEEFHex: hex.EncodeToString(legacy)},
 		{Cell: 1, RawTxHex: hex.EncodeToString(raw), LegacyBEEFHex: "dead"},
-	}}
-	if err := s.migrateLegacyBEEF(); err != nil {
+	}
+	if err := migrateLegacyBEEF(tips); err != nil {
 		t.Fatalf("migrateLegacyBEEF: %v", err)
 	}
 
-	if got := s.Chains[0].RawTxHex; got != hex.EncodeToString(raw) {
+	if got := tips[0].RawTxHex; got != hex.EncodeToString(raw) {
 		t.Errorf("cell 0 raw tx = %q, want the tip transaction's bytes", got)
 	}
-	if s.Chains[1].RawTxHex != hex.EncodeToString(raw) {
+	if tips[1].RawTxHex != hex.EncodeToString(raw) {
 		t.Error("cell 1 already had a raw tx and must be left alone")
 	}
-	for _, c := range s.Chains {
+	for _, c := range tips {
 		if c.LegacyBEEFHex != "" {
 			t.Errorf("cell %d still carries the legacy beef; it must be dropped, not kept alongside", c.Cell)
 		}
 	}
 
 	// And the migrated field must not be written back out.
-	encoded, err := json.Marshal(s.Chains[0])
+	encoded, err := json.Marshal(tips[0])
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}

@@ -14,6 +14,7 @@ package history
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -132,6 +133,17 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS cell_txs_inflight ON cell_txs (updated_at)
 		   WHERE status NOT IN ('mined', 'failed')`,
 		`CREATE INDEX IF NOT EXISTS cell_txs_txid ON cell_txs (txid)`,
+		// The other hot query is "what is cell c's newest record", asked once per
+		// cell at startup by CellTips. The primary key is (generation, cell) — the
+		// wrong column order for it, since a leading generation cannot serve a
+		// predicate on cell — so without this the answer costs a scan of the whole
+		// table per cell, or 128 scans of a table that grows by 128 rows per
+		// generation forever.
+		//
+		// This is the index the whole derived-tip design rests on: with it, the
+		// startup cost is O(cells x depth) regardless of how long the automaton
+		// has been running.
+		`CREATE INDEX IF NOT EXISTS cell_txs_cell_gen ON cell_txs (cell, generation)`,
 		// Single-writer election. See AcquireLease.
 		`CREATE TABLE IF NOT EXISTS leases (
 			name       TEXT PRIMARY KEY,
@@ -287,6 +299,25 @@ func (s *Store) Load(ctx context.Context, from uint64, limit int) ([]Generation,
 	return gens, nil
 }
 
+// RowAt returns the row recorded for one generation, and whether there is one.
+//
+// A point lookup on the primary key, for the startup cross-check that the rows
+// the store recorded when they were proved are the rows the seed and the rule
+// reproduce. Absent is not an error: a generation the store never saw is
+// perfectly ordinary, and only a DISAGREEMENT means anything.
+func (s *Store) RowAt(ctx context.Context, number uint64) (string, bool, error) {
+	var rowHex string
+	q := `SELECT row_hex FROM generations WHERE number = ?`
+	err := s.db.QueryRowContext(ctx, s.rebind(q), number).Scan(&rowHex)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("history: read generation %d: %w", number, err)
+	}
+	return rowHex, true, nil
+}
+
 // Stats summarises what has been recorded.
 type Stats struct {
 	Generations uint64
@@ -328,34 +359,77 @@ func scanCells(rows *sql.Rows) ([]CellTx, error) {
 	return out, nil
 }
 
-// UnresolvedAttempts returns the cells whose newest record is a write-ahead
-// attempt that was never resolved, mapped to the generation attempted.
-//
-// Each of these means a transaction may have been broadcast and then lost to a
-// crash: the cell's real tip is unknown, and advancing it from the last recorded
-// tip would double-spend. See StatusAttempting.
-func (s *Store) UnresolvedAttempts(ctx context.Context) (map[int]uint64, error) {
-	q := `SELECT c.cell, c.generation FROM cell_txs c
-	      JOIN (SELECT cell, MAX(generation) AS g FROM cell_txs GROUP BY cell) m
-	        ON m.cell = c.cell AND m.g = c.generation
-	      WHERE c.status = ?`
-	rows, err := s.db.QueryContext(ctx, s.rebind(q), string(StatusAttempting))
-	if err != nil {
-		return nil, fmt.Errorf("history: query unresolved attempts: %w", err)
-	}
-	defer rows.Close()
+// Tip is one recorded step of one cell's chain, newest first.
+type Tip struct {
+	Cell       int
+	Generation uint64
+	TxID       string
+	Status     Status
+	Err        string
+}
 
-	out := map[int]uint64{}
-	for rows.Next() {
-		var cell int
-		var generation uint64
-		if err := rows.Scan(&cell, &generation); err != nil {
-			return nil, fmt.Errorf("history: scan unresolved attempt: %w", err)
+// CellTips returns the newest depth records for each cell in [0, cells),
+// newest generation first.
+//
+// This is the whole of what the store knows about where a cell has got to, and
+// it answers three questions from one set of rows: what the tip is, whether the
+// cell is halted, and whether its tip is unknown. Keeping them together is not
+// tidiness — asking them separately is what let a rejection halt (the newest
+// record being `failed`) and a lost broadcast (the newest record being
+// `attempting`) be handled by different code paths, one of which was in memory
+// only and did not survive a restart.
+//
+// It replaces UnresolvedAttempts, which grouped over the whole of cell_txs to
+// find one row per cell. That is a full scan of a table growing by `cells` rows
+// per generation, executed while the process is starting and before the UI is
+// up. This is one indexed lookup per cell against cell_txs_cell_gen, bounded by
+// depth, so its cost does not grow with the automaton's age.
+//
+// depth must be large enough to cover a retry chain — a rejection followed by
+// the attempt that preceded it — but it is deliberately small: the caller walks
+// these rows in memory, and any answer needing more history than this is one
+// the caller should be refusing to guess at.
+func (s *Store) CellTips(ctx context.Context, cells, depth int) (map[int][]Tip, error) {
+	if cells <= 0 {
+		return nil, fmt.Errorf("history: cell tips: cells must be positive, got %d", cells)
+	}
+	if depth <= 0 {
+		return nil, fmt.Errorf("history: cell tips: depth must be positive, got %d", depth)
+	}
+	q := `SELECT generation, txid, status, err FROM cell_txs
+	      WHERE cell = ? ORDER BY generation DESC LIMIT ?`
+
+	out := make(map[int][]Tip, cells)
+	for cell := range cells {
+		rows, err := s.db.QueryContext(ctx, s.rebind(q), cell, depth)
+		if err != nil {
+			return nil, fmt.Errorf("history: query tips for cell %d: %w", cell, err)
 		}
-		out[cell] = generation
+		tips, err := scanTips(cell, rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		if len(tips) > 0 {
+			out[cell] = tips
+		}
+	}
+	return out, nil
+}
+
+func scanTips(cell int, rows *sql.Rows) ([]Tip, error) {
+	var out []Tip
+	for rows.Next() {
+		t := Tip{Cell: cell}
+		var status string
+		if err := rows.Scan(&t.Generation, &t.TxID, &status, &t.Err); err != nil {
+			return nil, fmt.Errorf("history: scan tip for cell %d: %w", cell, err)
+		}
+		t.Status = Status(status)
+		out = append(out, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("history: query unresolved attempts: %w", err)
+		return nil, fmt.Errorf("history: query tips for cell %d: %w", cell, err)
 	}
 	return out, nil
 }

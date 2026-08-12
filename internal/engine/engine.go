@@ -139,14 +139,49 @@ const maxHistory = 2048
 // the history it already has; older generations are terminal and do not change.
 const TailGenerations = 48
 
+// Options are the choices a deployment makes about how the engine behaves that
+// are not properties of the chain.
+type Options struct {
+	// AutoRecover lets the engine resolve a cell whose tip is unknown by itself,
+	// on every acquisition of the writer lease.
+	//
+	// It defaults OFF, and that is a considered position rather than caution for
+	// its own sake. The asymmetry decides it: what recovery prevents is a halted
+	// cell — visible, non-destructive, fixable by hand — while a bug in it runs
+	// 128 times unattended immediately after a crash, which is precisely when
+	// the deployment is least well understood. `rule110 recover` shows exactly
+	// what it would do, against the real wallet, before anything is allowed to
+	// do it on its own.
+	AutoRecover bool
+}
+
 // Engine owns the automaton's state and its clock.
 type Engine struct {
 	chain    *chain.Chain
 	compiled *cellscript.Compiled
 	logger   *slog.Logger
+	opts     Options
 
-	mu        sync.RWMutex
-	state     *chain.State
+	mu sync.RWMutex
+
+	// deployment is what genesis fixed: ring size, rule, seed, genesis txid.
+	// Immutable, so it needs no lock discipline of its own — it is here rather
+	// than passed around only because everything else in the engine wants it.
+	deployment *chain.Deployment
+
+	// tips[cell] is the output that cell will spend next.
+	//
+	// Derived at startup and on every re-acquisition of the writer lease, never
+	// loaded from a file: the durable record of where a cell is is the history
+	// store, and these are rebuilt from it plus the bytes of the transactions it
+	// names. See DeriveTips.
+	tips []chain.CellChain
+
+	// generation is the frontier: the newest row every unhalted cell has proved.
+	// Display state, derived from tips, and the position the automaton holds when
+	// every cell is halted and there is no frontier left to compute.
+	generation uint64
+
 	history   []Generation
 	mode      Mode
 	rate      float64
@@ -177,13 +212,21 @@ type Engine struct {
 	// fundingAddress is shown to the operator while starved.
 	fundingAddress string
 
-	// dirty marks tip state that the checkpointer has not written yet.
-	dirty bool
-
 	// owner identifies this instance in the single-writer election, and leader
 	// records whether it currently holds it. See holdLease.
 	owner  string
 	leader bool
+
+	// needsRederive gates every cell until the tips have been rebuilt under the
+	// lease we currently hold.
+	//
+	// holdLease can flip leader back to true after a store error, and it cannot
+	// tell "the database blinked" from "the lease genuinely expired and someone
+	// else advanced all 128 chains". Resuming from in-memory tips in the second
+	// case double-spends every cell at once. So a fresh acquisition is treated
+	// as the second case unconditionally: nothing advances until the tips have
+	// been re-derived from the store, which is cheap and bounded. See rederive.
+	needsRederive bool
 
 	// waitingOnCoin holds the cells currently retrying a funding shortfall, so
 	// coin contention is visible rather than looking like a slow network.
@@ -192,9 +235,15 @@ type Engine struct {
 	// txIndex maps a broadcast txid back to the cell that produced it, so
 	// arcade's status stream can be reflected in the diagram.
 	txIndex map[string]txLoc
-	// halted marks cells whose chain is broken (a rejected transaction), so we
-	// stop trying to spend outputs that do not exist.
-	halted map[int]bool
+	// halted marks cells whose chain is broken, and haltReason says why.
+	//
+	// Reconstructed from the store at startup, not merely accumulated at
+	// runtime. That is bug 9a: a rejection used to set this in memory only,
+	// while the tip had already been advanced to the rejected transaction's
+	// output, so a restart resumed the cell against an output that never
+	// existed and it spent a phantom forever.
+	halted     map[int]bool
+	haltReason map[int]string
 
 	// store is the durable record. Memory holds a window for the UI; the store
 	// holds everything.
@@ -205,15 +254,17 @@ type Engine struct {
 	changed chan struct{}
 }
 
-// New creates an engine positioned at the chain's recorded state.
-func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, state *chain.State,
-	store *history.Store, logger *slog.Logger) (*Engine, error) {
+// New creates an engine positioned where the history store and the chain say
+// the cells actually are.
+//
+// Nothing here is loaded from a mutable file. Every tip is derived and verified
+// against the covenant script the transaction really carries, and the halted set
+// is reconstructed from the same records — so a cell halted by a rejection stays
+// halted across a restart, which it did not before. See DeriveTips.
+func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *chain.Deployment,
+	store *history.Store, opts Options, logger *slog.Logger) (*Engine, error) {
 
-	seedHex := state.SeedHex
-	if seedHex == "" {
-		seedHex = state.RowHex
-	}
-	seed, err := ca.SeedHex(state.Cells, seedHex)
+	seed, err := d.Seed()
 	if err != nil {
 		return nil, err
 	}
@@ -221,17 +272,24 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, sta
 		chain:         c,
 		compiled:      compiled,
 		logger:        logger,
-		state:         state,
+		opts:          opts,
+		deployment:    d,
+		tips:          make([]chain.CellChain, d.Cells),
 		mode:          ModePaused,
 		rate:          1,
-		target:        state.Generation,
-		lastMined:     make(map[int]uint64, state.Cells),
+		lastMined:     make(map[int]uint64, d.Cells),
 		changed:       make(chan struct{}),
 		txIndex:       make(map[string]txLoc),
 		halted:        make(map[int]bool),
+		haltReason:    make(map[int]string),
 		waitingOnCoin: make(map[int]bool),
 		store:         store,
 		owner:         instanceOwner(),
+		// Nothing may advance until the tips have been re-derived while this
+		// instance actually holds the writer lease. They are derived here too,
+		// so the UI has something true to show immediately, but between here and
+		// the first acquisition another writer may still own these chains.
+		needsRederive: true,
 	}
 	// The address is what an operator needs the moment funding runs out, so
 	// resolve it now rather than when the automaton is already stopped.
@@ -240,31 +298,25 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, sta
 	} else {
 		logger.Warn("could not derive the funding address", "err", err)
 	}
-	// Nothing is known to be mined until the status stream says so; starting at
-	// the recorded generation means the depth gate opens rather than clamping
-	// every cell shut on a fresh start.
-	for i := range state.Cells {
-		e.lastMined[i] = state.Chains[i].Generation
+
+	// Seed generation 0 before deriving, so a brand-new deployment has the row
+	// the derivation cross-check compares against.
+	if err := seedGenesisRecord(ctx, store, d, seed); err != nil {
+		return nil, err
 	}
-	loaded, err := loadHistory(ctx, store, state)
+
+	positions, err := DeriveTips(ctx, c, compiled, d, store)
 	if err != nil {
 		return nil, err
 	}
-	if len(loaded) == 0 {
-		// Nothing recorded yet: seed generation 0 from the genesis transaction
-		// and persist it, so the very first row is durable too.
-		g := genesisGeneration(state, seed)
-		if err := store.RecordGeneration(ctx, 0, g.RowHex); err != nil {
-			return nil, err
-		}
-		for _, c := range g.Cells {
-			if err := store.RecordTx(ctx, history.CellTx{
-				Generation: 0, Cell: c.Cell, TxID: c.TxID, Status: history.StatusSeen,
-			}); err != nil {
-				return nil, err
-			}
-		}
-		loaded = []Generation{g}
+	if err := CheckMigrationFloor(positions, d.LegacyTips()); err != nil {
+		return nil, err
+	}
+	e.applyPositions(positions)
+
+	loaded, err := loadHistory(ctx, store, d.Cells, e.generation)
+	if err != nil {
+		return nil, err
 	}
 	e.history = loaded
 
@@ -283,47 +335,81 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, sta
 		}
 	}
 
-	// A write-ahead record left unresolved means the process died between
-	// broadcasting a transition and recording it. That cell's real tip is
-	// UNKNOWN — advancing it from the last tip we did record would re-spend an
-	// output the network may already have consumed, and the resulting rejection
-	// is indistinguishable from a genuine failure. It is exactly how cells 34
-	// and 51 were lost.
-	//
-	// So stop the cell instead of guessing. This is deliberately conservative:
-	// one stalled cell an operator can see beats a silent double spend, and
-	// recovering the real tip from chain data is a separate job.
-	uncertain, err := store.UnresolvedAttempts(ctx)
-	if err != nil {
-		return nil, err
+	e.logger.Info("tips derived", "generations", len(e.history), "unsettled", len(unsettled),
+		"frontier", e.generation, "halted", len(e.halted))
+	for cell, why := range e.haltReason {
+		e.logger.Warn("cell halted", "cell", cell, "reason", why)
 	}
-	for cell, generation := range uncertain {
-		if cell < 0 || cell >= state.Cells {
-			continue
-		}
-		e.halted[cell] = true
-		e.logger.Warn("cell tip is unknown after an unclean shutdown; refusing to advance it",
-			"cell", cell, "generation", generation,
-			"detail", "a transition may have been broadcast without being recorded")
-	}
-	if len(uncertain) > 0 {
-		e.lastError = fmt.Sprintf(
-			"%d cell(s) stopped: a transition may have been broadcast but not recorded before shutdown",
-			len(uncertain))
-	}
-	e.logger.Info("history loaded", "generations", len(e.history), "unsettled", len(unsettled))
-
 	return e, nil
 }
 
-// genesisGeneration records generation 0, whose cells were all created by the
-// single genesis transaction.
-func genesisGeneration(state *chain.State, row ca.Row) Generation {
-	cells := make([]CellTx, state.Cells)
-	for i := range state.Cells {
-		cells[i] = CellTx{Cell: i, TxID: state.GenesisTxID, State: TxSeen}
+// applyPositions installs a freshly derived set of tips. Callers must not hold
+// the lock; New runs before anything else can, and rederive takes it here.
+func (e *Engine) applyPositions(positions []CellPosition) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	unknown := 0
+	e.halted = make(map[int]bool, len(positions))
+	e.haltReason = make(map[int]string, len(positions))
+	for cell, p := range positions {
+		e.tips[cell] = p.Tip
+		if p.Halted {
+			e.halted[cell] = true
+			e.haltReason[cell] = p.HaltReason
+		}
+		if p.Unknown {
+			unknown++
+		}
+		// Nothing is known to be mined until the status stream says so; starting
+		// at the derived generation means the depth gate opens rather than
+		// clamping every cell shut on a fresh start.
+		e.lastMined[cell] = p.Tip.Generation
 	}
-	return Generation{Number: 0, RowHex: row.Hex(), Cells: cells}
+
+	e.generation = e.frontierLocked()
+	// Never leave the clock behind the cells, or every worker idles until it
+	// catches up.
+	if e.target < e.generation {
+		e.target = e.generation
+	}
+
+	// Set unconditionally, including the empty case: this is a fresh assessment
+	// of every cell, so a message left over from the previous one would report a
+	// problem that recovery has just resolved.
+	switch {
+	case unknown > 0:
+		e.lastError = fmt.Sprintf(
+			"%d cell(s) stopped: a transition may have been broadcast but not recorded before shutdown "+
+				"(run \"rule110 recover\")", unknown)
+	case len(e.halted) > 0:
+		e.lastError = fmt.Sprintf("%d cell(s) halted", len(e.halted))
+	default:
+		e.lastError = ""
+	}
+	e.notify()
+}
+
+// seedGenesisRecord writes generation 0 if the store has never recorded it.
+//
+// Generation 0's transactions are not something the engine ever broadcasts —
+// they were all created by the single genesis transaction — so nothing else
+// would ever put them in the store, and the diagram would start blank.
+func seedGenesisRecord(ctx context.Context, store *history.Store, d *chain.Deployment, seed ca.Row) error {
+	if _, ok, err := store.RowAt(ctx, 0); err != nil || ok {
+		return err
+	}
+	if err := store.RecordGeneration(ctx, 0, seed.Hex()); err != nil {
+		return err
+	}
+	for cell := range d.Cells {
+		if err := store.RecordTx(ctx, history.CellTx{
+			Generation: 0, Cell: cell, TxID: d.GenesisTxID, Status: history.StatusSeen,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // loadHistory restores the recorded history: real rows with the real
@@ -332,10 +418,10 @@ func genesisGeneration(state *chain.State, row ca.Row) Generation {
 // Rows could be recomputed from the seed, but the transaction ids could not —
 // they exist only in the store, and they are the evidence the automaton ran on
 // chain at all. Recomputing rows and discarding txids was the wrong trade.
-func loadHistory(ctx context.Context, store *history.Store, state *chain.State) ([]Generation, error) {
+func loadHistory(ctx context.Context, store *history.Store, cellCount int, frontier uint64) ([]Generation, error) {
 	from := uint64(0)
-	if state.Generation > maxHistory {
-		from = state.Generation - maxHistory
+	if frontier > maxHistory {
+		from = frontier - maxHistory
 	}
 	recorded, err := store.Load(ctx, from, maxHistory+1)
 	if err != nil {
@@ -344,12 +430,12 @@ func loadHistory(ctx context.Context, store *history.Store, state *chain.State) 
 
 	out := make([]Generation, 0, len(recorded))
 	for _, g := range recorded {
-		cells := make([]CellTx, state.Cells)
-		for i := range state.Cells {
+		cells := make([]CellTx, cellCount)
+		for i := range cells {
 			cells[i] = CellTx{Cell: i, State: TxPending}
 		}
 		for _, c := range g.Cells {
-			if c.Cell < 0 || c.Cell >= state.Cells {
+			if c.Cell < 0 || c.Cell >= len(cells) {
 				continue
 			}
 			cells[c.Cell] = CellTx{
@@ -400,8 +486,8 @@ func (e *Engine) Snapshot() Snapshot {
 
 	frontier := e.frontierLocked()
 	return Snapshot{
-		Cells:       e.state.Cells,
-		Rule:        int(e.state.Rule),
+		Cells:       e.deployment.Cells,
+		Rule:        int(e.deployment.Rule),
 		Mode:        e.mode,
 		Rate:        e.rate,
 		Generation:  frontier,
@@ -413,7 +499,7 @@ func (e *Engine) Snapshot() Snapshot {
 		FailedCells: failed,
 		Consensus:   failed == 0,
 		ArcadeURL:   e.chain.Config.ArcadeURL,
-		GenesisTxID: e.state.GenesisTxID,
+		GenesisTxID: e.deployment.GenesisTxID,
 		LastError:   e.lastError,
 
 		Starved:        e.mode == ModeStarved,
@@ -498,7 +584,7 @@ func indexOfGeneration(gens []Generation, number uint64) int {
 	return -1
 }
 
-// trackBalance refreshes the reported balance periodically.
+// trackFunds refreshes the reported balance periodically.
 func (e *Engine) trackFunds(ctx context.Context) {
 	// Five seconds, not ten: this is the number an operator watches after
 	// sending a payment to a starved deployment, and it is also how they see the
@@ -530,15 +616,65 @@ func (e *Engine) trackFunds(ctx context.Context) {
 	}
 }
 
-// persist writes a cell transaction to the durable store.
+// persistRetries is how many times a durable write is attempted before the cell
+// is halted, and persistBackoff the pause between attempts.
 //
-// Failures are logged rather than propagated: losing a history row must not
-// stop the automaton, and the reconciler will re-record the status later.
+// Short and few. This runs on the hot path with a cell's worker blocked on it,
+// and the failures worth riding out here are the momentary ones — a connection
+// recycled, a lock contended. Anything longer-lived is not going to clear inside
+// a retry loop, and the correct response to it is to stop the cell rather than
+// to keep advancing while its record goes unwritten.
+const (
+	persistRetries = 3
+	persistBackoff = 50 * time.Millisecond
+)
+
+// persist writes a cell transaction to the durable store, retrying briefly and
+// halting the cell if it still cannot be written.
+//
+// This used to log and swallow, on the reasoning that losing a history row must
+// not stop the automaton. That reasoning is backwards now, and it was always
+// wrong for one of the two rows written here:
+//
+//   - the write-ahead `attempting` record is the ONLY thing that says a
+//     transition might have been broadcast. Losing it means the next startup
+//     sees a healthy cell and re-spends an output that may already be gone;
+//   - the `broadcast` record is now the only record of where the cell IS. Losing
+//     it means the next startup derives the tip one generation back and spends
+//     an output the network has already consumed.
+//
+// Both are the double spend this whole rework exists to prevent, arrived at by a
+// different route. So a cell whose record cannot be written stops advancing —
+// visibly, with the error attached — rather than running on with no record of
+// what it did.
 func (e *Engine) persist(c history.CellTx) {
-	if err := e.store.RecordTx(context.Background(), c); err != nil {
-		e.logger.Error("persist cell transaction",
-			"generation", c.Generation, "cell", c.Cell, "err", err)
+	var err error
+	for attempt := 1; attempt <= persistRetries; attempt++ {
+		if err = e.store.RecordTx(context.Background(), c); err == nil {
+			return
+		}
+		e.logger.Warn("persist cell transaction failed; retrying",
+			"generation", c.Generation, "cell", c.Cell, "attempt", attempt, "err", err)
+		time.Sleep(persistBackoff)
 	}
+	e.logger.Error("persist cell transaction; halting the cell",
+		"generation", c.Generation, "cell", c.Cell, "err", err)
+	e.haltCell(c.Cell, fmt.Sprintf(
+		"generation %d could not be recorded (%v), so this cell's position is no longer durable and "+
+			"advancing it would risk re-spending a spent output", c.Generation, err))
+}
+
+// haltCell stops one cell and says why, once.
+func (e *Engine) haltCell(cell int, reason string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if cell < 0 || cell >= len(e.tips) || e.halted[cell] {
+		return
+	}
+	e.halted[cell] = true
+	e.haltReason[cell] = reason
+	e.lastError = fmt.Sprintf("cell %d halted: %s", cell, reason)
+	e.notify()
 }
 
 // instanceOwner is this process's identity in the single-writer election.

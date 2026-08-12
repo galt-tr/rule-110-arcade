@@ -10,15 +10,6 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
-// checkpointInterval is how often tip state is written to disk.
-//
-// Every advance changes a tip, and at 512 transactions a second writing the
-// file each time would put a synchronous megabyte-scale write in the middle of
-// the hot path. The durable record of what was broadcast is the history store,
-// which is written per transaction; this file only exists so a restart does not
-// have to rebuild the tips from it.
-const checkpointInterval = time.Second
-
 // starvationGrace is how long a cell keeps retrying a funding shortfall before
 // the automaton declares itself starved.
 //
@@ -40,22 +31,24 @@ func (e *Engine) Run(ctx context.Context) {
 	go e.trackFunds(ctx)
 	go e.watchStatus(ctx)
 	go e.reconcile(ctx)
-	go e.checkpoint(ctx)
 	go e.clock(ctx)
 	go e.holdLease(ctx)
 
+	cells := e.deployment.Cells
 	done := make(chan struct{})
-	for cell := range e.state.Cells {
+	for cell := range cells {
 		go func(cell int) {
 			defer func() { done <- struct{}{} }()
 			e.runCell(ctx, cell)
 		}(cell)
 	}
-	for range e.state.Cells {
+	for range cells {
 		<-done
 	}
-	// Final checkpoint on the way out, so a clean shutdown never loses a tip.
-	e.saveIfDirty()
+	// Nothing to checkpoint on the way out. Every tip is written to the history
+	// store as part of recording the transaction that created it, before the
+	// worker moves on, so there is no in-memory position left to lose — which
+	// there was when the tips lived in a file written on a one-second timer.
 }
 
 // clock raises the generation every cell is asked to reach.
@@ -107,16 +100,26 @@ func (e *Engine) runCell(ctx context.Context, cell int) {
 func (e *Engine) turnReady(cell int) bool {
 	e.mu.RLock()
 	var (
-		mode    = e.mode
-		target  = e.target
-		tip     = e.state.Chains[cell].Generation
-		mined   = e.lastMined[cell]
-		maxDeep = e.chain.Config.MaxUnconfirmedDepth
+		mode     = e.mode
+		target   = e.target
+		tip      = e.tips[cell].Generation
+		mined    = e.lastMined[cell]
+		maxDeep  = e.chain.Config.MaxUnconfirmedDepth
+		leader   = e.leader
+		rederive = e.needsRederive
 	)
 	e.mu.RUnlock()
 
-	if !e.isLeader() {
+	if !leader {
 		// Another instance owns these chains. See holdLease.
+		return false
+	}
+	if rederive {
+		// We hold the lease but have not yet re-derived the tips under it. If the
+		// lease had genuinely lapsed, another writer may have advanced every cell
+		// while we were not looking, and the tips in memory would be a generation
+		// or more behind — so advancing now would double-spend all 128 at once.
+		// See rederive.
 		return false
 	}
 
@@ -174,9 +177,9 @@ func (e *Engine) awaitTurn(ctx context.Context, cell int) bool {
 // advanceCell moves one cell forward a generation and records the result.
 func (e *Engine) advanceCell(ctx context.Context, cell int) {
 	e.mu.RLock()
-	tip := e.state.Chains[cell]
-	cells, rule := e.state.Cells, e.state.Rule
+	tip := e.tips[cell]
 	e.mu.RUnlock()
+	cells, rule := e.deployment.Cells, e.deployment.Rule
 
 	// Write the intent BEFORE building anything. Signing broadcasts, so there is
 	// a window in which the output is spent on chain and we do not yet know it;
@@ -226,7 +229,7 @@ func (e *Engine) ensureGeneration(ctx context.Context, number uint64, rowHex str
 		e.mu.Unlock()
 		return
 	}
-	gen := Generation{Number: number, RowHex: rowHex, Cells: make([]CellTx, e.state.Cells)}
+	gen := Generation{Number: number, RowHex: rowHex, Cells: make([]CellTx, e.deployment.Cells)}
 	for i := range gen.Cells {
 		gen.Cells[i] = CellTx{Cell: i, State: TxPending}
 	}
@@ -254,7 +257,7 @@ func (e *Engine) ensureGeneration(ctx context.Context, number uint64, rowHex str
 func (e *Engine) frontierLocked() uint64 {
 	frontier := uint64(0)
 	first := true
-	for i, c := range e.state.Chains {
+	for i, c := range e.tips {
 		if e.halted[i] {
 			continue
 		}
@@ -263,7 +266,7 @@ func (e *Engine) frontierLocked() uint64 {
 		}
 	}
 	if first {
-		return e.state.Generation // every cell halted; hold position
+		return e.generation // every cell halted; hold position
 	}
 	return frontier
 }
@@ -271,7 +274,7 @@ func (e *Engine) frontierLocked() uint64 {
 // deepestLocked returns the deepest unconfirmed chain. Callers must hold the lock.
 func (e *Engine) deepestLocked() uint64 {
 	var deepest uint64
-	for i, c := range e.state.Chains {
+	for i, c := range e.tips {
 		if e.halted[i] {
 			continue
 		}
@@ -417,63 +420,30 @@ func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, 
 		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
 	}
 	e.indexTx(res.TxID, generation, cell)
-	e.state.Chains[cell] = chain.CellChain{
+	e.tips[cell] = chain.CellChain{
 		Cell:       cell,
 		TxID:       res.TxID,
 		Vout:       0,
-		Satoshis:   e.state.Chains[cell].Satoshis,
+		Satoshis:   e.tips[cell].Satoshis,
 		Generation: res.Generation,
 		RowHex:     res.RowHex,
 		RawTxHex:   res.RawTxHex,
 	}
-	e.state.Generation = e.frontierLocked()
-	if idx := indexOfGeneration(e.history, e.state.Generation); idx >= 0 {
-		e.state.RowHex = e.history[idx].RowHex
-	}
+	e.generation = e.frontierLocked()
 	e.totalTx++
-	e.dirty = true
 	e.notify()
 	e.mu.Unlock()
 
 	// Persist outside the lock: at 512 transactions a second a synchronous
 	// write inside the critical section would serialise the whole pipeline.
+	//
+	// This row is now the ONLY record of where the cell is — there is no state
+	// file behind it — so persist halts the cell if it cannot be written rather
+	// than logging and carrying on. See Engine.persist.
 	e.persist(history.CellTx{
 		Generation: generation, Cell: cell,
 		TxID: res.TxID, Status: history.StatusBroadcast,
 	})
-}
-
-// checkpoint writes tip state periodically rather than on every advance.
-func (e *Engine) checkpoint(ctx context.Context) {
-	tick := time.NewTicker(checkpointInterval)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-			e.saveIfDirty()
-		}
-	}
-}
-
-// saveIfDirty writes the tip state if anything has moved since the last write.
-func (e *Engine) saveIfDirty() {
-	e.mu.Lock()
-	if !e.dirty {
-		e.mu.Unlock()
-		return
-	}
-	snapshot := e.state.Clone()
-	e.dirty = false
-	e.mu.Unlock()
-
-	if err := e.chain.SaveState(snapshot); err != nil {
-		e.logger.Error("checkpoint tip state", "err", err)
-		e.mu.Lock()
-		e.dirty = true // try again on the next tick
-		e.mu.Unlock()
-	}
 }
 
 // wake nudges every waiter without changing anything.
@@ -483,16 +453,25 @@ func (e *Engine) wake() {
 	e.notify()
 }
 
+// LeaseName is the single-writer election key.
+//
+// Exported because it is not only the engine's. Any tool that spends a cell's
+// UTXO — the depth probe, `recover`, `import-tips` — must take the SAME lease,
+// and a tool that takes a different one runs alongside the engine while both
+// believe they are alone. The resulting rejection is indistinguishable from an
+// ordinary failure, which is the worst possible way to be wrong about this. It
+// was a const here and a duplicated string literal twice in the probe; one
+// definition removes the way to get it wrong.
+const LeaseName = "rule110-engine"
+
 const (
-	// leaseName is the single-writer election key, and leaseTTL how long a lease
-	// survives without renewal.
+	// leaseTTL is how long a lease survives without renewal.
 	//
 	// The TTL is the failover delay: a pod that dies without releasing keeps the
 	// automaton stopped for this long. Short enough that a crash is not an
 	// outage, long enough that a slow renewal does not hand the chains to a
 	// second writer while the first is still using them.
-	leaseName = "rule110-engine"
-	leaseTTL  = 30 * time.Second
+	leaseTTL = 30 * time.Second
 
 	// leaseRenew must be comfortably shorter than leaseTTL so a transient
 	// database hiccup does not cost the lease.
@@ -511,7 +490,7 @@ func (e *Engine) holdLease(ctx context.Context) {
 	defer tick.Stop()
 
 	for {
-		held, err := e.store.AcquireLease(ctx, leaseName, e.owner, leaseTTL)
+		held, err := e.store.AcquireLease(ctx, LeaseName, e.owner, leaseTTL)
 		if err != nil {
 			// Treat an unreachable store as not holding it. Advancing on the
 			// assumption that we still do is the one outcome worth avoiding.
@@ -519,6 +498,12 @@ func (e *Engine) holdLease(ctx context.Context) {
 			e.logger.ErrorContext(ctx, "lease renewal failed", "err", err)
 		}
 		e.setLeader(held)
+		if held {
+			// Runs in this goroutine, not a new one, so a slow derivation simply
+			// delays the next renewal instead of racing itself. Nothing advances
+			// meanwhile: turnReady blocks on needsRederive.
+			e.rederiveIfNeeded(ctx)
+		}
 
 		select {
 		case <-ctx.Done():
@@ -527,7 +512,7 @@ func (e *Engine) holdLease(ctx context.Context) {
 			if e.isLeader() {
 				rel, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				defer cancel()
-				if err := e.store.ReleaseLease(rel, leaseName, e.owner); err != nil {
+				if err := e.store.ReleaseLease(rel, LeaseName, e.owner); err != nil {
 					e.logger.Error("release lease", "err", err)
 				}
 			}
@@ -539,20 +524,78 @@ func (e *Engine) holdLease(ctx context.Context) {
 
 // setLeader records whether this instance may advance cells, logging only the
 // transitions.
+//
+// Gaining the lease sets needsRederive. This instance cannot tell a lease it
+// never really lost — a database hiccup during renewal drops `leader` to false
+// and the next tick puts it back — from one that genuinely expired and was held
+// by somebody else in between. In the second case that somebody advanced all 128
+// chains and every tip in this process's memory is stale, so carrying on from
+// them would double-spend the lot. Re-deriving costs one indexed query per cell
+// and settles the question, so it is done unconditionally rather than guessed at.
 func (e *Engine) setLeader(held bool) {
 	e.mu.Lock()
 	was := e.leader
 	e.leader = held
+	if held && !was {
+		e.needsRederive = true
+	}
 	e.mu.Unlock()
 
 	if was == held {
 		return
 	}
 	if held {
-		e.logger.Info("acquired the writer lease; advancing", "owner", e.owner)
+		e.logger.Info("acquired the writer lease; re-deriving tips before advancing", "owner", e.owner)
 	} else {
 		e.logger.Warn("lost the writer lease; serving read-only", "owner", e.owner)
 	}
+	e.wake()
+}
+
+// rederiveIfNeeded rebuilds the tips from the store while this instance holds
+// the lease, and releases the cells once it succeeds.
+//
+// A failure leaves needsRederive set, which leaves every cell blocked. That is
+// the right way round: the alternative is advancing on tips nobody has
+// confirmed, and a stopped automaton is recoverable where a double spend is not.
+// holdLease calls this on every renewal, so a transient failure clears itself.
+func (e *Engine) rederiveIfNeeded(ctx context.Context) {
+	e.mu.RLock()
+	needed := e.needsRederive
+	e.mu.RUnlock()
+	if !needed {
+		return
+	}
+
+	positions, err := DeriveTips(ctx, e.chain, e.compiled, e.deployment, e.store)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		e.logger.ErrorContext(ctx, "could not re-derive tips; cells stay stopped", "err", err)
+		e.mu.Lock()
+		e.lastError = "tips could not be re-derived, so no cell may advance: " + err.Error()
+		e.notify()
+		e.mu.Unlock()
+		return
+	}
+	if err := CheckMigrationFloor(positions, e.deployment.LegacyTips()); err != nil {
+		e.logger.ErrorContext(ctx, "refusing to advance", "err", err)
+		e.mu.Lock()
+		e.lastError = err.Error()
+		e.notify()
+		e.mu.Unlock()
+		return
+	}
+
+	if e.opts.AutoRecover {
+		positions = e.recoverUnknown(ctx, positions)
+	}
+	e.applyPositions(positions)
+
+	e.mu.Lock()
+	e.needsRederive = false
+	e.mu.Unlock()
 	e.wake()
 }
 

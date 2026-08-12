@@ -34,6 +34,12 @@ type Chain struct {
 	// IdentityKey is the wallet's identity public key, as the wallet reports it.
 	IdentityKey string
 
+	// provider is the wallet's storage, kept rather than discarded because it is
+	// the only supported way to get a transaction's bytes back from a txid. See
+	// Chain.RawTx: every cell tip is now a txid plus a position, and the bytes
+	// behind that txid have to come from somewhere that cannot go stale.
+	provider *storage.Provider
+
 	logger  *slog.Logger
 	closers []func(context.Context) error
 }
@@ -173,6 +179,7 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		Identity: id,
 		Oracle:   oracle,
 		Headers:  hdrs,
+		provider: provider,
 		logger:   logger,
 		closers:  []func(context.Context) error{closeProvider},
 	}

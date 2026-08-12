@@ -22,14 +22,32 @@ import (
 // Note these are NOT wallet-spendable in the usual sense: only change outputs
 // are minted into the utxostore, so ListOutputs reports them Spendable=false by
 // design. We spend them by naming their outpoints explicitly, which is why the
-// state file below tracks them itself.
+// outpoint has to come from somewhere else — the history store records which
+// transaction each cell is on, and DeriveTip reconstructs the rest from the
+// transaction itself.
 const CellBasket = "rule110cells"
 
-// stateFile records the automaton's position on chain between runs.
+// stateFile records the deployment's immutable facts. The name is unchanged
+// from when it also held the automaton's position, so an existing deployment
+// keeps running.
 const stateFile = "state.json"
 
-// State is the durable record of where each cell chain has got to.
-type State struct {
+// Deployment is what genesis fixed and nothing may change afterwards.
+//
+// It used to be called State and it used to carry the per-cell tips as well.
+// That was the bug the whole tip rework exists to remove: a tip is MUTABLE
+// (it moves every generation, 128 times per row) while everything here is
+// immutable (it is compiled into the locking scripts and cannot change without
+// a new genesis), and keeping both in one file meant a durable record that had
+// to be rewritten on the hot path, was written on a one-second timer, and could
+// therefore disagree with the history store about where a cell actually was.
+// It did disagree: the live file held one cell at generation 1279 while the rest
+// sat at 806-837, and nothing in the program cross-checked it against anything.
+//
+// Written once, at genesis, and read-only from then on. Where each cell has got
+// to now lives in exactly one place — the history store — and the bytes behind
+// each tip are fetched by txid, which cannot go stale. See DeriveTip.
+type Deployment struct {
 	// Cells is the ring size and Rule the automaton rule, both fixed at genesis
 	// because they are compiled into every cell's locking script.
 	Cells int     `json:"cells"`
@@ -38,24 +56,54 @@ type State struct {
 	// GenesisTxID is the transaction that created generation 0.
 	GenesisTxID string `json:"genesisTxid"`
 
-	// Generation is the generation number Row describes.
-	Generation uint64 `json:"generation"`
-
-	// RowHex is the current row, hex-encoded.
-	RowHex string `json:"row"`
-
 	// SeedHex is generation 0's row. The automaton is deterministic, so the
 	// seed plus the rule reproduces every row that has ever existed — which is
 	// what lets the diagram be rebuilt after a restart instead of starting
-	// blank at whatever generation the chain had reached.
+	// blank at whatever generation the chain had reached, and what lets a tip's
+	// row be RECOMPUTED rather than recorded.
 	SeedHex string `json:"seed"`
 
-	// Chains is the per-cell tip, indexed by cell.
-	Chains []CellChain `json:"chains"`
+	// CellSatoshis is what each cell UTXO was created carrying. Informational:
+	// derivation takes a tip's value from the output itself, because the output
+	// is the authority and this is only a note about what was intended. A file
+	// written before this field existed simply has 0 here.
+	CellSatoshis uint64 `json:"cellSatoshis,omitempty"`
+
+	// legacyTips is the `chains[]` array of a deployment written before tips
+	// were derived. It is NOT authoritative and is never written back — it
+	// exists so startup can refuse to run when the history store is behind it
+	// (which would silently re-spend live outputs), and so `import-tips` can
+	// backfill the store from it after verifying every entry. See LegacyTips.
+	legacyTips []CellChain
 }
 
-// CellChain is one cell's position: the UTXO to spend next, and the BEEF that
-// proves where it came from.
+// legacyState is the on-disk shape, including the fields Deployment no longer
+// owns. Parsed, never written.
+type legacyState struct {
+	Deployment
+	Generation uint64      `json:"generation"`
+	RowHex     string      `json:"row"`
+	Chains     []CellChain `json:"chains"`
+}
+
+// LegacyTips returns the per-cell tips recorded by an older build, or nil.
+//
+// The caller must treat these as a claim to be checked, never as a source of
+// truth: they are the record that was allowed to drift, and acting on one
+// without verifying its bytes and its script is exactly the mistake that
+// re-spends a spent output.
+func (d *Deployment) LegacyTips() []CellChain { return d.legacyTips }
+
+// Seed returns generation 0's row.
+func (d *Deployment) Seed() (ca.Row, error) { return ca.SeedHex(d.Cells, d.SeedHex) }
+
+// CellChain is one cell's position: the UTXO to spend next, plus the bytes of
+// the transaction that created it.
+//
+// Not durable, and no longer serialized anywhere the program reads back. It is
+// DERIVED — see DeriveTip — from a txid and a generation held in the history
+// store. The JSON tags survive only so a legacy state.json's `chains[]` can
+// still be parsed for the migration floor check and by `import-tips`.
 type CellChain struct {
 	Cell       int    `json:"cell"`
 	TxID       string `json:"txid"`
@@ -63,11 +111,15 @@ type CellChain struct {
 	Satoshis   uint64 `json:"satoshis"`
 	Generation uint64 `json:"generation"`
 
-	// RowHex is the row THIS cell's UTXO carries. Cells can sit at different
-	// generations, so the global State.RowHex is not a safe substitute: the
+	// RowHex is the row THIS cell's UTXO carries. Cells sit at different
+	// generations, so a single automaton-wide row is not a safe substitute: the
 	// locking script and the sighash preimage are both derived from the row the
 	// UTXO actually holds, and using the wrong one fails with a bare
 	// OP_CHECKSIGVERIFY that gives no hint why.
+	//
+	// Recomputed from the seed at the cell's own generation, then CHECKED against
+	// the locking script the transaction really carries. It is not taken on trust
+	// from anywhere.
 	RowHex string `json:"row"`
 
 	// RawTxHex is the transaction that created this UTXO, and ONLY that
@@ -87,8 +139,8 @@ type CellChain struct {
 
 	// LegacyBEEFHex reads the field RawTxHex replaced, so an automaton written
 	// by an older build keeps running instead of needing a fresh genesis.
-	// LoadState converts it and drops it. Transitional: delete this along with
-	// the state file itself.
+	// LoadDeployment converts it and drops it. Transitional: it can go once no
+	// deployment needs `import-tips` any more.
 	LegacyBEEFHex string `json:"beef,omitempty"`
 }
 
@@ -114,27 +166,28 @@ func (c CellChain) tipBEEF() ([]byte, error) {
 	return out, nil
 }
 
-// Row returns the state's current row.
-func (s *State) Row() (ca.Row, error) { return ca.SeedHex(s.Cells, s.RowHex) }
-
-// Clone returns a deep copy, so the caller can write it to disk without
-// holding a lock over the encode.
-func (s *State) Clone() *State {
-	out := *s
-	out.Chains = make([]CellChain, len(s.Chains))
-	copy(out.Chains, s.Chains)
-	return &out
-}
-
 // Genesis creates generation 0: one output per cell, all carrying the same row.
 //
 // Every cell is created in a SINGLE transaction, which is what establishes the
 // invariant the whole design rests on — all N chains start from an identical
 // row, so any later divergence is visible.
-func (c *Chain) Genesis(ctx context.Context, compiled *cellscript.Compiled, seed ca.Row) (*State, error) {
+func (c *Chain) Genesis(ctx context.Context, compiled *cellscript.Compiled, seed ca.Row) (*Deployment, error) {
 	n := compiled.Cells()
 	if seed.Cells() != n {
 		return nil, fmt.Errorf("chain: seed has %d cells, contract expects %d", seed.Cells(), n)
+	}
+
+	// Refuse before spending anything. A second genesis would mint 128 new cells
+	// and overwrite the record of the 128 that already exist, orphaning every
+	// live UTXO the deployment owns with no way back to them — the file is the
+	// only record of the genesis txid the old cells descend from.
+	path := filepath.Join(c.Config.DataDir, stateFile)
+	if _, err := os.Stat(path); err == nil {
+		return nil, fmt.Errorf(
+			"chain: %s already exists, so this deployment has already had a genesis; "+
+				"move it aside deliberately if you really mean to abandon the existing cells", path)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("chain: check %s: %w", path, err)
 	}
 
 	outputs := make([]sdk.CreateActionOutput, 0, n)
@@ -196,36 +249,22 @@ func (c *Chain) Genesis(ctx context.Context, compiled *cellscript.Compiled, seed
 		return nil, err
 	}
 
-	genesisTx, err := transaction.NewTransactionFromBEEF(res.Tx)
-	if err != nil {
-		return nil, fmt.Errorf("chain: re-parse genesis transaction: %w", err)
+	// The per-cell tips are deliberately NOT recorded here. Cell c's tip at
+	// generation 0 is this transaction's output c, which is derivable from the
+	// three facts below plus the transaction's own bytes — so recording it would
+	// create a second copy of something that can be recomputed, and a second copy
+	// is a thing that can disagree. See DeriveTip.
+	d := &Deployment{
+		Cells:        n,
+		Rule:         compiled.Rule(),
+		GenesisTxID:  txid,
+		SeedHex:      seed.Hex(),
+		CellSatoshis: c.Config.CellSatoshis,
 	}
-	rawHex := hex.EncodeToString(genesisTx.Bytes())
-
-	state := &State{
-		Cells:       n,
-		Rule:        compiled.Rule(),
-		GenesisTxID: txid,
-		Generation:  0,
-		RowHex:      seed.Hex(),
-		SeedHex:     seed.Hex(),
-		Chains:      make([]CellChain, n),
-	}
-	for cell := range n {
-		state.Chains[cell] = CellChain{
-			Cell:       cell,
-			TxID:       txid,
-			Vout:       uint32(cell),
-			Satoshis:   c.Config.CellSatoshis,
-			Generation: 0,
-			RowHex:     seed.Hex(),
-			RawTxHex:   rawHex,
-		}
-	}
-	if err := c.SaveState(state); err != nil {
+	if err := c.saveDeployment(d); err != nil {
 		return nil, err
 	}
-	return state, nil
+	return d, nil
 }
 
 // verifyGenesisLayout re-parses the signed transaction and checks each cell's
@@ -257,11 +296,17 @@ func verifyGenesisLayout(atomicBEEF []byte, compiled *cellscript.Compiled, seed 
 	return nil
 }
 
-// SaveState writes the automaton's position, atomically.
-func (c *Chain) SaveState(s *State) error {
-	data, err := json.MarshalIndent(s, "", "  ")
+// saveDeployment writes the deployment's facts, atomically and exactly once.
+//
+// Unexported, and there is no exported counterpart: nothing outside genesis has
+// any business rewriting this file. Making that a compile-time fact rather than
+// a convention is the point — the previous version's SaveState was called from
+// the engine's checkpointer, from `step`, and from the depth probe, three
+// writers to a file that was also the only record of where 128 live UTXOs were.
+func (c *Chain) saveDeployment(d *Deployment) error {
+	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {
-		return fmt.Errorf("chain: encode state: %w", err)
+		return fmt.Errorf("chain: encode deployment: %w", err)
 	}
 	path := filepath.Join(c.Config.DataDir, stateFile)
 	tmp := path + ".tmp"
@@ -274,37 +319,41 @@ func (c *Chain) SaveState(s *State) error {
 	return nil
 }
 
-// LoadState reads the automaton's position.
-func (c *Chain) LoadState() (*State, error) {
+// LoadDeployment reads the facts genesis fixed.
+//
+// A file written by an older build also carries `chains[]`. Those tips are
+// parsed into legacyTips and go no further: they are a claim about where the
+// cells were when the file was last written, on a one-second timer, by a process
+// that may have been killed at any point after. Startup uses them for one
+// purpose only — refusing to run when derivation lands BELOW them, which would
+// mean the history store is behind and the automaton is about to re-spend
+// outputs that are already gone.
+func (c *Chain) LoadDeployment() (*Deployment, error) {
 	path := filepath.Join(c.Config.DataDir, stateFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("chain: read %s: %w", path, err)
 	}
-	var s State
+	var s legacyState
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("chain: parse %s: %w", path, err)
 	}
-	// Backfill per-cell rows for state written before CellChain carried one.
-	// Only cells still at the global generation can be assumed to hold the
-	// global row; a cell that ran ahead has an unknown row and must be
-	// reported rather than guessed at.
-	for i := range s.Chains {
-		if s.Chains[i].RowHex != "" {
-			continue
-		}
-		if s.Chains[i].Generation != s.Generation {
+	d := s.Deployment
+	if d.SeedHex == "" {
+		// Predates the seed field: the only file shape where the global row is
+		// the seed is one that never advanced past generation 0.
+		if s.Generation != 0 || s.RowHex == "" {
 			return nil, fmt.Errorf(
-				"chain: cell %d is at generation %d but the automaton is at %d, and the "+
-					"state file predates per-cell rows so its row cannot be recovered; "+
-					"re-run genesis", i, s.Chains[i].Generation, s.Generation)
+				"chain: %s records no seed and the automaton is at generation %d, so the row sequence "+
+					"cannot be reproduced; this deployment cannot be resumed", path, s.Generation)
 		}
-		s.Chains[i].RowHex = s.RowHex
+		d.SeedHex = s.RowHex
 	}
-	if err := s.migrateLegacyBEEF(); err != nil {
+	d.legacyTips = s.Chains
+	if err := migrateLegacyBEEF(d.legacyTips); err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return &d, nil
 }
 
 // migrateLegacyBEEF converts tips still carrying a whole atomic BEEF into the
@@ -314,9 +363,13 @@ func (c *Chain) LoadState() (*State, error) {
 // lossless projection — it just discards the ancestry that should never have
 // been kept. On a 128-cell automaton at generation 63 it turns a 175 MB state
 // file into roughly 512 KB.
-func (s *State) migrateLegacyBEEF() error {
-	for i := range s.Chains {
-		c := &s.Chains[i]
+//
+// It survives the move to derived tips because `import-tips` still has to read
+// these bytes to backfill the store, and a deployment old enough to need the
+// import is exactly the kind old enough to be carrying BEEFs.
+func migrateLegacyBEEF(tips []CellChain) error {
+	for i := range tips {
+		c := &tips[i]
 		if c.RawTxHex != "" || c.LegacyBEEFHex == "" {
 			c.LegacyBEEFHex = ""
 			continue

@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -57,6 +58,10 @@ func run(args []string) error {
 		return cmdRun(args[1:])
 	case "fuel":
 		return cmdFuel(args[1:])
+	case "recover":
+		return cmdRecover(args[1:])
+	case "import-tips":
+		return cmdImportTips(args[1:])
 	case "depth-probe":
 		return cmdDepthProbe(args[1:])
 	case "help", "-h", "--help":
@@ -77,6 +82,8 @@ func usage() {
   rule110 step [flags]      advance one cell by one generation
   rule110 run [flags]       start the automaton and its web UI
   rule110 fuel [flags]      mint coins so a whole generation can fan out
+  rule110 recover [flags]   resolve cells whose tip is unknown (dry run unless -apply)
+  rule110 import-tips       backfill the history store from a legacy state.json (dry run unless -apply)
   rule110 depth-probe       measure how deep an unconfirmed chain this network accepts
   rule110 help              show this message
 
@@ -269,7 +276,7 @@ func cmdGenesis(args []string) error {
 	fmt.Printf("balance before: %d sat\n", balance)
 	fmt.Printf("creating %d cells, rule %d, seed %s\n", cfg.Cells, cfg.Rule, seed.Hex())
 
-	state, err := c.Genesis(ctx, compiled, seed)
+	d, err := c.Genesis(ctx, compiled, seed)
 	if err != nil {
 		return err
 	}
@@ -280,10 +287,10 @@ func cmdGenesis(args []string) error {
 	}
 
 	fmt.Println()
-	fmt.Printf("GENESIS TXID: %s\n", state.GenesisTxID)
+	fmt.Printf("GENESIS TXID: %s\n", d.GenesisTxID)
 	fmt.Println()
-	fmt.Printf("cells:          %d (vout 0..%d)\n", state.Cells, state.Cells-1)
-	fmt.Printf("row:            %s\n", state.RowHex)
+	fmt.Printf("cells:          %d (vout 0..%d)\n", d.Cells, d.Cells-1)
+	fmt.Printf("seed:           %s\n", d.SeedHex)
 	fmt.Printf("balance after:  %d sat (spent %d)\n", after, balance-after)
 	return nil
 }
@@ -305,45 +312,71 @@ func cmdStep(args []string) error {
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	c, err := chain.Open(ctx, cfg, logger)
+	// Takes the writer lease: this spends a real cell UTXO, so it must not run
+	// beside the engine.
+	d, err := openDeployment(ctx, cfg, "step", logger)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close(ctx) }()
+	defer d.release()
 
-	state, err := c.LoadState()
+	positions, err := engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store)
 	if err != nil {
 		return err
 	}
-	compiled, err := cellscript.Compile(state.Cells, state.Rule)
-	if err != nil {
+	if err := engine.CheckMigrationFloor(positions, d.facts.LegacyTips()); err != nil {
 		return err
 	}
+	if *cell < 0 || *cell >= d.facts.Cells {
+		return fmt.Errorf("cell %d is outside the ring of %d", *cell, d.facts.Cells)
+	}
+	if p := positions[*cell]; p.Halted {
+		return fmt.Errorf("cell %d is halted and must not be advanced: %s", *cell, p.HaltReason)
+	}
+
 	// Report from THIS cell's tip, not the global row: cells can sit at
 	// different generations and the global row would describe the wrong one.
-	tip := state.Chains[*cell]
-	row, err := tip.Row(state.Cells)
+	tip := positions[*cell].Tip
+	row, err := tip.Row(d.facts.Cells)
 	if err != nil {
 		return err
 	}
-	next := state.Rule.Step(row)
+	next := d.facts.Rule.Step(row)
 
 	fmt.Printf("cell %d, generation %d -> %d\n", *cell, tip.Generation, tip.Generation+1)
 	fmt.Printf("row  %s -> %s\n", row.Hex(), next.Hex())
 	fmt.Printf("bit  %v -> %v\n", row.Get(*cell), next.Get(*cell))
 
-	res, err := c.AdvanceCell(ctx, compiled, tip, state.Cells, state.Rule)
-	if err != nil {
+	// The write-ahead record, for the same reason the engine writes one: signing
+	// broadcasts, so a process killed after this point has spent the output and
+	// does not know it. Without the record the next start would resume from a
+	// tip that is already spent. See history.StatusAttempting.
+	if err := d.store.RecordTx(ctx, history.CellTx{
+		Generation: tip.Generation + 1, Cell: *cell, Status: history.StatusAttempting,
+	}); err != nil {
 		return err
 	}
 
-	// Record this cell's new tip. The row advances only once every cell has.
-	state.Chains[*cell] = chain.CellChain{
-		Cell: *cell, TxID: res.TxID, Vout: 0,
-		Satoshis: state.Chains[*cell].Satoshis, Generation: res.Generation,
-		RowHex: res.RowHex, RawTxHex: res.RawTxHex,
+	res, err := d.chain.AdvanceCell(ctx, d.compiled, tip, d.facts.Cells, d.facts.Rule)
+	if err != nil {
+		if errors.Is(err, chain.ErrNotBroadcast) {
+			// Certainly unspent, so the record is a false alarm and must go.
+			if derr := d.store.DeleteAttempt(ctx, tip.Generation+1, *cell); derr != nil {
+				logger.Error("retract write-ahead record", "err", derr)
+			}
+		}
+		return err
 	}
-	if err := c.SaveState(state); err != nil {
+
+	// The store is the only record of where this cell now is; there is no state
+	// file behind it.
+	if err := d.store.RecordGeneration(ctx, res.Generation, res.RowHex); err != nil {
+		return err
+	}
+	if err := d.store.RecordTx(ctx, history.CellTx{
+		Generation: res.Generation, Cell: *cell,
+		TxID: res.TxID, Status: history.StatusBroadcast,
+	}); err != nil {
 		return err
 	}
 
@@ -360,6 +393,8 @@ func cmdRun(args []string) error {
 	addr := fs.String("addr", envOr("RULE110_ADDR", ":8110"), "web UI listen address")
 	rate := fs.Float64("rate", 1, "generations per second when running")
 	start := fs.Bool("start", false, "begin advancing immediately instead of waiting for the UI")
+	autoRecover := fs.Bool("auto-recover", false,
+		"resolve cells whose tip is unknown automatically; off by default — run \"rule110 recover\" first")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -380,11 +415,11 @@ func cmdRun(args []string) error {
 	}
 	defer func() { _ = c.Close(context.Background()) }()
 
-	state, err := c.LoadState()
+	d, err := c.LoadDeployment()
 	if err != nil {
 		return fmt.Errorf("%w\n(run \"rule110 genesis\" first to create generation 0)", err)
 	}
-	compiled, err := cellscript.Compile(state.Cells, state.Rule)
+	compiled, err := cellscript.Compile(d.Cells, d.Rule)
 	if err != nil {
 		return err
 	}
@@ -395,7 +430,7 @@ func cmdRun(args []string) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	eng, err := engine.New(ctx, c, compiled, state, store, logger)
+	eng, err := engine.New(ctx, c, compiled, d, store, engine.Options{AutoRecover: *autoRecover}, logger)
 	if err != nil {
 		return err
 	}
@@ -434,9 +469,9 @@ func cmdRun(args []string) error {
 		}
 	}()
 
-	fmt.Printf("rule 110 · %d cells · generation %d\n", state.Cells, state.Generation)
+	fmt.Printf("rule 110 · %d cells · generation %d\n", d.Cells, eng.Snapshot().Generation)
 	fmt.Printf("arcade:  %s\n", cfg.ArcadeURL)
-	fmt.Printf("genesis: %s\n", state.GenesisTxID)
+	fmt.Printf("genesis: %s\n", d.GenesisTxID)
 	if basket, denom, target, on := cfg.FuelPool(); on {
 		fmt.Printf("fuel:    %d x %d sat in %q, kept topped up\n", target, denom, basket)
 	}

@@ -12,8 +12,8 @@ import (
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
 
-	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
+	"github.com/dymurray/rule-110-arcade/internal/engine"
 	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
@@ -54,53 +54,41 @@ func cmdDepthProbe(args []string) error {
 	defer stop()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	c, err := chain.Open(ctx, cfg, logger)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = c.Close(ctx) }()
 
-	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir)
+	// Refuse to run against a live engine, and keep refusing. Two writers would
+	// double-spend this cell, and the resulting rejection would look exactly like
+	// the limit we are trying to measure — the worst possible way to be wrong.
+	//
+	// openDeployment takes engine.LeaseName, the same key the engine takes; a
+	// probe that took a different one would exclude nothing. holdToolLease then
+	// renews it, because a probe of 600 transactions runs far longer than any
+	// single lease and a lease that quietly expires mid-run gives back the
+	// exclusivity this whole paragraph is about.
+	d, err := openDeployment(ctx, cfg, "depth-probe", logger)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = store.Close() }()
+	defer d.release()
+	go d.holdToolLease(ctx, logger)
 
-	// Refuse to run against a live engine. Two writers would double-spend this
-	// cell, and the resulting rejection would look exactly like the limit we are
-	// trying to measure — the worst possible way to be wrong.
-	owner := fmt.Sprintf("depth-probe-%d", os.Getpid())
-	held, err := store.AcquireLease(ctx, "rule110-engine", owner, 10*time.Minute)
+	c, store, compiled := d.chain, d.store, d.compiled
+	positions, err := engine.DeriveTips(ctx, c, compiled, d.facts, store)
 	if err != nil {
 		return err
 	}
-	if !held {
-		return fmt.Errorf("the engine holds the writer lease; stop it before probing")
-	}
-	defer func() { _ = store.ReleaseLease(context.WithoutCancel(ctx), "rule110-engine", owner) }()
-
-	state, err := c.LoadState()
-	if err != nil {
+	if err := engine.CheckMigrationFloor(positions, d.facts.LegacyTips()); err != nil {
 		return err
 	}
-	compiled, err := cellscript.Compile(state.Cells, state.Rule)
-	if err != nil {
-		return err
+	if *cell < 0 || *cell >= d.facts.Cells {
+		return fmt.Errorf("cell %d is outside the ring of %d", *cell, d.facts.Cells)
+	}
+	if p := positions[*cell]; p.Halted {
+		return fmt.Errorf("cell %d is halted, so probing it would measure nothing: %s", *cell, p.HaltReason)
 	}
 
-	tip := state.Chains[*cell]
+	tip := positions[*cell].Tip
 	fmt.Printf("probing cell %d from generation %d, up to %d deep\n\n",
 		*cell, tip.Generation, *maxDepth)
-
-	// Persisting each tip as we go is not optional: abandoning a broadcast
-	// transition without recording it is precisely the crash that costs a cell.
-	save := func() {
-		state.Chains[*cell] = tip
-		if err := c.SaveState(state); err != nil {
-			logger.Error("save state", "err", err)
-		}
-	}
-	defer save()
 
 	var built []string
 	start := time.Now()
@@ -109,13 +97,17 @@ func cmdDepthProbe(args []string) error {
 		if ctx.Err() != nil {
 			break
 		}
+		// Recording each step as we go is not optional: abandoning a broadcast
+		// transition without recording it is precisely the crash that costs a
+		// cell. The store is now the only record — there is no state file behind
+		// it — so an unrecorded step is an unrecoverable one.
 		if err := store.RecordTx(ctx, history.CellTx{
 			Generation: tip.Generation + 1, Cell: *cell, Status: history.StatusAttempting,
 		}); err != nil {
 			return err
 		}
 
-		res, err := c.AdvanceCell(ctx, compiled, tip, state.Cells, state.Rule)
+		res, err := c.AdvanceCell(ctx, compiled, tip, d.facts.Cells, d.facts.Rule)
 		if err != nil {
 			fmt.Printf("\nstopped at depth %d: %v\n", depth, err)
 			break
@@ -125,6 +117,9 @@ func cmdDepthProbe(args []string) error {
 			Generation: res.Generation, RowHex: res.RowHex, RawTxHex: res.RawTxHex,
 		}
 		built = append(built, res.TxID)
+		if err := store.RecordGeneration(ctx, res.Generation, res.RowHex); err != nil {
+			return err
+		}
 		if err := store.RecordTx(ctx, history.CellTx{
 			Generation: res.Generation, Cell: *cell,
 			TxID: res.TxID, Status: history.StatusBroadcast,
@@ -132,10 +127,7 @@ func cmdDepthProbe(args []string) error {
 			return err
 		}
 
-		// Checkpoint periodically rather than every step: an interrupt must not
-		// leave the cell's tip further ahead than the file says.
 		if depth%25 == 0 {
-			save()
 			unconfirmed, rejectedAt, reason := probeStatuses(ctx, c.Oracle, built)
 			fmt.Printf("depth %4d  unconfirmed %4d  %.1f tx/s\n",
 				depth, unconfirmed, float64(depth)/time.Since(start).Seconds())
@@ -147,7 +139,6 @@ func cmdDepthProbe(args []string) error {
 		}
 	}
 
-	save()
 	// Give the last broadcasts a moment to be judged before the verdict.
 	fmt.Print("\nsettling")
 	for range 6 {
