@@ -157,12 +157,14 @@ func cmdRecover(args []string) error {
 		return err
 	}
 
-	_, decisions, err := engine.Recover(ctx, d.chain, d.compiled, d.facts, d.store, positions, *apply)
+	_, decisions, err := engine.Recover(ctx, d.chain, d.chain.Oracle, d.compiled, d.facts, d.store,
+		positions, *apply)
 	if err != nil {
 		return err
 	}
 	if len(decisions) == 0 {
-		fmt.Println("no cell has an unresolved transition; nothing to recover")
+		fmt.Println("no cell has an unresolved transition or a tip spent out from under it; " +
+			"nothing to recover")
 		return nil
 	}
 

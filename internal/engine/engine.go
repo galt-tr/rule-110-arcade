@@ -155,8 +155,9 @@ const TailGenerations = 48
 // Options are the choices a deployment makes about how the engine behaves that
 // are not properties of the chain.
 type Options struct {
-	// AutoRecover lets the engine resolve a cell whose tip is unknown by itself,
-	// on every acquisition of the writer lease.
+	// AutoRecover lets the engine resolve a cell whose tip is unknown — or whose
+	// tip a lost transition of ours already spent — by itself, on every
+	// acquisition of the writer lease.
 	//
 	// It defaults OFF, and that is a considered position rather than caution for
 	// its own sake. The asymmetry decides it: what recovery prevents is a halted

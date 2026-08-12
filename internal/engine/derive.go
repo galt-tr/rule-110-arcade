@@ -43,6 +43,23 @@ type CellPosition struct {
 	// decides, and recovery is the only thing allowed to clear it.
 	Attempted uint64
 	Unknown   bool
+
+	// Rejected is set when the generation DIRECTLY above the tip was refused by
+	// the network, and RejectionErr is arcade's own words for why.
+	//
+	// "Directly above" is the whole of the condition. A rejection one generation
+	// past the tip is a single refused transition with a reason attached, and its
+	// reason may name the transaction that really holds that generation — see
+	// chain.RecoverSpentTip. A rejection further up is a CASCADE: the cell built
+	// on a phantom output and every later attempt was refused in turn, so the
+	// newest reason describes the wreckage rather than the original event, and
+	// nothing in it points at a recoverable tip.
+	//
+	// The raw recorded message is carried rather than HaltReason's prose because
+	// recovery parses it. HaltReason is written for a human and is free to be
+	// reworded; this is not.
+	Rejected     bool
+	RejectionErr string
 }
 
 // DeriveTips rebuilds every cell's position from the history store and the
@@ -165,6 +182,7 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 					"this cell's chain ends at generation %d, buried under rejections up to "+
 						"generation %d: %s",
 					base.Generation, deep.Failed.Generation, orUnknown(deep.Failed.Err))
+				noteRejection(&out[cell], base.Generation, deep.Failed)
 			}
 			continue
 		}
@@ -182,6 +200,7 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 				out[cell].HaltReason = fmt.Sprintf(
 					"generation %d was rejected, so this cell's chain ends at generation %d: %s",
 					r.Generation, base.Generation, orUnknown(r.Err))
+				noteRejection(&out[cell], base.Generation, r)
 			case history.StatusAttempting:
 				out[cell].Unknown = true
 				out[cell].Halted = true
@@ -232,6 +251,23 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 		out[cell].Tip = tip
 	}
 	return out, nil
+}
+
+// noteRejection records a rejection that sits DIRECTLY on the cell's tip, and
+// only such a rejection.
+//
+// Both derivation paths call it with their own idea of "the failure above the
+// tip" — the shallow window walks every record above the tip, the deep dig
+// returns only the newest — and the generation test is what makes the two mean
+// the same thing. Without it the deep path would hand a cascade's 170th
+// rejection to recovery as if it described the break, and recovery would parse
+// a message about an output that never existed.
+func noteRejection(p *CellPosition, tip uint64, r history.Tip) {
+	if r.Generation != tip+1 {
+		return
+	}
+	p.Rejected = true
+	p.RejectionErr = r.Err
 }
 
 // newestSettled returns the newest record that names a transaction the network

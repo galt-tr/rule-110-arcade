@@ -618,6 +618,39 @@ func (s *Store) RejectedTxIDs(ctx context.Context, txids []string) (map[string]b
 	return out, nil
 }
 
+// HasTxID reports whether a transaction id appears anywhere in this
+// deployment's own record of cell transactions, at any generation, for any
+// cell, in any status.
+//
+// It answers one question for UTXO_SPENT recovery: arcade has told us that some
+// transaction already spent a cell's tip, and before that transaction can be
+// adopted as the cell's real position we have to know it is not one we already
+// hold. A txid we DO hold is not a lost transition — it is our own bookkeeping
+// disagreeing with itself, which is a situation to be looked at rather than
+// resolved by moving a live tip. See chain.RecoverSpentTip, condition 2.
+//
+// Deliberately status-blind, unlike RejectedTxIDs. "Do we know this
+// transaction at all" is the question; narrowing it to a status would let a
+// txid we recorded as failed pass as unknown, which is exactly the confusion
+// worth halting on.
+//
+// One point lookup against cell_txs_txid.
+func (s *Store) HasTxID(ctx context.Context, txid string) (bool, error) {
+	if txid == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT 1 FROM cell_txs WHERE txid = ? LIMIT 1`), txid).
+		Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("history: look up txid %s: %w", txid, err)
+	}
+	return true, nil
+}
+
 // AcquireLease takes or renews a named lease, returning whether it is held.
 //
 // This is what makes the automaton safe to deploy as anything but a single
