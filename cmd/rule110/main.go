@@ -64,6 +64,8 @@ func run(args []string) error {
 		return cmdImportTips(args[1:])
 	case "depth-probe":
 		return cmdDepthProbe(args[1:])
+	case "prune":
+		return cmdPrune(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -85,6 +87,7 @@ func usage() {
   rule110 recover [flags]   resolve cells whose tip is unknown (dry run unless -apply)
   rule110 import-tips       backfill the history store from a legacy state.json (dry run unless -apply)
   rule110 depth-probe       measure how deep an unconfirmed chain this network accepts
+  rule110 prune [flags]     reclaim wallet payload that can no longer be spent (dry run by default)
   rule110 help              show this message
 
 Common flags:
