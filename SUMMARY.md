@@ -126,6 +126,19 @@ What changed:
   sleep 100 ms, taxing every update to coalesce the few that needed it. The floor
   is now applied between publishes, not before one, and the handler subscribes
   before it reads — closing a race that left a stale final frame after pause.
+- **The diagram is painted incrementally.** The browser used to clear the canvas
+  and repaint every generation on every message. The canvas is now a durable
+  surface: rows are painted once, scrolled with the bitmap when the window
+  slides, and repainted only when their generation's pixels actually change.
+  Measured in a real browser with 2,072 rows on screen: **0** `fillRect` calls
+  for ten unchanged pushes, **65** for a push that changes one cell, against
+  ~134,000 per push before.
+
+  This also removes a slow fuse. The client kept every generation it was ever
+  sent while the server capped at 2048; canvas height is generations × cellPx,
+  browsers refuse a dimension over ~32767px, and past that the diagram did not
+  degrade — it went blank. The client now holds the same bound as the server and
+  caps what it renders, so maximum zoom shows fewer rows instead of none.
 
 Measured on the live deployment, one generation stepped from paused: 128 cells
 broadcast, first status through the observer ~1.9 s later, all 128 proved within
