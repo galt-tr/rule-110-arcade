@@ -10,7 +10,6 @@ package ca
 import (
 	"encoding/hex"
 	"fmt"
-	"math/rand/v2"
 	"strings"
 )
 
@@ -137,21 +136,6 @@ func SeedSingle(n int) (Row, error) {
 		return nil, err
 	}
 	row.Set(0, true)
-	return row, nil
-}
-
-// SeedRandom returns a row of n cells with each cell alive with probability
-// 1/2, drawn from rng.
-func SeedRandom(n int, rng *rand.Rand) (Row, error) {
-	row, err := NewRow(n)
-	if err != nil {
-		return nil, err
-	}
-	for i := range n {
-		if rng.IntN(2) == 1 {
-			row.Set(i, true)
-		}
-	}
 	return row, nil
 }
 

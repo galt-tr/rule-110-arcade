@@ -32,7 +32,6 @@ type StepResult struct {
 	// spend it. Deliberately not the atomic BEEF — see CellChain.RawTxHex.
 	RawTxHex  string
 	SizeBytes int
-	FeePaid   uint64
 }
 
 // AdvanceCell moves one cell forward a generation.
