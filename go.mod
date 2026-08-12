@@ -10,13 +10,17 @@ go 1.26.3
 // The arcade toolbox declares its module path as
 // github.com/bsv-blockchain/go-arcade-toolbox, but that repository is not
 // public. The work this application depends on — WithRequiredChangeOutput,
-// WithGenesisActivationHeight, WithMinBroadcastFeeRate, WithChronicleOpcodes —
-// lives on the fork, unreleased, so there is no tag to pin to instead. The
+// WithGenesisActivationHeight, WithMinBroadcastFeeRate, WithChronicleOpcodes,
+// and WithStatusObserver, which is how the UI reads arcade status without
+// opening a second SSE stream on our own callback token — lives on the fork,
+// unreleased, so there is no tag to pin to instead. This pins the fork's main,
+// not a feature branch: a branch pin resolves today and rots when the branch is
+// deleted, which is a build failure nobody is expecting. The
 // replace redirects the unreachable path at a specific fork commit; because
 // module paths are compared only for the module being replaced, Go accepts the
 // substitution even though the fork's go.mod still declares the bsv-blockchain
 // path.
-replace github.com/bsv-blockchain/go-arcade-toolbox => github.com/galt-tr/go-arcade-toolbox v0.0.0-20260812141020-a63e087d9be6
+replace github.com/bsv-blockchain/go-arcade-toolbox => github.com/galt-tr/go-arcade-toolbox v0.0.0-20260812163821-e4c78bb570a4
 
 // Runar's two modules import each other: packages/runar-go needs
 // compilers/go/codegen, and compilers/go/compiler needs
