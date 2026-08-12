@@ -189,17 +189,37 @@ printf '  waiting for postgres'
 until psql_q "SELECT 1" >/dev/null 2>&1; do printf '.'; sleep 1; done
 echo " ready"
 
-# The app reads this when no -postgres-dsn is given. It pointed at the old shared
-# server for a long time, which is a quiet way to run the engine against one
-# database and your psql session against another.
-printf '%s' "$DSN" > "${DATA}/postgres.dsn"
-echo "  wrote ${DATA}/postgres.dsn -> port ${PORT}"
+# NOT config. The app takes the DSN from -postgres-dsn or RULE110_POSTGRES_DSN
+# and defaults to SQLite in the data dir; nothing reads a file. The old
+# deployment had a data/postgres.dsn sitting next to a wallet that really was in
+# PostgreSQL, which reads exactly like configuration and is not — the flag was
+# being passed on every command instead.
+#
+# That misreading has teeth. Bootstrapping without the DSN puts the wallet in
+# SQLite, silently, and it works: `fund` reports the balance and `fuel` starts
+# minting. You find out at 128-cell fan-out, which is where SQLite is far too
+# slow, by which point the coin is in the wrong store and the funding output is
+# spent.
+#
+# So write an env file to SOURCE, which cannot be mistaken for something the app
+# picks up on its own.
+rm -f "${DATA}/postgres.dsn"
+cat > "${DATA}/env" <<ENVEOF
+# source this before running rule110, or the wallet goes to SQLite:
+#   source ${DATA}/env
+export RULE110_POSTGRES_DSN='${DSN}'
+export RULE110_ARCADE_URL='${ARCADE}'
+ENVEOF
+echo "  wrote ${DATA}/env — source it, nothing reads it automatically"
 
 go build -o rule110 ./cmd/rule110
 echo "  rebuilt ./rule110"
 
 # ---------------------------------------------------------------- what to do next
-FLAGS="-arcade-url ${ARCADE} -postgres-dsn '${DSN}'"
+# Print a `source` line rather than repeating flags on every command: a reader
+# who copies six commands will drop the flag on one of them, and dropping it is
+# silent — the wallet just goes to SQLite instead.
+SRC="source ${DATA}/env"
 
 if (( WIPE_WALLET )); then
   cat <<EOF
@@ -208,6 +228,13 @@ $(printf '\033[1m%s\033[0m' "Next: fund the new wallet, then create genesis")
 
 The identity is gone, so this is a new deployment with a new funding address and
 no coin. The subcommands are a sequence, not a menu.
+
+  0. FIRST, in every shell you use:
+
+       ${SRC}
+
+     Without RULE110_POSTGRES_DSN the wallet silently goes to SQLite, which is
+     far too slow for a 128-cell ring — and you find out after the coin is in it.
 
   1. Print the new funding address (offline, needs no arcade):
 
@@ -222,20 +249,20 @@ no coin. The subcommands are a sequence, not a menu.
 
   4. Internalize it. BOTH flags are required:
 
-       ./rule110 fund -tx <raw-tx-hex> -bump <merkle-proof-hex> ${FLAGS}
+       ./rule110 fund -tx <raw-tx-hex> -bump <merkle-proof-hex>
 
   5. Mint the fuel pool. Each cell transition spends exactly one coin, so this
      is what stops 128 cells contending for change:
 
-       ./rule110 fuel -count 20000 ${FLAGS}
+       ./rule110 fuel -count 20000
 
   6. Create generation 0 — one covenant UTXO per cell:
 
-       ./rule110 genesis -cells 128 -rule 110 ${FLAGS}
+       ./rule110 genesis -cells 128 -rule 110
 
   7. Start it:
 
-       ./rule110 run ${FLAGS}
+       ./rule110 run
 
      then open http://${UI} and press play. The engine boots PAUSED by design.
 EOF
@@ -247,18 +274,25 @@ $(printf '\033[1m%s\033[0m' "Next: create genesis. No funding needed")
 The wallet survived, so steps 1-4 of the usual bootstrap do not apply: the coin
 is already there and the funding address is unchanged.
 
+  0. FIRST, in every shell you use:
+
+       ${SRC}
+
+     Without RULE110_POSTGRES_DSN the app defaults to SQLite and will not see
+     this wallet at all.
+
   1. Top the fuel pool back up if it is low (genesis and the keeper both draw on
      it; skip if the pool is already stocked):
 
-       ./rule110 fuel -count 20000 ${FLAGS}
+       ./rule110 fuel -count 20000
 
   2. Create generation 0 — one covenant UTXO per cell:
 
-       ./rule110 genesis -cells 128 -rule 110 ${FLAGS}
+       ./rule110 genesis -cells 128 -rule 110
 
   3. Start it:
 
-       ./rule110 run ${FLAGS}
+       ./rule110 run
 
      then open http://${UI} and press play. The engine boots PAUSED by design.
 
