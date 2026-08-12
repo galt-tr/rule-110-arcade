@@ -77,6 +77,32 @@ type Store struct {
 	postgres bool
 }
 
+// maxOpenConns bounds the history store's connection pool.
+//
+// database/sql defaults to UNLIMITED, and this store is written to by one
+// goroutine per cell. At 128 cells every worker opened its own connection, and
+// together with the wallet's own pool that ran a stock PostgreSQL (200
+// max_connections) out of slots within seconds of reaching full rate.
+//
+// The consequence was not a slow query. `recordCell` writes the write-ahead
+// record that makes a crash mid-transition survivable, and a cell whose
+// write-ahead record cannot be written is halted rather than allowed to proceed
+// blind — correctly, but it means connection exhaustion destroys cells. A live
+// run at 4 generations/second halted nine of them in under a minute.
+//
+// 16 is far below what the workload would take if allowed, and that is the
+// point. Each write is a single indexed INSERT or UPDATE, so 16 connections
+// serve thousands per second — well past 128 cells at any rate this automaton
+// runs — while queuing costs milliseconds of backpressure. Exceeding the
+// server's limit costs a cell.
+//
+// Sized small rather than merely finite because the limit is shared and mostly
+// not ours to spend. On the machine where this was diagnosed a co-tenant
+// application held 179 idle connections of the server's 200, leaving about
+// twenty. An application that assumes it may open as many connections as it has
+// goroutines is wrong even when it happens to fit.
+const maxOpenConns = 16
+
 // Open connects to the history store, creating its schema on first use.
 //
 // dsn selects PostgreSQL; empty falls back to a SQLite file beside the wallet,
@@ -91,6 +117,11 @@ func Open(ctx context.Context, dsn, dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("history: open %s: %w", driver, err)
 	}
+	db.SetMaxOpenConns(maxOpenConns)
+	// Idle connections are kept to match, so a burst does not pay reconnection
+	// cost on every generation; SQLite ignores the distinction.
+	db.SetMaxIdleConns(maxOpenConns)
+	db.SetConnMaxLifetime(30 * time.Minute)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("history: connect: %w", err)
