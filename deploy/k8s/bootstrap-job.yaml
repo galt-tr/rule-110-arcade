@@ -1,0 +1,108 @@
+# One-shot bootstrap, for the subcommands that must run before `run` ever can.
+#
+# `rule110 run` is step 7 of a 7-step sequence (see `rule110 help` or the README
+# runbook). Steps 1, 4, 5 and 6 — address, fund, fuel, genesis — are one-shot
+# commands against the same wallet, and on Kubernetes that means the same PVC.
+# This Job is how they are run. Edit `args`, apply, read the logs, delete,
+# repeat for the next step.
+#
+# SCALE THE STATEFULSET TO 0 FIRST:
+#
+#   kubectl scale statefulset/rule110 --replicas=0
+#   kubectl wait --for=delete pod/rule110-0 --timeout=120s
+#
+# Two processes must not hold this wallet at once. The engine's writer lease
+# protects the CELL CHAINS, and nothing else: it is taken by `run`, and none of
+# these subcommands take it. `fuel` in particular mints and spends coins from
+# the same pool the running engine's fuel keeper is drawing on. The PVC is
+# ReadWriteOnce, which stops two pods on different nodes, and does not stop two
+# on the same one.
+#
+# The image has no shell, so there is nothing to `kubectl exec -- sh` into.
+# Run the binary directly instead — `kubectl exec rule110-0 -- rule110 address`
+# is safe against a live pod, because deriving the address only reads keys.json.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rule110-bootstrap
+  labels:
+    app.kubernetes.io/name: rule110
+spec:
+  # Retrying these is not obviously safe — a half-applied `fund` or `genesis` is
+  # a thing to look at, not to repeat automatically.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rule110
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rule110
+          image: ghcr.io/dymurray/rule110:latest
+          # The step to run. In order:
+          #
+          #   ["address"]
+          #       prints the funding address. Offline; needs no arcade. Send
+          #       coin to it and WAIT FOR THAT PAYMENT TO BE MINED — fund
+          #       verifies its merkle proof against the headers service, so an
+          #       unconfirmed payment cannot be internalized.
+          #
+          #   ["fund", "-tx", "<tx-hex>", "-bump", "<bump-hex>"]
+          #       both flags required; -bump is that merkle proof.
+          #
+          #   ["fuel", "-count", "20000", "-sats", "1000"]
+          #       mints the denominated pool. Without it 128 cells contend for
+          #       one change output and the automaton runs at about 4 tx/s.
+          #
+          #   ["genesis"]
+          #       creates generation 0, one UTXO per cell. -cells belongs here
+          #       and only here: the ring size is fixed for the life of the
+          #       deployment.
+          args: ["address"]
+          env:
+            - name: RULE110_ARCADE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: rule110-config
+                  key: arcadeUrl
+            - name: RULE110_NETWORK
+              valueFrom:
+                configMapKeyRef:
+                  name: rule110-config
+                  key: network
+            - name: RULE110_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: rule110-postgres
+                  key: dsn
+            - name: RULE110_DATA_DIR
+              value: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The StatefulSet's volumeClaimTemplate names its PVC
+        # <template>-<statefulset>-<ordinal>. This must be the SAME volume the
+        # engine uses: a different one is a different wallet, holding no coins,
+        # and the mistake is silent.
+        - name: data
+          persistentVolumeClaim:
+            claimName: data-rule110-0
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,58 @@
+# The checks the README claims are clean. Kept small on purpose: this repository
+# has no linter config and no coverage gate, and a workflow that asserts things
+# nobody maintains is worse than one that asserts four things that matter.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read from go.mod so the toolchain and the module agree by
+          # construction rather than by someone remembering to edit both.
+          go-version-file: go.mod
+          cache: true
+
+      # This is also the check that go.mod still resolves from public git.
+      # Every dependency comes from a git host — the arcade toolbox from a fork,
+      # via a replace, because its own module path is not public — so a runner
+      # with no checkouts on disk is exactly the environment that would catch a
+      # replace pointing back at somebody's laptop.
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      # -race, not plain `go test`. The engine is a clock, 128 cell workers, a
+      # status pipeline and an HTTP server sharing one snapshot; a data race
+      # there produced a genuine bug in Snapshot (the per-generation Cells
+      # slices were shared with the live engine while being marshalled).
+      - name: test
+        run: go test ./... -race
+
+      # The build stage only. Pushing an image needs registry credentials this
+      # workflow deliberately does not have, and the runtime stage is where
+      # nothing can go wrong that this would catch.
+      - name: docker build
+        run: docker build --target build -t rule110-build:ci .
