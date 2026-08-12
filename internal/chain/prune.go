@@ -108,9 +108,17 @@ func DefaultPruneOptions() PruneOptions {
 		DryRun:            true,
 		RetainGenerations: 1000,
 		MinConfirmations:  6,
-		BatchSize:         500,
-		Pause:             2 * time.Second,
-		Interval:          5 * time.Minute,
+		// Sized against production, not against politeness. 500 rows every 2
+		// seconds clears 250 a second, and a 256-cell ring at 0.5 gen/s writes
+		// 128 transactions a second before the fuel keeper's own leaves are
+		// counted — so the old cadence could never catch up, and a pruner that
+		// runs forever without gaining ground is indistinguishable from one that
+		// is not running. The sweep still holds a single connection and still
+		// pauses between batches; it is just no longer slower than the thing it
+		// is cleaning up after.
+		BatchSize: 2000,
+		Pause:     250 * time.Millisecond,
+		Interval:  5 * time.Minute,
 	}
 }
 
@@ -629,7 +637,31 @@ func (p *Pruner) tipHeight(ctx context.Context) (uint64, error) {
 // refuses to establish a floor at all rather than scanning an unbounded slice of
 // a 13 GB table — failing closed, which for this feature is the only acceptable
 // direction to fail in.
-const floorWindowCap = 250_000
+//
+// 400,000 rather than 250,000 because the cap is a product of BOTH knobs and
+// only one of them is a pruner setting. At the default 1000 retained
+// generations, 250,000 admitted a ring of 250 cells and refused 256 — so
+// widening the ring silently disabled pruning altogether, with every sweep
+// logging "lower it" and carrying on. The lookback is an ordered index read
+// bounded by LIMIT, so the extra rows cost a larger read, not an unbounded one.
+const floorWindowCap = 400_000
+
+// floorWindow is how many cell outputs the retention floor has to read back.
+//
+// Split out from floor so the arithmetic can be asserted without a database.
+// It is a product of two numbers set in different places — the ring size, fixed
+// at genesis, and -retain-generations, a pruner flag — which is exactly how a
+// 256-cell ring at the default retention came to exceed the cap and disable
+// pruning entirely while every sweep logged a warning and continued.
+func floorWindow(cells int, retain uint64) (int, error) {
+	window := cells * int(retain+1)
+	if window <= 0 || window > floorWindowCap {
+		return 0, fmt.Errorf(
+			"chain: prune: -retain-generations %d over %d cells needs a %d-row lookback, "+
+				"above the %d cap; lower it", retain, cells, window, floorWindowCap)
+	}
+	return window, nil
+}
 
 // floor returns the transaction_id at and above which nothing may be pruned,
 // and the generation that produced it.
@@ -646,11 +678,9 @@ const floorWindowCap = 250_000
 // with the retained generations too — they carry no generation of their own, but
 // they were created in the same span of ids.
 func (p *Pruner) floor(ctx context.Context) (int64, uint64, error) {
-	window := p.cells * int(p.opts.RetainGenerations+1)
-	if window <= 0 || window > floorWindowCap {
-		return 0, 0, fmt.Errorf(
-			"chain: prune: -retain-generations %d over %d cells needs a %d-row lookback, "+
-				"above the %d cap; lower it", p.opts.RetainGenerations, p.cells, window, floorWindowCap)
+	window, err := floorWindow(p.cells, p.opts.RetainGenerations)
+	if err != nil {
+		return 0, 0, err
 	}
 
 	q := `SELECT transaction_id, custom_instructions

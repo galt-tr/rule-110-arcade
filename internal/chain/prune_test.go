@@ -1013,3 +1013,54 @@ func TestPruneOnPostgres(t *testing.T) {
 			again.Prunable)
 	}
 }
+
+// TestTheDefaultRingCanEstablishARetentionFloor is the regression guard for
+// pruning switching itself off when the ring got wider.
+//
+// The lookback is cells × (retain+1), a product of two numbers set in different
+// places: the ring size is fixed at genesis and -retain-generations is a pruner
+// flag. At the default retention of 1000 the old 250,000 cap admitted 250 cells
+// and refused 256, so widening the ring disabled pruning entirely — and it
+// failed loudly in the wrong direction, because Run logs the error and carries
+// on, which reads as a pruner that is running.
+func TestTheDefaultRingCanEstablishARetentionFloor(t *testing.T) {
+	cells := DefaultConfig().Cells
+	retain := DefaultPruneOptions().RetainGenerations
+
+	window, err := floorWindow(cells, retain)
+	if err != nil {
+		t.Fatalf("the shipped defaults cannot establish a retention floor: %v", err)
+	}
+	if want := cells * int(retain+1); window != want {
+		t.Errorf("lookback = %d, want %d", window, want)
+	}
+}
+
+// The cap still has to fail closed. Scanning an unbounded slice of a table
+// measured in gigabytes is the thing it exists to refuse.
+func TestAnOversizedRetentionWindowIsRefused(t *testing.T) {
+	if _, err := floorWindow(DefaultConfig().Cells, 1_000_000); err == nil {
+		t.Error("floorWindow accepted a lookback that would scan the whole outputs table")
+	}
+	if _, err := floorWindow(0, 1000); err == nil {
+		t.Error("floorWindow accepted a ring of no cells")
+	}
+}
+
+// The sweep has to clear rows faster than the automaton writes them, or it
+// never gains ground and is indistinguishable from a pruner that is not
+// running. The ring at the configured rate is the bar it has to clear.
+func TestTheSweepOutrunsTheAutomaton(t *testing.T) {
+	opts := DefaultPruneOptions()
+	perSecond := float64(opts.BatchSize) / opts.Pause.Seconds()
+
+	// One transaction per cell per generation, at the rate the public
+	// deployment is locked to, before the fuel keeper's own leaves.
+	const lockedRate = 0.5
+	produced := float64(DefaultConfig().Cells) * lockedRate
+
+	if perSecond <= produced {
+		t.Errorf("sweep clears %.0f rows/s against %.0f transactions/s of production; "+
+			"a pruner slower than the workload never catches up", perSecond, produced)
+	}
+}
