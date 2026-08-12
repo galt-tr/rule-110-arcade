@@ -110,6 +110,30 @@ func newFixture(t *testing.T) *fixture {
 // derivation has something to find.
 func (f *fixture) advance(t *testing.T, cell int, from chain.CellChain, status history.Status) chain.CellChain {
 	t.Helper()
+	next := f.build(t, cell, from, 0)
+	if err := f.store.RecordGeneration(t.Context(), next.Generation, next.RowHex); err != nil {
+		t.Fatalf("record generation: %v", err)
+	}
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Generation: next.Generation, Cell: cell, TxID: next.TxID, Status: status,
+	}); err != nil {
+		t.Fatalf("record tx: %v", err)
+	}
+	return next
+}
+
+// build makes a real transition for one cell and registers its bytes with the
+// ledger, telling the history store NOTHING.
+//
+// Recovery reasons from transactions the record does not know about — that is the
+// whole damage class — so a test needs to be able to produce one.
+//
+// salt goes into the locktime and changes nothing else. It is how two DIFFERENT
+// transactions that spend the same output are built: the phantom and the
+// transition that really won, which is the shape a lost write-ahead record leaves
+// behind.
+func (f *fixture) build(t *testing.T, cell int, from chain.CellChain, salt uint32) chain.CellChain {
+	t.Helper()
 	row, err := from.Row(testCells)
 	if err != nil {
 		t.Fatalf("row: %v", err)
@@ -129,6 +153,7 @@ func (f *fixture) advance(t *testing.T, cell int, from chain.CellChain, status h
 	}
 
 	tx := transaction.NewTransaction()
+	tx.LockTime = salt
 	tx.Inputs = append(tx.Inputs, &transaction.TransactionInput{
 		SourceTXID: src, SourceTxOutIndex: from.Vout,
 	})
@@ -138,18 +163,9 @@ func (f *fixture) advance(t *testing.T, cell int, from chain.CellChain, status h
 	tx.AddOutput(&transaction.TransactionOutput{Satoshis: 999, LockingScript: change})
 
 	f.ledger.raw[tx.TxID().String()] = tx.Bytes()
-	gen := from.Generation + 1
-	if err := f.store.RecordGeneration(t.Context(), gen, next.Hex()); err != nil {
-		t.Fatalf("record generation: %v", err)
-	}
-	if err := f.store.RecordTx(t.Context(), history.CellTx{
-		Generation: gen, Cell: cell, TxID: tx.TxID().String(), Status: status,
-	}); err != nil {
-		t.Fatalf("record tx: %v", err)
-	}
 	return chain.CellChain{
 		Cell: cell, TxID: tx.TxID().String(), Vout: 0, Satoshis: from.Satoshis,
-		Generation: gen, RowHex: next.Hex(),
+		Generation: from.Generation + 1, RowHex: next.Hex(),
 	}
 }
 

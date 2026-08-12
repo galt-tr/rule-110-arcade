@@ -24,7 +24,7 @@ type CellRecovery struct {
 // executed one could differ, which for something that decides whether to re-spend
 // a live UTXO is not a risk worth taking for tidiness.
 //
-// Two kinds of cell are considered, and they are not the same problem.
+// Three kinds of cell are considered, and they are not the same problem.
 //
 // A cell marked Unknown has an unresolved write-ahead record: something may have
 // been broadcast without being recorded, and the wallet's own actions say what.
@@ -36,10 +36,17 @@ type CellRecovery struct {
 // that spent the tip, and that name is enough to verify one specific candidate
 // from its own bytes. chain.RecoverSpentTip decides those.
 //
-// Every OTHER rejection is still never recovered, exactly as before: the
-// rejected transaction's output does not exist, so there is nothing to adopt,
-// and the output it tried to spend is gone, so there is nothing to resume from
-// either. That cell's chain has ended and a human decides.
+// A cell halted by ANY rejection directly above its tip may be held down by a
+// verdict about a parent it no longer has: the rejected transaction was built on
+// an output that never existed, so its refusal was never about this tip. Reading
+// the rejected transaction's own bytes settles it. chain.RecoverStaleRejection
+// decides those, and only ever on positive proof that it spent something else.
+//
+// A rejection further up than the tip's own successor is still never recovered,
+// exactly as before: that is a cascade, its newest message describes wreckage
+// rather than the break, and a human decides. Derivation is where that line is
+// drawn — CellPosition.Rejected is set only for a rejection at tip+1 — so it
+// holds for both rejection paths at once. See noteRejection.
 //
 // The caller must hold the writer lease. Recovery reads the wallet's actions and
 // writes tips; another writer doing the same thing concurrently would have both
@@ -58,8 +65,8 @@ func Recover(ctx context.Context, l chain.Ledger, oracle chain.TxStatus, compile
 		switch {
 		case p.Unknown:
 			rec, err = chain.RecoverCell(ctx, l, compiled, p.Tip, p.Attempted, d.Cells, d.Rule, tipDepth)
-		case isSpentTip(p):
-			rec, err = recoverSpentTip(ctx, l, oracle, compiled, d, store, p)
+		case p.Rejected:
+			rec, err = recoverRejected(ctx, l, oracle, compiled, d, store, p)
 		default:
 			continue
 		}
@@ -90,6 +97,77 @@ func Recover(ctx context.Context, l chain.Ledger, oracle chain.TxStatus, compile
 // specific cell must find it in the output either way.
 func isSpentTip(p CellPosition) bool {
 	return p.Rejected && chain.IsUTXOSpent(p.RejectionErr)
+}
+
+// recoverRejected decides one cell whose halt is a rejection sitting directly
+// above its tip.
+//
+// Two repairs can apply to the same row and they are not interchangeable, so the
+// order is argued rather than convenient.
+//
+// # The tip fix speaks first
+//
+// A UTXO_SPENT names the transaction that spent this cell's tip, and if that
+// transaction verifies as ours the cell's TIP MOVES. Every later question is
+// asked about the tip, so asking "was this rejection built against a parent the
+// cell no longer has?" before the tip has been corrected is asking the right
+// question about the wrong output.
+//
+// # Why a halt from it may still be overturned
+//
+// The two examine DIFFERENT transactions. The tip fix reads the transaction the
+// message NAMES; the stale-rejection check reads the transaction that PRODUCED
+// the message — the one the record marks failed at this generation. Arcade's
+// "utxo already spent" is about one of that transaction's own inputs, so if none
+// of its inputs is this cell's tip, the message was never evidence about the tip
+// at all: it is about the fuel coin, or about the superseded parent it was built
+// on. The tip fix halting on a candidate it could not verify says nothing against
+// that, and RecoverSpentTip's own condition-4 halt says so in as many words.
+//
+// So a resume may override the tip fix's halt, and nothing else may: two halts
+// report the tip fix's reason, which names the more specific uncertainty.
+//
+// # One decision per cell per pass
+//
+// A cell whose tip the fix ADOPTS is not then examined for a stale rejection,
+// even though the live deployment's cell 2 needs both. The rejection that would
+// matter then is the one above the NEW tip, and that is not the row derivation
+// looked at: deciding about it here would mean deciding from a tip this pass has
+// not written yet, against a row nothing has verified, with the adjacency test
+// applied to a generation number rather than to what the store holds.
+//
+// So recovery CONVERGES instead. The next derivation reads the corrected tip out
+// of the store and offers the next row up, once, with the same evidence and the
+// same checks as every other cell. `rule110 recover -apply` run twice lands in
+// the same place — and so does the engine on its own, from the other direction:
+// an adopted cell is released, and the write-ahead record its worker writes for
+// the next generation replaces the stale rejection row (cell_txs is keyed by
+// generation and cell) before anything is broadcast.
+func recoverRejected(ctx context.Context, l chain.Ledger, oracle chain.TxStatus,
+	compiled *cellscript.Compiled, d *chain.Deployment, store *history.Store, p CellPosition,
+) (chain.Recovery, error) {
+
+	// The rejection is at tip+1 by construction: derivation flags a rejection only
+	// when it sits directly above the tip (see noteRejection), and
+	// chain.RecoverStaleRejection refuses to decide anything else — which is what
+	// keeps this away from the cascaded cells.
+	stale := func() (chain.Recovery, error) {
+		return chain.RecoverStaleRejection(ctx, l, p.Tip, p.Tip.Generation+1,
+			p.RejectionTxID, p.RejectionErr)
+	}
+	if !isSpentTip(p) {
+		return stale()
+	}
+
+	rec, err := recoverSpentTip(ctx, l, oracle, compiled, d, store, p)
+	if err != nil || rec.Verdict != chain.VerdictHalt {
+		return rec, err
+	}
+	alt, err := stale()
+	if err != nil || alt.Verdict != chain.VerdictResume {
+		return rec, err
+	}
+	return alt, nil
 }
 
 // recoverSpentTip gathers what chain.RecoverSpentTip cannot reach from where it
@@ -159,10 +237,28 @@ func applyRecovery(ctx context.Context, store *history.Store, cell int,
 		return CellPosition{Tip: rec.Tip}, nil
 
 	case chain.VerdictResume:
-		// Nothing was ever signed, so the write-ahead record is a false alarm and
-		// has to go — leaving it would halt the cell again at the next startup.
-		if err := store.DeleteAttempt(ctx, p.Attempted, cell); err != nil {
-			return p, err
+		// Whatever halted this cell has been shown not to be about its tip, and the
+		// record of it has to go: derivation reads these same rows, so leaving it
+		// would halt the cell again at the next startup, and at every startup after
+		// that.
+		//
+		// Which record depends on which question was answered, and the order
+		// mirrors Recover's own switch exactly — an unresolved attempt outranks a
+		// rejection — so the row that is retracted is always the one the decision
+		// was made about.
+		switch {
+		case p.Unknown:
+			// Nothing was ever signed, so the write-ahead record is a false alarm.
+			if err := store.DeleteAttempt(ctx, p.Attempted, cell); err != nil {
+				return p, err
+			}
+		case p.Rejected:
+			// The rejected transaction was built on a parent this cell no longer
+			// has, so its refusal was a verdict about that parent. tip+1 is where
+			// derivation found it; see noteRejection.
+			if err := store.DeleteRejection(ctx, p.Tip.Generation+1, cell, p.RejectionTxID); err != nil {
+				return p, err
+			}
 		}
 		return CellPosition{Tip: rec.Tip}, nil
 
@@ -184,7 +280,7 @@ func applyRecovery(ctx context.Context, store *history.Store, cell int,
 func (e *Engine) recoverUnknown(ctx context.Context, positions []CellPosition) []CellPosition {
 	candidates := 0
 	for _, p := range positions {
-		if p.Unknown || isSpentTip(p) {
+		if p.Unknown || p.Rejected {
 			candidates++
 		}
 	}
@@ -192,7 +288,8 @@ func (e *Engine) recoverUnknown(ctx context.Context, positions []CellPosition) [
 		return positions
 	}
 
-	e.logger.WarnContext(ctx, "recovering cells whose tip is unknown or spent out from under them",
+	e.logger.WarnContext(ctx,
+		"recovering cells whose tip is unknown, spent out from under them, or held down by a rejection",
 		"cells", candidates)
 	out, decisions, err := Recover(ctx, e.chain, e.chain.Oracle, e.compiled, e.deployment, e.store,
 		positions, true)

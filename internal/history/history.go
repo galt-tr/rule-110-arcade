@@ -479,6 +479,38 @@ func (s *Store) DeleteAttempt(ctx context.Context, generation uint64, cell int) 
 	return nil
 }
 
+// DeleteRejection removes a recorded rejection, and only the exact one that was
+// examined.
+//
+// It exists because a rejection halts a cell from the store rather than in
+// memory: derivation reads the same rows the tip comes from, so a cell whose
+// recorded rejection is left in place halts again at every startup, for ever.
+// When chain.RecoverStaleRejection has proved that the rejected transaction was
+// built against a parent this cell no longer has, that row is a verdict about
+// something else, and leaving it is what keeps the cell dead.
+//
+// Both extra clauses are the safety property, and they are the same one
+// DeleteAttempt's status check is. `status = 'failed'` keeps this off a row that
+// has since become a real transaction. `txid = ?` keeps it off a DIFFERENT
+// transaction recorded at the same (generation, cell) since the decision was
+// made — a retry, the engine, another writer. Either way the delete matches
+// nothing and the cell stays halted, which is the direction that costs nothing.
+func (s *Store) DeleteRejection(ctx context.Context, generation uint64, cell int, txid string) error {
+	if txid == "" {
+		// Without a txid there is no row this can be shown to be about. Refusing
+		// is not pedantry: the clause is what stops the delete from matching a
+		// rejection nobody verified.
+		return fmt.Errorf(
+			"history: delete rejection for cell %d generation %d: no transaction id", cell, generation)
+	}
+	q := `DELETE FROM cell_txs WHERE generation = ? AND cell = ? AND status = ? AND txid = ?`
+	_, err := s.db.ExecContext(ctx, s.rebind(q), generation, cell, string(StatusFailed), txid)
+	if err != nil {
+		return fmt.Errorf("history: delete rejection for cell %d generation %d: %w", cell, generation, err)
+	}
+	return nil
+}
+
 // DeepTip is what derivation needs about a cell buried under more unsettled
 // records than the ordinary window covers.
 type DeepTip struct {

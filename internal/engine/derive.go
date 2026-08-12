@@ -58,8 +58,16 @@ type CellPosition struct {
 	// The raw recorded message is carried rather than HaltReason's prose because
 	// recovery parses it. HaltReason is written for a human and is free to be
 	// reworded; this is not.
-	Rejected     bool
-	RejectionErr string
+	//
+	// RejectionTxID is the transaction the record blames for that generation, and
+	// it is carried for a reason the message alone cannot serve: the rejection may
+	// be about a parent this cell no longer has, and the only way to tell is to
+	// fetch that transaction's bytes and look at what it SPENDS. See
+	// chain.RecoverStaleRejection. It is empty when the rejection was recorded
+	// before anything was signed, which is a cell this cannot reason about.
+	Rejected      bool
+	RejectionErr  string
+	RejectionTxID string
 }
 
 // DeriveTips rebuilds every cell's position from the history store and the
@@ -262,12 +270,19 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 // the same thing. Without it the deep path would hand a cascade's 170th
 // rejection to recovery as if it described the break, and recovery would parse
 // a message about an output that never existed.
+//
+// The same test is the only thing keeping chain.RecoverStaleRejection away from
+// cells 34, 51, 64 and 91: every rejection in a cascade after the first spends
+// the previous rejected transaction's output rather than the tip, so every one of
+// them would satisfy that check on its own. Adjacency is what distinguishes one
+// refused transition from 170 stacked ones.
 func noteRejection(p *CellPosition, tip uint64, r history.Tip) {
 	if r.Generation != tip+1 {
 		return
 	}
 	p.Rejected = true
 	p.RejectionErr = r.Err
+	p.RejectionTxID = r.TxID
 }
 
 // newestSettled returns the newest record that names a transaction the network

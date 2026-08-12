@@ -659,6 +659,255 @@ func TestSpentTipHaltsOnEveryFailedCondition(t *testing.T) {
 	})
 }
 
+// aRefusal is arcade's own words for a transaction built on an output that never
+// existed, as the record holds them beside it.
+//
+// Nothing is decided from this string — which input a refusal is about can only
+// be read from the transaction — but it is what an operator reads when the answer
+// is a halt, so every decision has to carry it through.
+const aRefusal = "arcade: REJECTED: MISSING_INPUTS (13): unable to find inputs"
+
+// aRepairedTip builds the state cell 2 of the live deployment was left in once
+// RecoverSpentTip had corrected its tip.
+//
+// Generation 0 was spent twice, as far as our records are concerned: by `real`,
+// which the network took and which recovery adopted as generation 1, and by
+// `phantom`, the re-spend that arcade refused. The record then also holds a
+// rejection at generation 2 for a transaction built on the PHANTOM's output —
+// which never existed, so that transaction could never have been valid, and its
+// refusal is a verdict about a parent this cell no longer has.
+//
+// It returns the ledger, the repaired tip, and the phantom's outpoint to build
+// the doomed transaction from.
+func aRepairedTip(t *testing.T) (*cellscript.Compiled, *fakeLedger, CellChain, ca.Row,
+	transaction.Outpoint) {
+
+	t.Helper()
+	compiled, l, gen0, seed := aGenesisTip(t)
+	row1 := ca.Rule110.Step(seed)
+
+	real := stepTx(t, compiled, 0, row1, gen0.Satoshis, outpointOf(gen0))
+	// The phantom is a SIBLING of the transaction that won: same cell, same row,
+	// same parent output, built when we still believed generation 0 was unspent.
+	// Only the locktime differs here, which stands in for the different fuel coin
+	// the second attempt would really have picked up.
+	phantom := stepTx(t, compiled, 0, row1, gen0.Satoshis, outpointOf(gen0))
+	phantom.LockTime = 7
+	if phantom.TxID().String() == real.TxID().String() {
+		t.Fatal("the phantom and the real transition must be different transactions")
+	}
+
+	l.raw[real.TxID().String()] = real.Bytes()
+	tip, err := VerifySuccessor(compiled, gen0, testCells, ca.Rule110, real.TxID().String(), real.Bytes())
+	if err != nil {
+		t.Fatalf("verify the repaired tip: %v", err)
+	}
+	return compiled, l, tip, ca.Rule110.Step(row1),
+		transaction.Outpoint{Txid: *phantom.TxID(), Index: 0}
+}
+
+// TestStaleRejectionResumesOverASupersededParent is the repair this path exists
+// for, in the shape the live deployment actually holds.
+//
+// The rejected transaction at tip+1 spends the phantom's output. That output has
+// never existed, so its refusal was never a verdict on the tip that recovery
+// established — and derivation, which sees only "a failed row directly above the
+// tip", halts the cell for it anyway. Roughly 67 cells stayed dead on exactly
+// this.
+func TestStaleRejectionResumesOverASupersededParent(t *testing.T) {
+	compiled, l, tip, row2, phantomOut := aRepairedTip(t)
+
+	doomed := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomOut)
+	txid := doomed.TxID().String()
+	l.raw[txid] = doomed.Bytes()
+
+	rec, err := RecoverStaleRejection(context.Background(), l, tip, tip.Generation+1, txid, aRefusal)
+	if err != nil {
+		t.Fatalf("RecoverStaleRejection: %v", err)
+	}
+	if rec.Verdict != VerdictResume {
+		t.Fatalf("verdict = %s, want resume: %s", rec.Verdict, rec.Reason)
+	}
+	if rec.Tip.TxID != tip.TxID || rec.Tip.Generation != tip.Generation || rec.Tip.Vout != tip.Vout {
+		t.Errorf("resume moved the tip to %+v; nothing here justifies moving it from %+v", rec.Tip, tip)
+	}
+	if len(rec.Steps) != 0 {
+		t.Errorf("steps = %+v; a resume adopts nothing", rec.Steps)
+	}
+	// The refusal that was set aside is quoted, so an operator reading a dry run
+	// can see what this decided to ignore rather than having to go to the store
+	// for it.
+	if !strings.Contains(rec.Reason, aRefusal) {
+		t.Errorf("the reason should quote the refusal it set aside, got: %s", rec.Reason)
+	}
+}
+
+// TestStaleRejectionHaltsOnAGenuineRejection is the direction that must never be
+// relaxed.
+//
+// Here the rejected transaction really does spend the current tip, so the network
+// was asked about this cell's real chain and answered no. Resuming would rebuild
+// that generation against the same output and broadcast it again — and our
+// `failed` row is a belief written from an arcade status event, not proof the
+// network never took it, so the re-spend could be a second transaction against a
+// live output. That is the double spend all of this exists to avoid; a stalled
+// cell is not.
+func TestStaleRejectionHaltsOnAGenuineRejection(t *testing.T) {
+	compiled, l, tip, row2, _ := aRepairedTip(t)
+
+	refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
+	txid := refused.TxID().String()
+	l.raw[txid] = refused.Bytes()
+
+	rec, err := RecoverStaleRejection(context.Background(), l, tip, tip.Generation+1, txid, aRefusal)
+	if err != nil {
+		t.Fatalf("RecoverStaleRejection: %v", err)
+	}
+	if rec.Verdict != VerdictHalt {
+		t.Fatalf("verdict = %s for a refused transaction that spends the tip, want halt: %s",
+			rec.Verdict, rec.Reason)
+	}
+	if !strings.Contains(rec.Reason, "spends this cell's tip") {
+		t.Errorf("the reason should say it spent the tip, got: %s", rec.Reason)
+	}
+
+	// The same transaction with the tip's own outpoint as its SECOND input is
+	// still a spend of the tip: the test is over every input, not the first one.
+	extra := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomLike(t))
+	extra.Inputs = append(extra.Inputs, &transaction.TransactionInput{
+		SourceTXID: hashOf(t, tip.TxID), SourceTxOutIndex: tip.Vout,
+	})
+	l.raw[extra.TxID().String()] = extra.Bytes()
+
+	rec, err = RecoverStaleRejection(context.Background(), l, tip, tip.Generation+1,
+		extra.TxID().String(), aRefusal)
+	if err != nil {
+		t.Fatalf("RecoverStaleRejection: %v", err)
+	}
+	if rec.Verdict != VerdictHalt {
+		t.Fatalf("verdict = %s for a tip spent at input 1, want halt: %s", rec.Verdict, rec.Reason)
+	}
+}
+
+// phantomLike is an outpoint belonging to nothing in particular — a parent this
+// cell does not have.
+func phantomLike(t *testing.T) transaction.Outpoint {
+	t.Helper()
+	return transaction.Outpoint{Txid: *hashOf(t, strings.Repeat("7a", 32)), Index: 0}
+}
+
+// TestStaleRejectionHaltsOnEveryUncertainty: resuming is a decision to spend, so
+// it may only ever be reached by reading the rejected transaction's own bytes and
+// finding another parent in them. Nothing else — not a failed fetch, not bytes
+// that hash elsewhere, not a record with no transaction to fetch — may be read as
+// "it must have been about something else".
+func TestStaleRejectionHaltsOnEveryUncertainty(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("the bytes cannot be fetched", func(t *testing.T) {
+		compiled, l, tip, row2, phantomOut := aRepairedTip(t)
+		doomed := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomOut)
+		l.raw[doomed.TxID().String()] = doomed.Bytes()
+		l.rawErr = errors.New("timeout")
+
+		rec, err := RecoverStaleRejection(ctx, l, tip, tip.Generation+1, doomed.TxID().String(), aRefusal)
+		if err != nil {
+			t.Fatalf("RecoverStaleRejection: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s when the bytes could not be read, want halt: %s", rec.Verdict, rec.Reason)
+		}
+		if !strings.Contains(rec.Reason, "could not be read") {
+			t.Errorf("the reason should name the failed fetch, got: %s", rec.Reason)
+		}
+	})
+
+	t.Run("the bytes hash to a different transaction", func(t *testing.T) {
+		compiled, l, tip, row2, phantomOut := aRepairedTip(t)
+		// Bytes that WOULD resume, served under the txid the record holds. Neither
+		// the wallet nor arcade is authenticated; the hash is the only thing making
+		// these bytes a statement about the rejection we are examining.
+		doomed := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomOut)
+		recorded := strings.Repeat("5c", 32)
+		l.raw[recorded] = doomed.Bytes()
+
+		rec, err := RecoverStaleRejection(ctx, l, tip, tip.Generation+1, recorded, aRefusal)
+		if err != nil {
+			t.Fatalf("RecoverStaleRejection: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s for bytes that hash elsewhere, want halt: %s", rec.Verdict, rec.Reason)
+		}
+		if !strings.Contains(rec.Reason, "hash to") {
+			t.Errorf("the reason should name the hash mismatch, got: %s", rec.Reason)
+		}
+	})
+
+	t.Run("the record names no transaction", func(t *testing.T) {
+		_, l, tip, _, _ := aRepairedTip(t)
+
+		rec, err := RecoverStaleRejection(ctx, l, tip, tip.Generation+1, "", aRefusal)
+		if err != nil {
+			t.Fatalf("RecoverStaleRejection: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s with nothing to fetch, want halt: %s", rec.Verdict, rec.Reason)
+		}
+	})
+
+	t.Run("the transaction has no inputs at all", func(t *testing.T) {
+		compiled, l, tip, row2, _ := aRepairedTip(t)
+		// A transaction with no inputs spends nothing, so it trivially "does not
+		// spend the tip" — and reading that as grounds to resume would take a
+		// transaction this program cannot have built as permission to spend.
+		empty := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomLike(t))
+		empty.Inputs = nil
+		txid := empty.TxID().String()
+		l.raw[txid] = empty.Bytes()
+
+		rec, err := RecoverStaleRejection(ctx, l, tip, tip.Generation+1, txid, aRefusal)
+		if err != nil {
+			t.Fatalf("RecoverStaleRejection: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s for a transaction with no inputs, want halt: %s", rec.Verdict, rec.Reason)
+		}
+	})
+}
+
+// TestStaleRejectionRefusesANonAdjacentRejection pins the cascade guard inside
+// the decision itself, not only in the caller that selects candidates.
+//
+// Cells 34, 51, 64 and 91 carry about 170 stacked rejections over tips near
+// generation 300, and every rejection in a cascade after the first spends the
+// PREVIOUS rejected transaction's output — so every one of them would pass the
+// "it spent something else" test and resume. Adjacency is the whole of what
+// distinguishes one refused transition from a pile of wreckage, so it is checked
+// here as well as in derivation: neither may be safe only by virtue of the other
+// being careful.
+func TestStaleRejectionRefusesANonAdjacentRejection(t *testing.T) {
+	compiled, l, tip, row2, phantomOut := aRepairedTip(t)
+
+	// A transaction that WOULD resume if it were offered at tip+1.
+	doomed := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomOut)
+	txid := doomed.TxID().String()
+	l.raw[txid] = doomed.Bytes()
+
+	for _, gen := range []uint64{tip.Generation, tip.Generation + 2, tip.Generation + 170} {
+		rec, err := RecoverStaleRejection(context.Background(), l, tip, gen, txid, aRefusal)
+		if err != nil {
+			t.Fatalf("RecoverStaleRejection: %v", err)
+		}
+		if rec.Verdict != VerdictHalt {
+			t.Fatalf("verdict = %s for a rejection at generation %d over a tip at %d, want halt: %s",
+				rec.Verdict, gen, tip.Generation, rec.Reason)
+		}
+		if !strings.Contains(rec.Reason, "cascade") {
+			t.Errorf("the reason should say why non-adjacency matters, got: %s", rec.Reason)
+		}
+	}
+}
+
 // TestSpentByReadsTheDoubledPrefix covers the parser on its own, because the
 // message it reads is the only surviving pointer to a lost tip and getting it
 // wrong in either direction is expensive: a missed parse leaves a recoverable

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -168,10 +167,16 @@ func TestRecoverDryRunWritesNothing(t *testing.T) {
 	}
 }
 
-// A cell halted by a REJECTION is never a recovery candidate. The rejected
-// transaction's output does not exist, so there is nothing to adopt, and the
-// output it tried to spend is gone, so there is nothing to resume from either.
-func TestRecoverIgnoresARejectedCell(t *testing.T) {
+// TestRecoverWillNotResumeAGenuineRejection is the direction that must stay
+// broken.
+//
+// The rejected transaction here really does spend the cell's tip: the network was
+// asked to spend that exact output and said no. Our `failed` row is a belief
+// written from an arcade status event rather than proof the transaction never
+// reached anyone, so rebuilding that generation against the same tip could put a
+// second transaction on a live output. The cell stays halted, the rejection stays
+// recorded, and a human decides.
+func TestRecoverWillNotResumeAGenuineRejection(t *testing.T) {
 	f := newFixture(t)
 	good := f.advance(t, 6, f.genesisTip(6), history.StatusBroadcast)
 	rejected := f.advance(t, 6, good, history.StatusBroadcast)
@@ -183,19 +188,187 @@ func TestRecoverIgnoresARejectedCell(t *testing.T) {
 	}
 
 	positions := f.derive(t)
-	l := &recoveringLedger{actions: map[int][]chain.CellAction{}}
-	l.raw = f.ledger.raw
-	l.rawErr = errors.New("must not be consulted")
-
-	_, decisions, err := Recover(t.Context(), l, noArcade, f.compiled, f.facts, f.store, positions, true)
+	out, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, true)
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
-	if len(decisions) != 0 {
-		t.Fatalf("recovery considered a rejected cell: %+v", decisions)
+	// EXAMINED, and halted with a reason. An operator who came to look at this
+	// cell must find it in the report; what they must not find is it moving.
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictHalt {
+		t.Fatalf("decisions = %+v, want a single halt", decisions)
 	}
-	if !positions[6].Halted {
-		t.Error("the rejected cell must stay halted")
+	if !strings.Contains(decisions[0].Reason, "spends this cell's tip") {
+		t.Errorf("the reason should say the rejected transaction spent the tip, got: %s",
+			decisions[0].Reason)
+	}
+	if !out[6].Halted || out[6].Tip.TxID != good.TxID {
+		t.Errorf("cell 6 = %+v, want left exactly where it was", out[6])
+	}
+
+	// And the rejection is still recorded, so the halt survives the restart.
+	again := f.derive(t)
+	if !again[6].Halted || again[6].Tip.TxID != good.TxID {
+		t.Errorf("cell 6 = %+v after a restart, want still halted on %s", again[6], good.TxID)
+	}
+}
+
+// aSupersededRejection puts one cell into the state RecoverSpentTip leaves behind
+// and cannot itself clear — the state roughly 67 cells of the live deployment sat
+// in, halted for a reason that had already been repaired.
+//
+// Cell 2 of the live deployment, exactly: the record's tip was generation 1508;
+// 1509 held 03a1cf74, a re-spend that arcade refused; 1509 is really held by
+// 3b3d0b5a, which was mined and which recovery adopted; and 1510 holds 8db21dcb,
+// marked failed — built on 03a1cf74's output, which has never existed.
+//
+// It returns the repaired tip and the doomed transaction sitting above it.
+func aSupersededRejection(t *testing.T, f *fixture, cell int) (chain.CellChain, chain.CellChain) {
+	t.Helper()
+	base := f.advance(t, cell, f.genesisTip(cell), history.StatusMined)
+	tip := f.advance(t, cell, base, history.StatusMined)
+
+	// The phantom is a sibling of the tip: both spend `base`, only one of them
+	// ever existed as far as the network is concerned. It is deliberately never
+	// recorded — recovery has already replaced its row with the tip's.
+	phantom := f.build(t, cell, base, 7)
+	doomed := f.build(t, cell, phantom, 0)
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Generation: doomed.Generation, Cell: cell, TxID: doomed.TxID,
+		Status: history.StatusFailed,
+		Err:    "arcade: REJECTED: MISSING_INPUTS (13): unable to find inputs",
+	}); err != nil {
+		t.Fatalf("record the rejection: %v", err)
+	}
+	if doomed.Generation != tip.Generation+1 {
+		t.Fatalf("the rejection is at generation %d over a tip at %d; the shape under test is a "+
+			"rejection DIRECTLY above the tip", doomed.Generation, tip.Generation)
+	}
+	return tip, doomed
+}
+
+// TestRecoverResumesOverASupersededRejection is the repair, end to end and
+// through a restart.
+//
+// Nothing about the tip changes: the cell simply stops being held down by a
+// verdict about a parent it no longer has, and re-creates the generation itself.
+func TestRecoverResumesOverASupersededRejection(t *testing.T) {
+	f := newFixture(t)
+	tip, doomed := aSupersededRejection(t, f, 3)
+
+	positions := f.derive(t)
+	p := positions[3]
+	if !p.Halted || p.Unknown {
+		t.Fatalf("cell 3 = %+v, want halted by a rejection rather than flagged unknown", p)
+	}
+	if !p.Rejected || p.RejectionTxID != doomed.TxID {
+		t.Fatalf("cell 3 was not offered with the rejected transaction to examine: %+v", p)
+	}
+
+	out, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, true)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictResume {
+		t.Fatalf("decisions = %+v, want a single resume", decisions)
+	}
+	if out[3].Halted || out[3].Tip.TxID != tip.TxID || out[3].Tip.Generation != tip.Generation {
+		t.Errorf("cell 3 = %+v, want released on its unchanged tip %s at generation %d",
+			out[3], tip.TxID, tip.Generation)
+	}
+
+	// What the operator reads: the same verdict vocabulary as every other path,
+	// naming the transaction whose refusal was set aside and why.
+	line := FormatRecovery(decisions[0])
+	for _, want := range []string{"resume", doomed.TxID, "does not spend this cell's tip"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the report does not mention %q:\n%s", want, line)
+		}
+	}
+
+	// Surviving the restart is the only thing that matters. Derivation halts a
+	// cell from the same rows the tip comes from, so a rejection left in the store
+	// would halt this cell again at every startup for ever.
+	again := f.derive(t)
+	if again[3].Halted {
+		t.Fatalf("cell 3 came back halted after recovery: %s", again[3].HaltReason)
+	}
+	if again[3].Tip.TxID != tip.TxID || again[3].Tip.Generation != tip.Generation {
+		t.Errorf("re-derived tip = %s at generation %d, want the unchanged %s at %d",
+			again[3].Tip.TxID, again[3].Tip.Generation, tip.TxID, tip.Generation)
+	}
+}
+
+// A dry run over this path must change nothing either. It is the flag an operator
+// uses to read a decision about 128 live UTXO chains before allowing it to act.
+func TestRecoverStaleRejectionDryRunWritesNothing(t *testing.T) {
+	f := newFixture(t)
+	aSupersededRejection(t, f, 3)
+
+	positions := f.derive(t)
+	_, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, false)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictResume {
+		t.Fatalf("decisions = %+v, want a single resume to be REPORTED", decisions)
+	}
+
+	if again := f.derive(t); !again[3].Halted {
+		t.Error("a dry run released the cell; it must only report what it would do")
+	}
+}
+
+// TestRecoverResumesWhenTheSpentUTXOWasNotTheTip covers the one case where both
+// rejection repairs bear on the same cell.
+//
+// The rejection is a UTXO_SPENT, so the tip fix goes first — and it halts,
+// because the transaction the message names is not one anybody can produce the
+// bytes of. That halt is not the end of it: the transaction that PRODUCED the
+// message does not spend this cell's tip at all, so arcade was complaining about
+// one of its OTHER inputs (the fuel coin, or the phantom it was built on). The
+// message was therefore never evidence about this tip, and the cell resumes.
+func TestRecoverResumesWhenTheSpentUTXOWasNotTheTip(t *testing.T) {
+	f := newFixture(t)
+	const cell = 4
+	base := f.advance(t, cell, f.genesisTip(cell), history.StatusMined)
+	tip := f.advance(t, cell, base, history.StatusMined)
+
+	phantom := f.build(t, cell, base, 7)
+	doomed := f.build(t, cell, phantom, 0)
+	// Arcade blames a transaction nobody can produce: not on our record, and no
+	// bytes anywhere. RecoverSpentTip can establish nothing about it.
+	foreign := strings.Repeat("ee", 32)
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Generation: doomed.Generation, Cell: cell, TxID: doomed.TxID,
+		Status: history.StatusFailed,
+		Err: "arcade: REJECTED: UTXO_SPENT (70): UTXO_SPENT (70): " + phantom.TxID +
+			":1 utxo already spent by tx " + foreign,
+	}); err != nil {
+		t.Fatalf("record the rejection: %v", err)
+	}
+
+	positions := f.derive(t)
+	if !isSpentTip(positions[cell]) {
+		t.Fatalf("cell %d = %+v, want it selected by the tip fix first", cell, positions[cell])
+	}
+
+	out, decisions, err := Recover(t.Context(), f.ledger, mined{foreign: true}, f.compiled,
+		f.facts, f.store, positions, true)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Verdict != chain.VerdictResume {
+		t.Fatalf("decisions = %+v, want a single resume: the rejected transaction does not spend "+
+			"the tip, so the UTXO_SPENT was about one of its other inputs", decisions)
+	}
+	if out[cell].Halted || out[cell].Tip.TxID != tip.TxID {
+		t.Errorf("cell %d = %+v, want released on its unchanged tip %s", cell, out[cell], tip.TxID)
+	}
+	if again := f.derive(t); again[cell].Halted {
+		t.Fatalf("cell %d came back halted: %s", cell, again[cell].HaltReason)
 	}
 }
 
@@ -425,5 +598,75 @@ func TestRecoverIgnoresACascadeRejection(t *testing.T) {
 	}
 	if len(decisions) != 0 {
 		t.Fatalf("recovery considered a cascaded cell: %+v", decisions)
+	}
+}
+
+// TestCascadeIsNeverOfferedToTheStaleRejectionCheck is the cascade guard where it
+// now matters most, built out of real transactions rather than placeholder ids.
+//
+// In a cascade every attempt after the first spends the PREVIOUS rejected
+// transaction's output, because the build that produced this deployment's older
+// history advanced a cell's tip onto the output of a transaction the network had
+// refused. So every rejection in the pile spends a phantom rather than the tip —
+// which is exactly the condition chain.RecoverStaleRejection resumes on. The only
+// thing standing between cells 34, 51, 64 and 91 and being resumed automatically
+// is that the newest rejection is nowhere near the tip, and this pins it.
+//
+// Resuming them would achieve nothing anyway: the 169 rejections underneath the
+// newest one would halt the cell again at the next startup. Untangling that is
+// task 34's job and a human's.
+func TestCascadeIsNeverOfferedToTheStaleRejectionCheck(t *testing.T) {
+	f := newFixture(t)
+	const cell = 5
+	tip := f.advance(t, cell, f.genesisTip(cell), history.StatusMined)
+
+	// The first refusal spent the tip; everything after it spent the refusal.
+	parent := f.build(t, cell, tip, 9)
+	newest := parent
+	for range tipDepth + 4 {
+		if err := f.store.RecordTx(t.Context(), history.CellTx{
+			Generation: newest.Generation, Cell: cell, TxID: newest.TxID,
+			Status: history.StatusFailed, Err: "arcade: REJECTED: MISSING_INPUTS (13)",
+		}); err != nil {
+			t.Fatalf("record rejection at %d: %v", newest.Generation, err)
+		}
+		parent = newest
+		newest = f.build(t, cell, parent, 0)
+	}
+
+	positions := f.derive(t)
+	p := positions[cell]
+	if !p.Halted {
+		t.Fatal("a cell under a cascade of rejections must not advance")
+	}
+	if p.Rejected || p.RejectionTxID != "" {
+		t.Errorf("a cascade was offered for examination: %+v", p)
+	}
+	if p.Tip.TxID != tip.TxID {
+		t.Fatalf("derived tip = %s, want the newest accepted record %s", p.Tip.TxID, tip.TxID)
+	}
+
+	_, decisions, err := Recover(t.Context(), f.ledger, noArcade, f.compiled, f.facts, f.store,
+		positions, true)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(decisions) != 0 {
+		t.Fatalf("recovery considered a cascaded cell: %+v", decisions)
+	}
+	if again := f.derive(t); !again[cell].Halted || again[cell].Tip.TxID != tip.TxID {
+		t.Errorf("cell %d = %+v, want left exactly where it was", cell, again[cell])
+	}
+
+	// And the guard really is the only thing stopping it: offered as though it sat
+	// directly above the tip, this same wreckage resumes.
+	rec, err := chain.RecoverStaleRejection(t.Context(), f.ledger, p.Tip, p.Tip.Generation+1,
+		parent.TxID, "arcade: REJECTED: MISSING_INPUTS (13)")
+	if err != nil {
+		t.Fatalf("RecoverStaleRejection: %v", err)
+	}
+	if rec.Verdict != chain.VerdictResume {
+		t.Fatalf("verdict = %s; this test only means something if a cascade's rejections would "+
+			"otherwise resume: %s", rec.Verdict, rec.Reason)
 	}
 }

@@ -517,6 +517,169 @@ func RecoverSpentTip(ctx context.Context, l Ledger, oracle TxStatus, compiled *c
 	}, nil
 }
 
+// RecoverStaleRejection decides what to do with a cell halted by a rejection
+// that may never have been about this cell's tip at all.
+//
+// # The damage
+//
+// A cell whose tip RecoverSpentTip has just corrected comes back one generation
+// higher than the record used to claim — and the row above the corrected tip is a
+// rejection that was written while the phantom was still believed in. Cell 2 of
+// the live deployment, exactly:
+//
+//	the record's tip was generation 1508
+//	1509 held 03a1cf74, a re-spend of 1508 that arcade refused as UTXO_SPENT
+//	1509 is really held by 3b3d0b5a, which was mined; RecoverSpentTip adopted it
+//	1510 holds 8db21dcb, marked failed — and ITS input[0] is 03a1cf74:0
+//
+// 8db21dcb was built on the phantom's output. That output has never existed, so
+// that transaction could not have been valid whatever the network thought of this
+// cell, and its refusal is a verdict on a parent the cell no longer has. It says
+// nothing whatsoever about 3b3d0b5a.
+//
+// Derivation cannot see that. It sees a `failed` row directly above the tip and
+// halts the cell — "generation 1510 was rejected, so this cell's chain ends at
+// 1509" — which is why roughly 67 cells stayed dead after their tips had already
+// been repaired.
+//
+// # The one question
+//
+// Does the rejected transaction spend THIS tip?
+//
+//	no  — it was built against some other parent, so its refusal is about that
+//	      parent. This tip was never offered to the network in it, and the cell
+//	      resumes and re-creates the generation.
+//	yes — the network was asked to spend this exact output and answered no. That
+//	      is a verdict on this cell's real chain, and it stands.
+//
+// Nothing else is asked. Not whether the rejected transaction carried the right
+// covenant — it is not being adopted, and only its PARENTAGE is evidence. Not
+// what the wallet thinks: see RecoverCell, the wallet holds two actions per
+// generation at exactly these generations, so it cannot say which is which. And
+// deliberately not what arcade's reason SAID. That message is carried in and
+// quoted, because it is what an operator needs in order to decide about a cell
+// this leaves halted, but it decides nothing here: a refusal names a problem with
+// one of the transaction's inputs, and which input that is can only be read from
+// the transaction itself.
+//
+// # Why the burden of proof sits on resuming
+//
+// Resuming a cell whose real transition was refused re-spends the output that
+// transition was built on, which is safe only if our record is right that the
+// network never took it. That record is a BELIEF, not a proof: the `failed` row
+// is written from an arcade status event, and DOUBLE_SPEND_ATTEMPTED is recorded
+// under it too. If the transaction is on the network after all, the rebuild is a
+// second transaction spending a live output — the double spend the whole of this
+// file exists to avoid — and recovery would commit it unattended, for every cell
+// that looked like this at once.
+//
+// Leaving a stale rejection in place merely wastes a cell. It stays halted, an
+// operator sees it in `rule110 recover`, and nothing is spent.
+//
+// So ONLY positive proof that the rejected transaction spent something else
+// justifies resuming, read from its own bytes and checked against the txid the
+// record holds beside the rejection. Every other outcome is a halt: bytes that
+// cannot be fetched, bytes that hash to a different transaction, bytes that do
+// not parse, an input whose outpoint cannot be read, a record with no txid to
+// look up at all.
+//
+// The mirrored error is cheap by comparison. If the tip this is checked against
+// is itself superseded — the tip fix has not run yet, or could not verify its
+// candidate — then resuming re-spends an output that is already spent, and the
+// answer is another UTXO_SPENT rejection naming the transaction that really holds
+// the generation, which is precisely what RecoverSpentTip repairs. One wasted
+// transaction, no coin at risk.
+//
+// # Adjacency, and the cascade
+//
+// rejected must be exactly tip.Generation+1. A rejection further up is a CASCADE:
+// the cell built on a phantom, and every attempt after it spent the previous
+// rejected transaction's output and was refused in turn. Cells 34, 51, 64 and 91
+// carry about 170 of those each over tips near generation 300, and every one of
+// them WOULD pass the test below — they all spend phantoms rather than the tip —
+// so the adjacency check is the whole of what keeps this away from them. Nor
+// would resuming help: the 169 rejections underneath the newest would still halt
+// the cell at the next startup. Untangling that is a human's job, not this one's.
+func RecoverStaleRejection(ctx context.Context, l Ledger, tip CellChain,
+	rejected uint64, rejectedTxID, rejection string) (Recovery, error) {
+
+	cell := tip.Cell
+	if rejected != tip.Generation+1 {
+		return halt(fmt.Sprintf(
+			"cell %d: the rejection under examination is at generation %d but the tip is at generation %d; "+
+				"only a rejection DIRECTLY above the tip describes a single refused transition, and anything "+
+				"further up is a cascade this must not touch",
+			cell, rejected, tip.Generation)), nil
+	}
+	if rejectedTxID == "" {
+		return halt(fmt.Sprintf(
+			"cell %d: generation %d is recorded as rejected (%s) but the record names no transaction, so "+
+				"there is nothing to read and no way to tell what it was built on",
+			cell, rejected, orNoReason(rejection))), nil
+	}
+
+	// The bytes are the evidence, and the hash is what makes them evidence:
+	// neither the wallet nor arcade is authenticated, so an unchecked blob served
+	// under this txid could say anything at all about what it spends.
+	raw, err := l.RawTx(ctx, rejectedTxID)
+	if err != nil {
+		return halt(fmt.Sprintf(
+			"cell %d: generation %d was rejected as %s, but that transaction's bytes could not be read, so "+
+				"what it was built on is unknown: %v", cell, rejected, rejectedTxID, err)), nil
+	}
+	tx, err := parseTip(cell, rejectedTxID, raw)
+	if err != nil {
+		return halt(fmt.Sprintf(
+			"cell %d: the bytes offered for the rejected transaction at generation %d are not that "+
+				"transaction: %v", cell, rejected, err)), nil
+	}
+	if len(tx.Inputs) == 0 {
+		return halt(fmt.Sprintf(
+			"cell %d: the rejected transaction %s at generation %d has no inputs at all, which is not a "+
+				"transaction this program builds; nothing can be concluded from it",
+			cell, rejectedTxID, rejected)), nil
+	}
+
+	// "None of its inputs spends the tip" is a claim about EVERY input, so an
+	// input whose outpoint cannot be read defeats it. Reading such an input as
+	// "not the tip" would turn a transaction we cannot see the parentage of into
+	// permission to spend.
+	//
+	// Bytes that parsed always carry an outpoint on every input — the decoder
+	// reads 32 bytes and an index or fails — so the nil check below cannot fire
+	// today. It is the assumption written down rather than relied on: this
+	// function's answer is only as good as its ability to read every input, and a
+	// future path that builds inputs some other way must halt here rather than
+	// resume by omission.
+	for _, in := range tx.Inputs {
+		if in.SourceTXID == nil {
+			return halt(fmt.Sprintf(
+				"cell %d: the rejected transaction %s at generation %d has an input with no source "+
+					"transaction, so it cannot be shown to have spent anything other than this cell's tip",
+				cell, rejectedTxID, rejected)), nil
+		}
+		if in.SourceTXID.String() == tip.TxID && in.SourceTxOutIndex == tip.Vout {
+			return halt(fmt.Sprintf(
+				"cell %d: generation %d (%s) spends this cell's tip %s:%d and was refused, so the network "+
+					"has answered about this cell's real chain; it ends at generation %d and a human "+
+					"decides. Arcade said: %s",
+				cell, rejected, rejectedTxID, tip.TxID, tip.Vout, tip.Generation,
+				orNoReason(rejection))), nil
+		}
+	}
+
+	return Recovery{
+		Verdict: VerdictResume, Tip: tip,
+		Reason: fmt.Sprintf(
+			"cell %d: generation %d (%s) was rejected, but it does not spend this cell's tip %s:%d — it was "+
+				"built on a parent this cell no longer has, so its refusal says nothing about the tip and the "+
+				"tip was never offered to the network in it. Resuming from generation %d; the cell "+
+				"re-creates generation %d. What was set aside: %s",
+			cell, rejected, rejectedTxID, tip.TxID, tip.Vout, tip.Generation, rejected,
+			orNoReason(rejection)),
+	}, nil
+}
+
 // acceptedByNetwork reports whether arcade's verdict is that the network took
 // this transaction.
 //
@@ -703,3 +866,14 @@ func agreesWithWallet(compiled *cellscript.Compiled, a CellAction, tip CellChain
 
 // halt builds the safe verdict. Every uncertain path in this file ends here.
 func halt(reason string) Recovery { return Recovery{Verdict: VerdictHalt, Reason: reason} }
+
+// orNoReason renders a recorded rejection message for a human. A rejection with
+// no recorded reason is a real state — the reason is fetched from arcade after
+// the fact and the fetch can fail — and it must read as such rather than as an
+// empty pair of quotes.
+func orNoReason(rejection string) string {
+	if rejection == "" {
+		return "no reason was recorded"
+	}
+	return fmt.Sprintf("%q", rejection)
+}

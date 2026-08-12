@@ -163,8 +163,8 @@ func cmdRecover(args []string) error {
 		return err
 	}
 	if len(decisions) == 0 {
-		fmt.Println("no cell has an unresolved transition or a tip spent out from under it; " +
-			"nothing to recover")
+		fmt.Println("no cell has an unresolved transition, a tip spent out from under it, or a " +
+			"rejection directly above its tip; nothing to recover")
 		return nil
 	}
 
