@@ -132,8 +132,25 @@ func (e *Engine) clock(ctx context.Context) {
 }
 
 // runCell advances one cell for as long as the engine is running.
+//
+// The context is checked HERE as well as inside awaitTurn, which looks
+// redundant and is not: awaitTurn returns true the moment a cell's turn is
+// ready, without reaching its select, so a worker whose turn is ready never
+// observes cancellation there at all. It then calls advanceCell, which fails
+// immediately once the store committer has stopped, and comes straight back
+// round to a turn that is still ready.
+//
+// That is an unbounded spin, and it is only unbounded now: persist used to
+// block on the database, which made each turn of the loop slow enough to look
+// like nothing was wrong. Group-committing made the failure instant, and a
+// single shutdown produced 7.3 MILLION log lines from 128 workers racing a
+// cancelled context. Measured, not theorised — it is what the second
+// connection-pool run wrote to stderr while stopping.
 func (e *Engine) runCell(ctx context.Context, cell int) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		if !e.awaitTurn(ctx, cell) {
 			return
 		}

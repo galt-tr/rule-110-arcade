@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"sync"
@@ -141,6 +142,44 @@ func TestConcurrentPersistsShareACommit(t *testing.T) {
 		t.Errorf("%d rows took %d batches; they are not being grouped at all", rows, batches)
 	}
 	t.Logf("%d rows in %d commits (%.1f rows per round trip)", rows, batches, float64(rows)/float64(batches))
+}
+
+// A cancelled context must stop a cell worker, not make it spin.
+//
+// awaitTurn returns true the instant a cell's turn is ready, without reaching
+// the select that observes cancellation — so runCell has to check the context
+// itself. It did not, and while persist blocked on the database each turn of
+// the loop was slow enough to hide it. Group-committing made the failure
+// return instantly and one shutdown wrote 7.3 million log lines.
+//
+// Asserted as a bound on iterations rather than by watching the log, because
+// the log line is not the bug; the loop is.
+func TestACancelledWorkerStopsInsteadOfSpinning(t *testing.T) {
+	e := newTestEngine(t, 4)
+	atGeneration(e, 0)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 1_000_000 // every cell's turn is ready, and stays ready
+	e.mu.Unlock()
+
+	// Cancelled before the worker ever starts: the loop must notice on its own.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	before := e.perf.advanceTotal.Count()
+	done := make(chan struct{})
+	go func() { defer close(done); e.runCell(ctx, 0) }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runCell did not return on a cancelled context")
+	}
+
+	if spins := e.perf.advanceTotal.Count() - before; spins > 1 {
+		t.Errorf("worker attempted %d transitions against a cancelled context, want at most 1", spins)
+	}
 }
 
 // Shutting down must not leave a caller blocked for ever waiting for a reply

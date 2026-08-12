@@ -113,7 +113,12 @@ func (e *Engine) persist(c history.CellTx) bool {
 // caller still gets false and so still does not broadcast, which is the part
 // that matters.
 func (e *Engine) persistAbandoned(c history.CellTx) bool {
-	e.logger.Warn("not recording a cell transaction; the store committer has stopped",
+	// Debug, not Warn. Every cell in flight passes through here on the way out,
+	// so at Warn a clean shutdown ends with a screenful of alarming lines about
+	// an outcome that is completely normal — and if the workers ever spin
+	// against a cancelled context again, a log line per iteration turns that
+	// bug into an I/O storm on top of itself.
+	e.logger.Debug("not recording a cell transaction; the store committer has stopped",
 		"generation", c.Generation, "cell", c.Cell)
 	return false
 }

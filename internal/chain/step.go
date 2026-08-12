@@ -151,7 +151,21 @@ func (c *Chain) AdvanceCell(
 			OutputDescription:  fmt.Sprintf("rule110 cell %d generation %d", cell, nextGen),
 			Basket:             CellBasket,
 			CustomInstructions: string(instructions),
-			Tags:               []string{"rule110", "step"},
+			// NO TAGS. They cost what the shared label cost — see Labels below.
+			//
+			// A tag is recorded exactly as a label is, INSERT ... ON CONFLICT
+			// (user_id, name) DO UPDATE inside the action's transaction, so
+			// "rule110" and "step" were two more rows every one of the 128 cells
+			// had to lock in turn. Removing the shared label alone did not fix
+			// anything, it just handed the queue to these: the tags INSERT went
+			// from 0.058 ms and 0.0% of database time to 1,033 ms and 99.1% of
+			// it, in the very next run, because whichever shared row is taken
+			// first becomes the mutex.
+			//
+			// Nothing reads them. Cells are selected by BASKET (CellBasket, just
+			// above), the per-cell label is what finds a lost transition, and no
+			// query in this program filters an output by tag. They were pure
+			// decoration with a global lock attached.
 		}},
 		// The per-cell label is what makes a lost transition findable again.
 		//
@@ -160,11 +174,32 @@ func (c *Chain) AdvanceCell(
 		// only public way back to it is ListActions, which filters by label and
 		// nothing else. Labelling by cell turns "what did cell 34 actually do?"
 		// into two paginated calls; without it, a lost tip is unrecoverable
-		// through any supported API and the cell is gone for good.
+		// through any supported API and the cell is gone for good. See
+		// Chain.CellActions, which is the only label lookup in the program.
 		//
-		// "step" was replaced rather than added to: it distinguished nothing, so
-		// this costs no extra label rows.
-		Labels: []string{"rule110", CellLabel(cell)},
+		// EXACTLY ONE LABEL, AND IT MUST BE PER CELL. A shared "rule110" label
+		// used to sit alongside it, and it was the single worst line in this
+		// program.
+		//
+		// Storage records a label with INSERT ... ON CONFLICT (user_id, name) DO
+		// UPDATE, inside the transaction that creates the action. An upsert takes
+		// a row lock and holds it until that transaction commits, so a label
+		// shared by every cell is one row that all 128 of them must take in turn
+		// — a global mutex, implemented in PostgreSQL, on the hot path. It does
+		// not look like a lock from anywhere: the query is trivial, the table has
+		// 131 rows, and every plan is an index hit.
+		//
+		// Measured at 1 generation/second, over 90 seconds: that INSERT was
+		// 99.5% of ALL database execution time, averaging 1,338 ms per call
+		// against a median of well under a millisecond for every other statement
+		// in the workload, with 87% of sampled backend time in
+		// Lock:transactionid and ~70 ungranted locks outstanding at any instant.
+		// PostgreSQL was using half a core; the application was using 0.88 of 32.
+		//
+		// So: never label a cell transition with anything two cells share. The
+		// per-cell label costs nothing, because no two cells contend for its row
+		// and one cell has at most one transition in flight.
+		Labels: []string{CellLabel(cell)},
 		Options: &sdk.CreateActionOptions{
 			// The continuation MUST be vout 0: the covenant rebuilds it there.
 			RandomizeOutputs:       &no,
