@@ -48,6 +48,10 @@ func (e *Engine) Run(ctx context.Context) {
 	go e.trackFunds(ctx)
 	go e.watchStatus(ctx)
 	go e.writeStatuses(ctx)
+	// Before any cell worker, because they block on it: a cell cannot broadcast
+	// until its write-ahead record is durable, and nothing makes it durable
+	// until this is running.
+	go e.commitTxs(ctx)
 	go e.PublishTails(ctx, PublishInterval)
 	go e.reconcile(ctx)
 	go e.clock(ctx)
@@ -106,6 +110,7 @@ func (e *Engine) clock(ctx context.Context) {
 			}
 			if e.target-frontier < maxLag {
 				e.target++
+				e.noteTargetRaisedLocked(e.target)
 			}
 			e.mu.Unlock()
 			e.wake()
@@ -178,8 +183,14 @@ func (e *Engine) turnReady(cell int) bool {
 	// once while paused, and pausing simply freezes it, which lets cells that
 	// are behind finish catching up rather than stranding a half-done
 	// generation. The depth gate says how fast the chain will let us, by keeping
-	// this cell's unbroken run of unconfirmed transactions inside the node's
-	// mempool ancestor limit.
+	// this cell's unbroken run of unconfirmed transactions inside whatever
+	// mempool ancestor limit the network enforces.
+	//
+	// It is OFF by default, because the networks this runs against enforce no
+	// such limit and a bound is a rate throttle: depth grows at the generation
+	// rate and drains only when a block lands, so any finite bound caps the
+	// sustained rate at depth/blocktime however fast the code is. See
+	// chain.Config.MaxUnconfirmedDepth.
 	//
 	// A zero limit means unbounded, not "stop". Reading it the other way turns
 	// an unset field into an automaton that silently never advances, which is
@@ -204,10 +215,34 @@ func (e *Engine) turnReady(cell int) bool {
 	return tip < target
 }
 
+// depthPoll is how often a cell re-checks its turn when the depth gate is
+// armed, and it is armed only when an operator sets -max-depth.
+//
+// The gate reopens when a status event raises lastMined, and a status batch
+// notifies only when it changed something a cell DISPLAYS — so a mined status
+// for a generation already shown as mined releases the gate silently, and a
+// worker waiting on Changed alone would sleep through it. Every other input to
+// turnReady does arrive as a notify, which is why this poll runs only while the
+// gate is on: 128 cells waking four times a second is a real cost to carry for
+// a case the default configuration does not have.
+const depthPoll = 250 * time.Millisecond
+
 // awaitTurn blocks until this cell should advance, or until ctx ends (returning
 // false).
 func (e *Engine) awaitTurn(ctx context.Context, cell int) bool {
+	// Read once: the gate is configuration, fixed for the life of the process.
+	gated := e.chain.Config.MaxUnconfirmedDepth > 0
+
 	for {
+		// Subscribe BEFORE testing, not after. Changed() hands out a channel that
+		// notify() replaces, so a state change landing between the test below and
+		// the select would close a channel this worker no longer holds, and the
+		// cell would sleep until something unrelated woke it. The 250 ms poll used
+		// to paper over that; with the poll gone by default it would be a cell
+		// that stops for no visible reason, which is the failure mode this whole
+		// file is written to avoid. Same discipline as PublishTails.
+		changed := e.Changed()
+
 		e.mu.RLock()
 		halted := e.halted[cell]
 		repair := e.needsRepair[cell]
@@ -242,13 +277,16 @@ func (e *Engine) awaitTurn(ctx context.Context, cell int) bool {
 			return true
 		}
 
+		// nil unless the depth gate is armed, and a nil channel never fires.
+		var poll <-chan time.Time
+		if gated {
+			poll = time.After(depthPoll)
+		}
 		select {
 		case <-ctx.Done():
 			return false
-		case <-e.Changed():
-		case <-time.After(250 * time.Millisecond):
-			// The depth gate reopens on a status event rather than a state
-			// change, so do not rely solely on Changed.
+		case <-changed:
+		case <-poll:
 		}
 	}
 }
@@ -273,22 +311,33 @@ func (e *Engine) advanceCell(ctx context.Context, cell int) {
 	// generation back and re-spend an output the network had already consumed.
 	// Observed live: a saturated database halted 70 cells this way, every one of
 	// which had broadcast regardless.
-	if !e.persist(history.CellTx{
+	start := time.Now()
+	persistStart := start
+	ok := e.persist(history.CellTx{
 		Generation: tip.Generation + 1, Cell: cell, Status: history.StatusAttempting,
-	}) {
+	})
+	e.perf.persistAttempting.Observe(time.Since(persistStart))
+	if !ok {
 		return
 	}
 
 	res, err := e.chain.AdvanceCell(ctx, e.compiled, tip, cells, rule)
 	if err != nil {
+		e.perf.failuresTotal.Inc()
 		e.transitionFailed(ctx, tip.Generation+1, cell, err)
 		return
 	}
+	e.perf.observeStep(res.Timings)
 
 	e.doneWaiting(cell)
 	e.clearStarvation()
 	e.ensureGeneration(ctx, res.Generation, res.RowHex)
 	e.recordCell(res.Generation, cell, res, nil)
+
+	// Measured around everything, including the lock waits and the two durable
+	// writes, so the gap between this and the sum of the phases is the cost of
+	// being one of 128 rather than the only one.
+	e.perf.advanceTotal.Observe(time.Since(start))
 }
 
 // transitionFailed decides what a transition that did not complete leaves
@@ -462,6 +511,7 @@ func isFundingShortfall(err error) bool {
 // means the deployment is actually out of coin, and then the whole automaton
 // says so rather than each cell failing separately.
 func (e *Engine) onShortfall(ctx context.Context, cell int) {
+	e.perf.shortfallsTotal.Inc()
 	e.mu.Lock()
 	if e.starvedSince.IsZero() {
 		e.starvedSince = time.Now()
@@ -573,12 +623,14 @@ func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, 
 		return
 	}
 
+	lockStart := time.Now()
 	e.mu.Lock()
+	e.perf.recordLockWait.Observe(time.Since(lockStart))
 	genIdx := indexOfGeneration(e.history, generation)
 	if genIdx >= 0 {
 		e.history[genIdx].Cells[cell] = CellTx{Cell: cell, TxID: res.TxID, State: TxBroadcast}
 	}
-	e.indexTx(res.TxID, generation, cell)
+	e.indexTx(res.TxID, generation, cell, time.Now())
 	e.tips[cell] = chain.CellChain{
 		Cell:       cell,
 		TxID:       res.TxID,
@@ -588,7 +640,13 @@ func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, 
 		RowHex:     res.RowHex,
 		RawTxHex:   res.RawTxHex,
 	}
+	// The frontier moving is what "a generation completed" means: it is the
+	// minimum over unhalted cells, so it passing g says every cell that still
+	// can has proved g. Recorded here because this is the only place it moves
+	// forward under load.
+	wasFrontier := e.generation
 	e.generation = e.frontierLocked()
+	done, completed := e.observeFrontierLocked(wasFrontier, e.generation)
 	e.totalTx++
 	// This cell has moved past whatever it was last refused for, so the refusal
 	// count that would eventually halt it no longer describes anything.
@@ -596,16 +654,22 @@ func (e *Engine) recordCell(generation uint64, cell int, res *chain.StepResult, 
 	e.notify()
 	e.mu.Unlock()
 
+	if completed {
+		e.logGeneration(done)
+	}
+
 	// Persist outside the lock: at 512 transactions a second a synchronous
 	// write inside the critical section would serialise the whole pipeline.
 	//
 	// This row is now the ONLY record of where the cell is — there is no state
 	// file behind it — so persist halts the cell if it cannot be written rather
 	// than logging and carrying on. See Engine.persist.
+	persistStart := time.Now()
 	e.persist(history.CellTx{
 		Generation: generation, Cell: cell,
 		TxID: res.TxID, Status: history.StatusBroadcast,
 	})
+	e.perf.persistBroadcast.Observe(time.Since(persistStart))
 }
 
 // noteFailure shows one cell's failure to whoever is watching, and writes

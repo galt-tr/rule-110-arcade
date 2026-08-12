@@ -186,7 +186,7 @@ func TestMinedStatusReleasesDepth(t *testing.T) {
 
 	e.mu.Lock()
 	e.history[0].Cells[1] = CellTx{Cell: 1, TxID: "cc", State: TxBroadcast}
-	e.indexTx("cc", 7, 1)
+	e.indexTx("cc", 7, 1, time.Now())
 	e.mu.Unlock()
 
 	e.applyStatus("cc", arcade.StatusMined, "")
@@ -372,18 +372,23 @@ func engineOn(t *testing.T, f *fixture) *Engine {
 		lastMined:  map[int]uint64{},
 		// The recovery seams, so a repair can be driven against the fixture's
 		// ledger rather than a wallet. See Engine.ledger.
-		ledger:        f.ledger,
-		oracle:        noArcade,
-		retries:       map[int]retryState{},
-		needsRepair:   map[int]bool{},
-		waitingOnCoin: map[int]bool{},
-		statusWrites:  make(chan history.StatusUpdate, statusWriteQueue),
-		owner:         "test",
-		leader:        true,
+		ledger:         f.ledger,
+		oracle:         noArcade,
+		retries:        map[int]retryState{},
+		needsRepair:    map[int]bool{},
+		waitingOnCoin:  map[int]bool{},
+		statusWrites:   make(chan history.StatusUpdate, statusWriteQueue),
+		persistQueue:   make(chan persistRequest, persistQueueSize),
+		persistStopped: make(chan struct{}),
+		owner:          "test",
+		leader:         true,
+		perf:           newPerf(),
+		raisedAt:       map[uint64]time.Time{},
 	}
 	for cell := range f.facts.Cells {
 		e.tips[cell] = f.genesisTip(cell)
 	}
+	startCommitter(t, e)
 	return e
 }
 

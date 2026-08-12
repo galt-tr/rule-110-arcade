@@ -101,13 +101,25 @@ type Store struct {
 // application held 179 idle connections of the server's 200, leaving about
 // twenty. An application that assumes it may open as many connections as it has
 // goroutines is wrong even when it happens to fit.
+// It is the DEFAULT rather than the limit, because the reasoning above is about
+// one particular server: a shared one with a co-tenant holding 179 of its 200
+// slots. A deployment with its own database has no reason to queue behind
+// sixteen, and finding that out used to mean editing this constant and
+// rebuilding. See Open's conns argument and -history-db-conns.
 const maxOpenConns = 16
 
 // Open connects to the history store, creating its schema on first use.
 //
 // dsn selects PostgreSQL; empty falls back to a SQLite file beside the wallet,
 // so a small deployment needs no extra service.
-func Open(ctx context.Context, dsn, dataDir string) (*Store, error) {
+//
+// conns bounds the connection pool; 0 takes maxOpenConns. Sizing it is a
+// judgement about the SERVER, not about this application — read maxOpenConns
+// before raising it, and count the wallet's own pool against the same limit.
+func Open(ctx context.Context, dsn, dataDir string, conns int) (*Store, error) {
+	if conns <= 0 {
+		conns = maxOpenConns
+	}
 	driver, target, postgres := "sqlite", filepath.Join(dataDir, "history.db"), false
 	if dsn != "" {
 		driver, target, postgres = "pgx", dsn, true
@@ -117,10 +129,10 @@ func Open(ctx context.Context, dsn, dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("history: open %s: %w", driver, err)
 	}
-	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxOpenConns(conns)
 	// Idle connections are kept to match, so a burst does not pay reconnection
 	// cost on every generation; SQLite ignores the distinction.
-	db.SetMaxIdleConns(maxOpenConns)
+	db.SetMaxIdleConns(conns)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
@@ -219,6 +231,106 @@ func (s *Store) RecordGeneration(ctx context.Context, number uint64, rowHex stri
 		return fmt.Errorf("history: record generation %d: %w", number, err)
 	}
 	return nil
+}
+
+// RecordTxBatch stores several cells' transactions in one round trip.
+//
+// This is RecordTx's reason for existing at scale. A generation writes two rows
+// per cell — the write-ahead record before anything is built, and the broadcast
+// record after — so 128 cells cost 256 individual round trips, every one of them
+// with a cell worker blocked on it. Batched, a generation costs a handful.
+//
+// # Duplicates
+//
+// Rows are deduplicated by (generation, cell), keeping the LAST, and that is not
+// tidiness. PostgreSQL refuses an INSERT ... ON CONFLICT DO UPDATE whose own
+// VALUES list touches one row twice ("cannot affect row a second time"), so a
+// duplicate would fail the whole batch — taking every unrelated cell in it down,
+// and halting each one, because a cell whose record cannot be written must not
+// advance. Callers cannot currently produce a duplicate, since a cell blocks on
+// each write before making the next; this is defence against that stopping being
+// true quietly.
+func (s *Store) RecordTxBatch(ctx context.Context, txs []CellTx) error {
+	if len(txs) == 0 {
+		return nil
+	}
+	deduped := dedupeCellTxs(txs)
+	if len(deduped) == 1 {
+		return s.RecordTx(ctx, deduped[0])
+	}
+	if !s.postgres {
+		// SQLite has no multi-row upsert worth the string building, and one
+		// transaction already collapses the fsyncs, which is the cost that
+		// matters here.
+		return s.recordTxBatchTx(ctx, deduped)
+	}
+
+	now := time.Now().UTC()
+	var b strings.Builder
+	b.WriteString(`INSERT INTO cell_txs (generation, cell, txid, status, err, updated_at) VALUES `)
+	args := make([]any, 0, len(deduped)*6)
+	for i, tx := range deduped {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(?, ?, ?, ?, ?, ?)")
+		args = append(args, tx.Generation, tx.Cell, tx.TxID, string(tx.Status), tx.Err, now)
+	}
+	b.WriteString(` ON CONFLICT (generation, cell) DO UPDATE
+	        SET txid = EXCLUDED.txid, status = EXCLUDED.status,
+	            err = EXCLUDED.err, updated_at = EXCLUDED.updated_at`)
+
+	if _, err := s.db.ExecContext(ctx, s.rebind(b.String()), args...); err != nil {
+		return fmt.Errorf("history: record %d cell transactions: %w", len(deduped), err)
+	}
+	return nil
+}
+
+// recordTxBatchTx is the SQLite path: one transaction, one statement per row.
+func (s *Store) recordTxBatchTx(ctx context.Context, txs []CellTx) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("history: begin cell transaction batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	q := s.rebind(`INSERT INTO cell_txs (generation, cell, txid, status, err, updated_at)
+	      VALUES (?, ?, ?, ?, ?, ?)
+	      ON CONFLICT (generation, cell) DO UPDATE
+	        SET txid = EXCLUDED.txid, status = EXCLUDED.status,
+	            err = EXCLUDED.err, updated_at = EXCLUDED.updated_at`)
+	now := time.Now().UTC()
+	for _, c := range txs {
+		if _, err := tx.ExecContext(ctx, q,
+			c.Generation, c.Cell, c.TxID, string(c.Status), c.Err, now); err != nil {
+			return fmt.Errorf("history: record cell %d generation %d: %w", c.Cell, c.Generation, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("history: commit cell transaction batch: %w", err)
+	}
+	return nil
+}
+
+// dedupeCellTxs keeps the last row per (generation, cell), preserving the order
+// of first appearance.
+func dedupeCellTxs(txs []CellTx) []CellTx {
+	type key struct {
+		generation uint64
+		cell       int
+	}
+	at := make(map[key]int, len(txs))
+	out := make([]CellTx, 0, len(txs))
+	for _, c := range txs {
+		k := key{c.Generation, c.Cell}
+		if i, seen := at[k]; seen {
+			out[i] = c
+			continue
+		}
+		at[k] = len(out)
+		out = append(out, c)
+	}
+	return out
 }
 
 // RecordTx stores a cell's transaction, replacing any previous row for that

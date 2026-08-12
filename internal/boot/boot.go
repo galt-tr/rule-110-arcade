@@ -32,6 +32,7 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
 	"github.com/dymurray/rule-110-arcade/internal/engine"
+	"github.com/dymurray/rule-110-arcade/internal/metrics"
 )
 
 // Phase is how far the cold start has got.
@@ -112,6 +113,9 @@ type Boot struct {
 	lastErr string
 	target  *chain.FundingTarget
 
+	// idle is the registry served before an engine exists. See Boot.Metrics.
+	idle *metrics.Registry
+
 	// engine is installed by Adopt; every Automaton method forwards to it once
 	// it is non-nil.
 	engine atomic.Pointer[engineRef]
@@ -130,6 +134,7 @@ type Automaton interface {
 	Snapshot() engine.Snapshot
 	SnapshotTail() engine.Snapshot
 	Stats() engine.Snapshot
+	Metrics() *metrics.Registry
 	PublishedTail() (*[]byte, bool)
 	Changed() <-chan struct{}
 
@@ -153,6 +158,7 @@ func New(w Wallet, compiled *cellscript.Compiled, opts Options, logger *slog.Log
 		logger:   logger,
 		phase:    PhaseFunding,
 		changed:  make(chan struct{}),
+		idle:     metrics.NewRegistry(),
 	}
 	if t, err := w.FundingTarget(); err == nil {
 		b.target = t
@@ -318,6 +324,21 @@ func (b *Boot) PublishedTail() (*[]byte, bool) {
 		return nil, false
 	}
 	return p, true
+}
+
+// Metrics is the engine's latency registry once there is an engine, and an
+// empty one before that.
+//
+// Empty rather than nil: /metrics is scraped from the moment the process
+// answers, which during a cold start is long before any engine exists, and a
+// nil registry would make the endpoint panic exactly when someone is watching
+// to see whether the bootstrap is progressing. It reports no samples, which is
+// the truth — nothing has been measured yet.
+func (b *Boot) Metrics() *metrics.Registry {
+	if a := b.adopted(); a != nil {
+		return a.Metrics()
+	}
+	return b.idle
 }
 
 func (b *Boot) Changed() <-chan struct{} {

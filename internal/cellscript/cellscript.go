@@ -62,6 +62,28 @@ type Compiled struct {
 	// BIP-143 scriptCode for step.
 	codeSepOffset int
 
+	// codePart and codePartHex are each cell's locking script with the state
+	// stripped, built once at Compile and never rebuilt.
+	//
+	// This is the cache that makes a transition cheap. A cell locking script is
+	// exactly codePart(cell) || OP_RETURN || serialized row, and the code part
+	// depends only on the cell index and the ring size — the constructor
+	// arguments that vary with the row all end up in the state suffix. So a
+	// generation's worth of script construction is the same 128 code parts
+	// concatenated with a new tail, and rebuilding them through the Rúnar
+	// contract every time was the single largest avoidable cost on the path:
+	// AdvanceCell alone provoked five constructions per cell per generation,
+	// each assembling ~2.6 kB as a hex string.
+	//
+	// The invariant is asserted, not assumed. TestCachedScriptsMatchTheContract
+	// rebuilds every cell's script the long way and compares byte for byte, and
+	// TestCodePartIsStableAcrossGenerations pins the property this rests on.
+	//
+	// nil until Compile fills it, because Compile itself needs a locking script
+	// to resolve codeSepOffset before there is a cache to serve one.
+	codePart    [][]byte
+	codePartHex []string
+
 	// bindings maps a code part back to the cell it binds, for Decode. Built on
 	// first use rather than at Compile: every subcommand compiles the contract
 	// and only the auditor decodes, so the N locking scripts this costs should
@@ -104,7 +126,50 @@ func Compile(cells int, rule ca.Rule) (*Compiled, error) {
 	}
 	c.codeSepOffset = off
 
+	if err := c.buildCodeParts(); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// buildCodeParts constructs every cell's code part once.
+//
+// Eagerly rather than on first use, and without a lock. Cells advance on 128
+// goroutines at once, so a lazily-filled cache would need synchronising on the
+// hottest path in the program to save work at startup that costs one
+// generation's worth of construction — done once, before anything is serving.
+// Filled here, the slices are immutable for the life of the Compiled and need
+// no coordination at all.
+func (c *Compiled) buildCodeParts() error {
+	row := mustRow(c.cells)
+	c.codePart = make([][]byte, c.cells)
+	c.codePartHex = make([]string, c.cells)
+	for i := range c.cells {
+		hexPart, err := c.buildCodePartHex(i, row)
+		if err != nil {
+			return err
+		}
+		raw, err := hex.DecodeString(hexPart)
+		if err != nil {
+			return fmt.Errorf("cellscript: decode code part for cell %d: %w", i, err)
+		}
+		c.codePart[i], c.codePartHex[i] = raw, hexPart
+	}
+	return nil
+}
+
+// buildCodePartHex constructs one cell's code part the long way, through the
+// contract. The only caller is buildCodeParts.
+func (c *Compiled) buildCodePartHex(i int, row ca.Row) (string, error) {
+	lockHex, err := c.constructLockingScriptHex(i, row)
+	if err != nil {
+		return "", err
+	}
+	suffix := c.stateSuffixHex(row)
+	if !strings.HasSuffix(lockHex, suffix) {
+		return "", fmt.Errorf("cellscript: cell %d locking script does not end with OP_RETURN|state", i)
+	}
+	return lockHex[:len(lockHex)-len(suffix)], nil
 }
 
 // Cells returns the ring size.
@@ -138,11 +203,10 @@ func (c *Compiled) ctorArgs(i int, row ca.Row) ([]interface{}, error) {
 
 // LockingScript returns the locking script for cell i carrying row.
 func (c *Compiled) LockingScript(i int, row ca.Row) ([]byte, error) {
-	args, err := c.ctorArgs(i, row)
+	h, err := c.lockingScriptHex(i, row)
 	if err != nil {
 		return nil, err
 	}
-	h := runar.NewRunarContract(c.artifact, args).GetLockingScript()
 	b, err := hex.DecodeString(h)
 	if err != nil {
 		return nil, fmt.Errorf("cellscript: decode locking script for cell %d: %w", i, err)
@@ -154,20 +218,20 @@ func (c *Compiled) LockingScript(i int, row ca.Row) ([]byte, error) {
 // before the OP_RETURN that introduces the serialized state. It is constant
 // across generations for a given cell, and is pushed as the contract's
 // _codePart argument so the covenant can rebuild its own continuation output.
+// The row is validated but otherwise unused: the code part does not depend on
+// it. It stays in the signature because a caller asking for "cell i's code part
+// at this row" and being handed one built for a DIFFERENT ring size would get a
+// script that cannot be spent, and the check is what rules that out.
 func (c *Compiled) CodePart(i int, row ca.Row) ([]byte, error) {
-	lockHex, err := c.lockingScriptHex(i, row)
-	if err != nil {
+	if _, err := c.ctorArgs(i, row); err != nil {
 		return nil, err
 	}
-	suffix := c.stateSuffixHex(row)
-	if !strings.HasSuffix(lockHex, suffix) {
-		return nil, fmt.Errorf("cellscript: cell %d locking script does not end with OP_RETURN|state", i)
+	if c.codePart == nil {
+		return nil, fmt.Errorf("cellscript: code parts are not built for cell %d", i)
 	}
-	b, err := hex.DecodeString(lockHex[:len(lockHex)-len(suffix)])
-	if err != nil {
-		return nil, fmt.Errorf("cellscript: decode code part for cell %d: %w", i, err)
-	}
-	return b, nil
+	// A copy, because the cache is shared by 128 goroutines and a caller that
+	// appended to what it was handed would corrupt every later script.
+	return bytes.Clone(c.codePart[i]), nil
 }
 
 // stateSuffixHex is the tail every cell locking script ends with: the OP_RETURN
@@ -181,7 +245,28 @@ func (c *Compiled) stateSuffixHex(row ca.Row) string {
 	return opReturn + runar.SerializeState(c.artifact.StateFields, map[string]interface{}{"row": row.Hex()})
 }
 
+// lockingScriptHex is a cell's locking script as hex, from the cache when there
+// is one.
+//
+// The cached path is a string concatenation where the uncached one assembles the
+// whole contract, and the two are required to agree byte for byte — see
+// Compiled.codePart, and TestCachedScriptsMatchTheContract, which is what
+// establishes it rather than assuming it.
 func (c *Compiled) lockingScriptHex(i int, row ca.Row) (string, error) {
+	if _, err := c.ctorArgs(i, row); err != nil {
+		return "", err
+	}
+	if c.codePart == nil {
+		// Only before the cache is built: Compile needs a locking script to
+		// resolve codeSepOffset, which happens first.
+		return c.constructLockingScriptHex(i, row)
+	}
+	return c.codePartHex[i] + c.stateSuffixHex(row), nil
+}
+
+// constructLockingScriptHex builds a locking script through the Rúnar contract.
+// It is what the cache holds the result of.
+func (c *Compiled) constructLockingScriptHex(i int, row ca.Row) (string, error) {
 	args, err := c.ctorArgs(i, row)
 	if err != nil {
 		return "", err

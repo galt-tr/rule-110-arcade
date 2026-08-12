@@ -8,11 +8,13 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -262,6 +264,20 @@ type Options struct {
 	// A zero Rate means the default of one generation per second.
 	Rate  float64
 	Start bool
+
+	// PerfLog writes one line per completed generation with the current phase
+	// quantiles, at most once a second. Nil is off, which is the default.
+	//
+	// Its own logger rather than a bool, because the process logger runs at Warn
+	// and the obvious way to make this line visible — lowering that level —
+	// turns on the toolbox's info logging too, which at several hundred
+	// transactions a second is a second workload rather than an aid to
+	// measuring the first.
+	//
+	// Off by default and worth keeping that way: the numbers are all on
+	// /metrics, which is where a long run should be read from. This is for
+	// watching a short experiment in a terminal without standing up a scraper.
+	PerfLog *slog.Logger
 }
 
 // startMode is the clock's initial state.
@@ -419,9 +435,33 @@ type Engine struct {
 	// stalls the SSE reader for the whole process. Drained by writeStatuses.
 	statusWrites chan history.StatusUpdate
 
+	// persistQueue carries durable cell writes to the single committer, and
+	// persistStopped is closed when that committer exits so a caller can tell
+	// "shutting down" from "the write failed".
+	//
+	// Unlike statusWrites, every sender here is BLOCKED on the result: this is a
+	// group commit, not a hand-off. See Engine.persist.
+	persistQueue   chan persistRequest
+	persistStopped chan struct{}
+
 	// published is the most recent tail snapshot, already marshalled. See
 	// PublishTail.
 	published atomic.Pointer[[]byte]
+
+	// perf holds every latency instrument. Its own instruments are atomic, so
+	// only raisedAt below needs the engine lock.
+	perf *perf
+
+	// raisedAt[g] is when generation g was first asked for, which is where the
+	// generation-duration histogram measures from. Guarded by mu; entries are
+	// deleted as the frontier passes them. See noteTargetRaisedLocked.
+	raisedAt map[uint64]time.Time
+
+	// perfLogMu paces the per-generation log line. Its own lock rather than mu,
+	// because it is taken after the engine lock is released and adding a second
+	// reason to hold mu on this path would defeat the point of measuring it.
+	perfLogMu   sync.Mutex
+	lastPerfLog time.Time
 }
 
 // PublishedTail returns the most recently published tail snapshot as JSON, and
@@ -512,28 +552,32 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		return nil, err
 	}
 	e := &Engine{
-		chain:         c,
-		ledger:        c,
-		oracle:        c.Oracle,
-		compiled:      compiled,
-		logger:        logger,
-		opts:          opts,
-		deployment:    d,
-		tips:          make([]chain.CellChain, d.Cells),
-		mode:          startMode(opts),
-		rate:          startRate(opts),
-		lastMined:     make(map[int]uint64, d.Cells),
-		lastSeen:      make(map[int]uint64, d.Cells),
-		changed:       make(chan struct{}),
-		txIndex:       make(map[string]txLoc),
-		halted:        make(map[int]bool),
-		haltReason:    make(map[int]string),
-		waitingOnCoin: make(map[int]bool),
-		needsRepair:   make(map[int]bool),
-		retries:       make(map[int]retryState),
-		statusWrites:  make(chan history.StatusUpdate, statusWriteQueue),
-		store:         store,
-		owner:         InstanceOwner(),
+		chain:          c,
+		ledger:         c,
+		oracle:         c.Oracle,
+		compiled:       compiled,
+		logger:         logger,
+		opts:           opts,
+		deployment:     d,
+		tips:           make([]chain.CellChain, d.Cells),
+		mode:           startMode(opts),
+		rate:           startRate(opts),
+		lastMined:      make(map[int]uint64, d.Cells),
+		lastSeen:       make(map[int]uint64, d.Cells),
+		changed:        make(chan struct{}),
+		txIndex:        make(map[string]txLoc),
+		halted:         make(map[int]bool),
+		haltReason:     make(map[int]string),
+		waitingOnCoin:  make(map[int]bool),
+		needsRepair:    make(map[int]bool),
+		retries:        make(map[int]retryState),
+		statusWrites:   make(chan history.StatusUpdate, statusWriteQueue),
+		persistQueue:   make(chan persistRequest, persistQueueSize),
+		persistStopped: make(chan struct{}),
+		store:          store,
+		owner:          InstanceOwner(),
+		perf:           newPerf(),
+		raisedAt:       make(map[uint64]time.Time),
 		// Nothing may advance until the tips have been re-derived while this
 		// instance actually holds the writer lease. They are derived here too,
 		// so the UI has something true to show immediately, but between here and
@@ -580,7 +624,9 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 	// the HTTP server comes up.
 	for _, c := range unsettled {
 		if c.TxID != "" {
-			e.indexTx(c.TxID, c.Generation, c.Cell)
+			// Zero time: broadcast by an earlier process, so the status lag for
+			// these is unknowable and deliberately not measured.
+			e.indexTx(c.TxID, c.Generation, c.Cell, time.Time{})
 		}
 	}
 
@@ -655,14 +701,15 @@ func seedGenesisRecord(ctx context.Context, store *history.Store, d *chain.Deplo
 	if err := store.RecordGeneration(ctx, 0, seed.Hex()); err != nil {
 		return err
 	}
+	// One statement rather than one per cell. This runs before the HTTP server
+	// comes up, so its cost is startup latency an operator waits through.
+	rows := make([]history.CellTx, d.Cells)
 	for cell := range d.Cells {
-		if err := store.RecordTx(ctx, history.CellTx{
+		rows[cell] = history.CellTx{
 			Generation: 0, Cell: cell, TxID: d.GenesisTxID, Status: history.StatusSeen,
-		}); err != nil {
-			return err
 		}
 	}
-	return nil
+	return store.RecordTxBatch(ctx, rows)
 }
 
 // loadHistory restores the recorded history: real rows with the real
@@ -839,15 +886,49 @@ func (e *Engine) SetMode(m Mode) {
 // SetRate and the Options path so there is one answer to what a rate may be.
 func clampRate(r float64) float64 { return min(max(r, 0.05), 20) }
 
+// arcadeEventBudget is roughly how many status events a second arcade's SSE
+// fan-out has been measured to sustain, and fullStatusMultiplier is how many
+// events a transaction produces when every transition is subscribed to rather
+// than only the terminal one.
+//
+// Both are observations of a particular deployment rather than anything arcade
+// promises, which is why exceeding them warns instead of clamping. A number
+// this soft has no business silently overriding what an operator asked for.
+const (
+	arcadeEventBudget    = 1500
+	fullStatusMultiplier = 4
+	terminalStatusPerTx  = 1
+)
+
 // SetRate sets generations per second, clamped to something a chain can serve.
 func (e *Engine) SetRate(r float64) {
 	if e.opts.LockControls {
 		return
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.rate = clampRate(r)
+	rate := clampRate(r)
+	e.rate = rate
+	cells := e.deployment.Cells
+	full := e.chain.Config.FullStatusUpdates
 	e.notify()
+	e.mu.Unlock()
+
+	// Warn about the event budget rather than the transaction rate, because the
+	// two fail differently and only this one is invisible. Outrunning the chain
+	// shows up as lag, which the UI already reports; outrunning arcade's SSE
+	// fan-out makes it drop events for a slow client, and a dropped event is a
+	// status that never arrives — the diagram simply stops being true, with
+	// nothing anywhere saying so until the reconciler catches it 90 seconds
+	// later.
+	perTx := terminalStatusPerTx
+	if full {
+		perTx = fullStatusMultiplier
+	}
+	if events := rate * float64(cells*perTx); events > arcadeEventBudget && full {
+		e.logger.Warn("rate exceeds the measured arcade event budget; statuses will lag or be dropped",
+			"rate", rate, "events_per_second", int(events), "budget", arcadeEventBudget,
+			"remedy", "restart with -full-status=false, which drops this to one event per transaction")
+	}
 }
 
 // Step asks every cell to advance exactly one generation.
@@ -865,21 +946,31 @@ func (e *Engine) Step() {
 	} else {
 		e.target++
 	}
+	e.noteTargetRaisedLocked(e.target)
 	e.notify()
 }
 
-// indexOfGeneration finds a generation by number, or -1. It scans from the end
-// because the only caller is looking for the newest generation.
+// indexOfGeneration finds a generation by number, or -1.
+//
+// A binary search rather than the backward scan this used to be. The scan was
+// written for the caller that looks for the NEWEST generation, where it stops
+// after one comparison — but applyStatusBatch calls this once per status record
+// while holding the write lock, and a status for an old generation walks the
+// whole window. With up to maxHistory entries and every late or re-delivered
+// status paying for it, that put an unbounded scan in the hottest critical
+// section in the program to save nothing at all: log2(2048) is eleven
+// comparisons, and the newest-generation case is only one of them slower.
+//
+// The slice is kept ascending by ensureGeneration, and may have gaps where a
+// generation was never created; BinarySearchFunc handles both.
 func indexOfGeneration(gens []Generation, number uint64) int {
-	for i := len(gens) - 1; i >= 0; i-- {
-		if gens[i].Number == number {
-			return i
-		}
-		if gens[i].Number < number {
-			break // ordered by number: no earlier entry can match
-		}
+	i, found := slices.BinarySearchFunc(gens, number, func(g Generation, n uint64) int {
+		return cmp.Compare(g.Number, n)
+	})
+	if !found {
+		return -1
 	}
-	return -1
+	return i
 }
 
 // trackFunds refreshes the reported balance periodically.
@@ -914,60 +1005,20 @@ func (e *Engine) trackFunds(ctx context.Context) {
 	}
 }
 
-// persistRetries is how many times a durable write is attempted before the cell
-// is halted, and persistBackoff the pause between attempts.
-//
-// Short and few. This runs on the hot path with a cell's worker blocked on it,
-// and the failures worth riding out here are the momentary ones — a connection
-// recycled, a lock contended. Anything longer-lived is not going to clear inside
-// a retry loop, and the correct response to it is to stop the cell rather than
-// to keep advancing while its record goes unwritten.
+// persistRetries is how many times a durable write is attempted before the
+// cells in it are halted, persistBackoff the pause between attempts, and
+// persistTimeout the bound on one attempt. See commitBatch.
 const (
 	persistRetries = 3
 	persistBackoff = 50 * time.Millisecond
-)
 
-// persist writes a cell transaction to the durable store, retrying briefly and
-// halting the cell if it still cannot be written.
-//
-// This used to log and swallow, on the reasoning that losing a history row must
-// not stop the automaton. That reasoning is backwards now, and it was always
-// wrong for one of the two rows written here:
-//
-//   - the write-ahead `attempting` record is the ONLY thing that says a
-//     transition might have been broadcast. Losing it means the next startup
-//     sees a healthy cell and re-spends an output that may already be gone;
-//   - the `broadcast` record is now the only record of where the cell IS. Losing
-//     it means the next startup derives the tip one generation back and spends
-//     an output the network has already consumed.
-//
-// Both are the double spend this whole rework exists to prevent, arrived at by a
-// different route. So a cell whose record cannot be written stops advancing —
-// visibly, with the error attached — rather than running on with no record of
-// what it did.
-// It reports whether the row was written, and a caller that is about to
-// broadcast MUST check that. Halting a cell stops its NEXT turn; it does not
-// unwind the call already in flight. Returning nothing here meant a cell whose
-// write-ahead record failed was marked halted and then went on to broadcast
-// anyway — the exact double spend the record exists to prevent, since nothing
-// durable would say the transition had ever been attempted.
-func (e *Engine) persist(c history.CellTx) bool {
-	var err error
-	for attempt := 1; attempt <= persistRetries; attempt++ {
-		if err = e.store.RecordTx(context.Background(), c); err == nil {
-			return true
-		}
-		e.logger.Warn("persist cell transaction failed; retrying",
-			"generation", c.Generation, "cell", c.Cell, "attempt", attempt, "err", err)
-		time.Sleep(persistBackoff)
-	}
-	e.logger.Error("persist cell transaction; halting the cell",
-		"generation", c.Generation, "cell", c.Cell, "err", err)
-	e.haltCell(c.Cell, fmt.Sprintf(
-		"generation %d could not be recorded (%v), so this cell's position is no longer durable and "+
-			"advancing it would risk re-spending a spent output", c.Generation, err))
-	return false
-}
+	// persistTimeout replaces the context.Background() this used to run under.
+	// A store that accepts the connection and then never answers would
+	// otherwise block a cell worker for ever, holding a slot in the batch and
+	// never halting the cell that is stuck — the one failure this whole path is
+	// built to make visible.
+	persistTimeout = 15 * time.Second
+)
 
 // haltCell stops one cell and says why, once.
 func (e *Engine) haltCell(cell int, reason string) {

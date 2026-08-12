@@ -59,7 +59,7 @@ func openDeployment(ctx context.Context, cfg chain.Config, tool string, logger *
 		closeAll()
 		return nil, err
 	}
-	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir)
+	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir, cfg.HistoryDBConns)
 	if err != nil {
 		closeAll()
 		return nil, err

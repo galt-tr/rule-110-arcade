@@ -341,8 +341,8 @@ Flags accepted by every subcommand, beyond those five:
 |---|---|---|
 | `-originator` | `rule110.arcade.local` | BRC-100 originator; must be FQDN-shaped. |
 | `-cell-sats` | `1` | Value each cell UTXO carries. Constant across generations — fees come from the fuel pool, not from the cells. |
-| `-concurrency` | `32` | How many cells advance at once. Unbounded fan-out makes SQLite worse, not better. |
-| `-max-db-conns` | `72` | Storage pool size. Pair with worker count. |
+| `-max-db-conns` | `72` | Wallet storage pool size — **one** pool, shared by the metastore and the utxostore. Pair with worker count. |
+| `-history-db-conns` | `0` (16) | History store pool size, which is a *separate* pool against the same server. Budget it and `-max-db-conns` together against `max_connections`: exceeding that does not slow the automaton down, it halts cells, because a cell whose write-ahead record cannot be written must not advance. |
 | `-apply-concurrency` | `32` | Monitor workers applying arcade status batches. The toolbox default of 8 is documented as too low: when appliers cannot drain the hand-off queue, the SSE reader blocks and arcade drops events, and transactions end up with no status at all. |
 | `-full-status` | `true` | Subscribe to every status transition rather than terminal ones. ~4× the events; turn off above ~3 gen/s. |
 | `-chronicle` | `true` | Chronicle-era script rules for local pre-broadcast verification. Required — the covenant contains `OP_2MUL`. |
@@ -350,7 +350,7 @@ Flags accepted by every subcommand, beyond those five:
 | `-throughput` | `true` | Fund from the denominated fuel pool instead of contending for change. |
 | `-fuel-sats` | `1000` | Value of one fuel coin. Must clear one transition's fee plus the dust floor. |
 | `-fuel-pool` | `20000` | Coins the keeper maintains. |
-| `-max-depth` | `200` | How far a cell may run ahead of its newest mined transaction; 0 is unbounded. A deliberate margin, not a proven boundary — see below. |
+| `-max-depth` | `0` | How far a cell may run ahead of its newest mined transaction; 0 is unbounded, which is the default because no ancestor limit was found and any bound throttles the rate — see below. |
 | `-max-lag` | `32` | How far the clock may run ahead of the slowest cell. |
 
 Per-subcommand flags:
@@ -362,7 +362,7 @@ Per-subcommand flags:
 | `fuel` | `-count`, `-sats` |
 | `genesis` | `-cells`, `-rule`, `-seed` |
 | `step` | `-cell` |
-| `run` | `-addr`, `-rate`, `-start` |
+| `run` | `-addr`, `-rate`, `-start`, `-auto-recover`, `-pprof`, `-perf-log` |
 | `depth-probe` | `-cell`, `-max` |
 
 `Config.MinBroadcastFeeRate` (default 100) has no flag. It is the floor a
@@ -457,6 +457,44 @@ cells queueing for one coin (`rule110_waiting_on_coin`), and a frontier that
 would not move turned out to be the depth governor working
 (`rule110_unconfirmed_depth`).
 
+Alongside the gauges are latency histograms (`internal/metrics`), which answer
+a different question: not where the automaton is, but how long it took to get
+there and which phase spent the time. `rule110_generation_seconds` is the one
+being raced — the clock raising a generation to the last cell reaching it — and
+`rule110_generations_completed_total` gives the *achieved* rate, as opposed to
+`rule110_rate_generations_per_second`, which is only the setting. Under those,
+one histogram per phase of a transition: `build_scripts`, `create_action`,
+`verify`, `sign_action` (the only one containing the arcade round trip),
+`persist_attempting`, `persist_broadcast`, `record_lock_wait`, and
+`advance_cell_seconds` around the lot. What the phases do not account for is
+lock contention and scheduling, which is why the total is measured separately
+rather than summed. `rule110_status_lag_seconds` and `rule110_mined_lag_seconds`
+measure the other direction: broadcast to the network's first acknowledgement,
+and broadcast to a block.
+
+`rule110 run -perf-log` prints the same quantiles as one line per completed
+generation, at most once a second, for watching a short experiment without
+standing up a scraper.
+
+`rule110_persist_rows_total` divided by `rule110_persist_batches_total` is worth
+watching on its own: the durable cell writes are group-committed, so that ratio
+is how many cells one database round trip served. A generation writes two rows
+per cell — the write-ahead record before anything is built and the broadcast
+record after — which used to be 256 individual round trips with a cell worker
+blocked on every one. The commit is still synchronous, and `persist` still
+returns only once the row is durable; what is shared is the round trip, not the
+guarantee. If that ratio sits near 1, cells are arriving one at a time and
+something upstream is serialising them.
+
+For anything the histograms cannot resolve, `-pprof <addr>` serves
+`net/http/pprof` **on its own listener** — not the UI's, which is already
+unauthenticated — and turns on mutex and block profiling with it. That last part
+is the point: the contention worth finding here is on one global lock and on a
+notification that wakes 128 workers at once, and neither appears in a CPU
+profile, because a goroutine waiting on a mutex is not on CPU. Build with
+`--target debug` (see the Dockerfile) or the profile will report addresses
+instead of function names.
+
 ---
 
 ## What was measured
@@ -470,10 +508,13 @@ ancestors with zero rejections. That is consistent with arcade enforcing no
 ancestor limit — its `LimitAncestorCount` is a dead value with no setter — and
 with teranode's documentation saying ancestor tracking is not enforced. The
 cascade recorded in the toolbox's own benchmarks may well have had another
-cause. `-max-depth` is kept at 200 as a deliberate margin, not a proven
-boundary: other networks may differ, and the bound also caps the in-flight set
-the status pipeline has to carry. **Measure it on the network you are actually
-running against.**
+cause. **`-max-depth` is therefore off by default**, having been kept at 200 for
+a while as a margin under a limit nobody could demonstrate. That margin was not
+free: depth grows at the generation rate and drains only when a block lands, so
+any finite bound caps the sustained rate at roughly `depth / block interval` per
+cell, however fast the code is. The gate is still there for a network that does
+enforce an ancestor limit — **measure it on the network you are actually running
+against** before arming it.
 
 **Fuel-pool funding took the application from 4 to 267 transactions per
 second.** The 4 was not a slow network. It was 128 cells contending for the

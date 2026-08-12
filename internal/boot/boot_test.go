@@ -13,6 +13,7 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
 	"github.com/dymurray/rule-110-arcade/internal/engine"
+	"github.com/dymurray/rule-110-arcade/internal/metrics"
 )
 
 // fakeWallet records what it was asked to do, in order. Nothing here touches a
@@ -319,6 +320,10 @@ func (s *stubEngine) note(name string) {
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, name)
 }
+
+// The adopted engine owns the real registry; the stub only has to satisfy the
+// seam.
+func (s *stubEngine) Metrics() *metrics.Registry { return metrics.NewRegistry() }
 
 func (s *stubEngine) Snapshot() engine.Snapshot {
 	s.note("Snapshot")

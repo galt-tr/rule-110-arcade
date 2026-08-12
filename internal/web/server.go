@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/dymurray/rule-110-arcade/internal/engine"
+	"github.com/dymurray/rule-110-arcade/internal/metrics"
 )
 
 //go:embed static
@@ -161,6 +162,8 @@ type Automaton interface {
 	SnapshotTail() engine.Snapshot
 	// Stats is the scalars with no history, for metrics and readiness.
 	Stats() engine.Snapshot
+	// Metrics is the latency registry, rendered alongside the scalars above.
+	Metrics() *metrics.Registry
 	// PublishedTail is the tail already marshalled, shared by every subscriber. The
 	// pointer is the identity of a publish: unchanged means the subscriber has
 	// already sent this exact frame.
@@ -462,7 +465,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		return 0
 	}
 
-	metrics := []struct {
+	scalars := []struct {
 		name, help, kind string
 		value            float64
 	}{
@@ -485,7 +488,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	for _, m := range metrics {
+	for _, m := range scalars {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %g\n", m.name, m.help, m.name, m.kind, m.name, m.value)
 	}
+
+	// The latency histograms and their counters. These answer a different
+	// question from the gauges above: those say where the automaton IS, these
+	// say how long it took to get there and which phase spent the time.
+	s.engine.Metrics().Render(w)
 }

@@ -19,6 +19,8 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/perfprovider"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+
+	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 )
 
 // storageName identifies this deployment's storage to the wallet.
@@ -192,10 +194,25 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		// The delayed-broadcast drainer is single-threaded by default, which
 		// serialises a generation that is otherwise fully parallel.
 		storage.WithSendConcurrency(64),
+
+		// Verify each transaction's scripts once instead of twice.
+		//
+		// SignAction runs the verifier in processNewTx and again in
+		// broadcastOne, on the same finished transaction, and at ~0.9 ms per run
+		// of this covenant the second one is the largest piece of pure
+		// repetition on the hot path. cellscript.ScriptsVerifier memoises the
+		// verdict by txid; see it for why that is sound and what it costs.
+		//
+		// This REPLACES the default verifier, which means WithChronicleOpcodes
+		// no longer reaches it — hence the era being passed in here instead, and
+		// hence WithChronicleOpcodes below being about nothing but the default
+		// this now overrides. Keep the two agreeing.
+		storage.WithScriptsVerifier(cellscript.NewScriptsVerifier(cfg.Chronicle)),
 	}
 	if cfg.Chronicle {
 		// Rúnar covenants contain OP_2MUL, which Genesis-era rules reject. See
-		// the cellscript package docs.
+		// the cellscript package docs. Retained for the paths that do not go
+		// through the verifier above.
 		extra = append(extra, storage.WithChronicleOpcodes())
 	}
 

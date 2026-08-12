@@ -43,10 +43,19 @@ COPY . .
 # Linking statically against musl still gets what the runtime stage wants: one
 # self-contained file with no libc to ship. osusergo and netgo replace the two
 # remaining things that would otherwise reach for the system C library.
+#
+# -s -w strips the symbol table and DWARF, which is most of the difference
+# between a 39 MB binary and a 55 MB one. It also costs pprof its symbol names:
+# a CPU profile taken from a stripped build reports addresses where it should
+# report functions. That is the right trade for the image that runs all the
+# time, and the wrong one for a measurement run — hence the debug stage below,
+# which is the same build with the stripping removed. LDFLAGS carries the
+# difference so there is only ever one build command to keep correct.
+ARG LDFLAGS="-s -w -extldflags=-static"
 RUN CGO_ENABLED=1 GOOS=linux go build \
       -trimpath \
       -tags osusergo,netgo \
-      -ldflags="-s -w -extldflags=-static" \
+      -ldflags="${LDFLAGS}" \
       -o /out/rule110 ./cmd/rule110
 
 # Fail here rather than in a crash loop: a dynamically linked binary builds
@@ -66,7 +75,7 @@ RUN if ldd /out/rule110 2>/dev/null | grep -q '=>'; then \
 # directly instead — `kubectl exec … -- rule110 address` works, because exec
 # needs a binary, not a shell — or use the one-shot Job in
 # deploy/k8s/bootstrap-job.yaml.
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
 # 65532 is distroless's "nonroot" user. It is named explicitly because the data
 # directory has to be writable BY THIS UID and nothing enforces that for you:
@@ -102,3 +111,24 @@ EXPOSE 8110
 
 ENTRYPOINT ["/usr/local/bin/rule110"]
 CMD ["run"]
+
+# ---- debug ------------------------------------------------------------------
+
+# The same image, built with symbols, for a measurement run.
+#
+#   docker build --target debug --build-arg LDFLAGS=-extldflags=-static -t rule110:debug .
+#
+# The build arg is what drops -s -w; without it this stage is just the default
+# image under another name, which would be a trap rather than a convenience.
+# A profile from a stripped binary still collects, it just reports addresses
+# instead of function names, and discovering that after the run is over is the
+# specific waste this stage exists to prevent.
+#
+# It is a separate target rather than the default because the stripping is worth
+# having in the image that runs continuously: profiling costs a few percent even
+# when nobody is scraping it, and the symbols are 16 MB of image nobody reads.
+#
+# Reaching it still needs -pprof, which is off unless set. The listener defaults
+# to loopback, so exposing it here would be pointless: set RULE110_PPROF to a
+# bindable address and port-forward to it.
+FROM runtime AS debug

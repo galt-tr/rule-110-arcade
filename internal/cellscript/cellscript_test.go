@@ -250,6 +250,67 @@ func TestCodePartIsStableAcrossGenerations(t *testing.T) {
 	}
 }
 
+// TestCachedScriptsMatchTheContract is what licenses the code-part cache.
+//
+// LockingScript no longer assembles the Rúnar contract; it concatenates a cached
+// code part with a freshly serialized state suffix. That is only correct if the
+// two produce identical bytes for every cell and every row — and "identical" has
+// to mean byte for byte, because a script that differs anywhere is a script no
+// cell can spend, and the symptom would be an opaque covenant failure a long way
+// from here.
+//
+// So this rebuilds every cell's script the long way, through the contract, and
+// compares. Across several generations, because a cache indexed by cell would
+// pass a single-row check trivially.
+func TestCachedScriptsMatchTheContract(t *testing.T) {
+	const cells = 32
+	c := mustCompile(t, cells)
+
+	row, _ := ca.SeedSingle(cells)
+	for gen := range 4 {
+		for cell := range cells {
+			want, err := c.constructLockingScriptHex(cell, row)
+			if err != nil {
+				t.Fatalf("gen %d cell %d: %v", gen, cell, err)
+			}
+			got, err := c.lockingScriptHex(cell, row)
+			if err != nil {
+				t.Fatalf("gen %d cell %d: %v", gen, cell, err)
+			}
+			if got != want {
+				t.Fatalf("gen %d cell %d: cached script differs from the contract's\n got %s\nwant %s",
+					gen, cell, got, want)
+			}
+		}
+		row = ca.Rule110.Step(row)
+	}
+}
+
+// A caller that appends to the code part it was handed must not be able to
+// corrupt the copy 127 other goroutines are about to use.
+func TestCodePartIsNotAliasedToTheCache(t *testing.T) {
+	const cells = 16
+	c := mustCompile(t, cells)
+	row, _ := ca.SeedSingle(cells)
+
+	first, err := c.CodePart(3, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := bytes.Clone(first)
+	for i := range first {
+		first[i] ^= 0xff
+	}
+
+	again, err := c.CodePart(3, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, original) {
+		t.Error("mutating a returned code part changed what the cache serves next")
+	}
+}
+
 // TestCellsHaveDistinctScripts confirms the per-cell binding actually differs —
 // otherwise every cell would be checking the same bit.
 func TestCellsHaveDistinctScripts(t *testing.T) {

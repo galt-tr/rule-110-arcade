@@ -32,7 +32,7 @@ func newTestEngineQueued(t *testing.T, cells int, gens ...uint64) *Engine {
 
 func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64) *Engine {
 	t.Helper()
-	store, err := history.Open(t.Context(), "", t.TempDir())
+	store, err := history.Open(t.Context(), "", t.TempDir(), 0)
 	if err != nil {
 		t.Fatalf("open history store: %v", err)
 	}
@@ -58,8 +58,12 @@ func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64
 		// rather than a stand-in — otherwise they would assert against a queue
 		// nothing ever drains. Assertions on the store go through
 		// waitForPersistedStatus.
-		statusWrites: make(chan history.StatusUpdate, statusWriteQueue),
-		owner:        "test",
+		statusWrites:   make(chan history.StatusUpdate, statusWriteQueue),
+		persistQueue:   make(chan persistRequest, persistQueueSize),
+		persistStopped: make(chan struct{}),
+		owner:          "test",
+		perf:           newPerf(),
+		raisedAt:       map[uint64]time.Time{},
 		// The tests exercise a writer that has already re-derived under its
 		// lease; the non-leader and re-derive paths have their own tests.
 		leader: true,
@@ -81,7 +85,25 @@ func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64
 			<-done
 		})
 	}
+	startCommitter(t, e)
 	return e
+}
+
+// startCommitter runs the durable-write committer for the life of the test.
+//
+// Not optional, unlike the status writer above. persist is a group commit and
+// its caller BLOCKS on the reply, so an engine whose committer is not running
+// does not merely fail to persist — the first write-ahead record never returns
+// and the test deadlocks.
+func startCommitter(t *testing.T, e *Engine) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); e.commitTxs(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 }
 
 // waitForPersistedStatus blocks until the store shows txid at want, or fails.
@@ -138,7 +160,7 @@ func TestStatusSurvivesHistoryTrim(t *testing.T) {
 
 	e.mu.Lock()
 	e.history[0].Cells[2] = CellTx{Cell: 2, TxID: txid, State: TxBroadcast}
-	e.indexTx(txid, 100, 2)
+	e.indexTx(txid, 100, 2, time.Now())
 	e.mu.Unlock()
 
 	// Two generations fall out of the window, shifting every index down by two.
@@ -178,7 +200,7 @@ func TestStatusReachesTheRightCellAfterATrim(t *testing.T) {
 
 	e.mu.Lock()
 	e.history[3].Cells[1] = CellTx{Cell: 1, TxID: txid, State: TxBroadcast}
-	e.indexTx(txid, 103, 1)
+	e.indexTx(txid, 103, 1, time.Now())
 	e.history = e.history[2:] // 103 is now at index 1, not 3
 	e.mu.Unlock()
 
@@ -242,7 +264,7 @@ func TestSnapshotDoesNotShareCellArrays(t *testing.T) {
 func TestLastSeenTracksAcceptance(t *testing.T) {
 	e := newTestEngine(t, 4, 1)
 	e.mu.Lock()
-	e.indexTx("t-seen", 5, 0)
+	e.indexTx("t-seen", 5, 0, time.Now())
 	e.mu.Unlock()
 
 	e.applyStatus("t-seen", arcade.StatusSeenOnNetwork, "")
@@ -262,7 +284,7 @@ func TestLastSeenTracksAcceptance(t *testing.T) {
 func TestLastSeenAdvancesOnMinedToo(t *testing.T) {
 	e := newTestEngine(t, 4, 1)
 	e.mu.Lock()
-	e.indexTx("t-mined", 9, 1)
+	e.indexTx("t-mined", 9, 1, time.Now())
 	e.mu.Unlock()
 
 	e.applyStatus("t-mined", arcade.StatusMined, "")
@@ -280,8 +302,8 @@ func TestLastSeenAdvancesOnMinedToo(t *testing.T) {
 func TestLastSeenNeverRegresses(t *testing.T) {
 	e := newTestEngine(t, 4, 1)
 	e.mu.Lock()
-	e.indexTx("t-new", 20, 2)
-	e.indexTx("t-old", 3, 2)
+	e.indexTx("t-new", 20, 2, time.Now())
+	e.indexTx("t-old", 3, 2, time.Now())
 	e.mu.Unlock()
 
 	e.applyStatus("t-new", arcade.StatusSeenOnNetwork, "")

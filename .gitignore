@@ -2,6 +2,20 @@
 # repositories; committing them makes a clone that cannot be checked out.
 /.claude/
 
+# Measurement scratch: harness scripts, run directories, captured profiles and
+# logs. Dot-prefixed so they sit out of the way, which is also how 196 of them
+# reached a commit unnoticed via `git add -A` during a conflict resolution —
+# including two 950 MB stderr logs that GitHub refuses outright.
+/.runs*/
+/.pgprobe*/
+/.reset-backups/
+/.[a-z]*.sh
+/.[a-z]*.py
+/.[a-z]*.hex
+/.[a-z]*.out
+/.[a-z]*.err
+/.[a-z]*.log
+
 # Build output.
 /rule110
 /spike

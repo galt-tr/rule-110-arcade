@@ -21,6 +21,16 @@ import (
 type txLoc struct {
 	generation uint64
 	cell       int
+
+	// broadcastAt is when we handed this transaction to arcade, and the zero
+	// time means we do not know.
+	//
+	// It is zero for anything re-indexed at startup: those were broadcast by an
+	// earlier process, possibly days ago, and stamping them with the current
+	// time would report a status lag of "however long this process has been
+	// running" — a number that is not merely wrong but wrong in the flattering
+	// direction. Unknown is measured as nothing at all.
+	broadcastAt time.Time
 }
 
 // stateFor maps an arcade lifecycle status onto a cell's display state.
@@ -249,6 +259,7 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 		if rank(w.next) <= rank(cell.State) {
 			continue
 		}
+		e.observeStatusLag(loc, cell.State, w.next)
 		cell.State = w.next
 		changed = true
 
@@ -600,12 +611,16 @@ func rejectionMessage(status arcade.Status, extra string) string {
 	return msg
 }
 
-// indexTx remembers which cell a txid belongs to. Callers must hold the lock.
-func (e *Engine) indexTx(txid string, generation uint64, cell int) {
+// indexTx remembers which cell a txid belongs to, and when it was broadcast.
+// Callers must hold the lock.
+//
+// broadcastAt may be the zero time, meaning the moment is unknown and this
+// transaction's status lag must not be measured. See txLoc.
+func (e *Engine) indexTx(txid string, generation uint64, cell int, broadcastAt time.Time) {
 	if e.txIndex == nil {
 		e.txIndex = make(map[string]txLoc)
 	}
-	e.txIndex[txid] = txLoc{generation: generation, cell: cell}
+	e.txIndex[txid] = txLoc{generation: generation, cell: cell, broadcastAt: broadcastAt}
 }
 
 const (

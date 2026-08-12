@@ -55,7 +55,7 @@ func TestApplyStatusBatchDoesNotWriteUnderTheLock(t *testing.T) {
 	const txid = "cafe"
 	e.mu.Lock()
 	e.history[0].Cells[3] = CellTx{Cell: 3, TxID: txid, State: TxBroadcast}
-	e.indexTx(txid, 1, 3)
+	e.indexTx(txid, 1, 3, time.Now())
 	e.mu.Unlock()
 
 	e.applyStatusBatch([]arcade.TxRecord{{TxID: txid, Status: arcade.StatusMined}})
@@ -96,7 +96,7 @@ func TestApplyStatusBatchAppliesTheWholeBatchAtomically(t *testing.T) {
 	for c := range cells {
 		txid := "tx" + strconv.Itoa(c)
 		e.history[0].Cells[c] = CellTx{Cell: c, TxID: txid, State: TxBroadcast}
-		e.indexTx(txid, 1, c)
+		e.indexTx(txid, 1, c, time.Now())
 		recs = append(recs, arcade.TxRecord{TxID: txid, Status: arcade.StatusSeenOnNetwork})
 	}
 	e.mu.Unlock()
@@ -148,7 +148,7 @@ func TestApplyStatusBatchIgnoresForeignTxidsWithoutTheWriteLock(t *testing.T) {
 	const ours = "ours"
 	e.mu.Lock()
 	e.history[0].Cells[1] = CellTx{Cell: 1, TxID: ours, State: TxBroadcast}
-	e.indexTx(ours, 1, 1)
+	e.indexTx(ours, 1, 1, time.Now())
 	e.mu.Unlock()
 
 	apply := func(recs []arcade.TxRecord) chan struct{} {
@@ -236,6 +236,7 @@ func TestEnqueueStatusWritesNeverBlocks(t *testing.T) {
 	e := &Engine{
 		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		statusWrites: make(chan history.StatusUpdate, 2),
+		perf:         newPerf(),
 	}
 	for range 2 {
 		e.statusWrites <- history.StatusUpdate{TxID: "filler"}

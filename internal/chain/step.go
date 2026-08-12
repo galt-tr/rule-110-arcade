@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
@@ -32,6 +33,35 @@ type StepResult struct {
 	// spend it. Deliberately not the atomic BEEF — see CellChain.RawTxHex.
 	RawTxHex  string
 	SizeBytes int
+
+	// Timings is how long each phase of this transition took.
+	Timings StepTimings
+}
+
+// StepTimings breaks one transition into the four costs worth telling apart.
+//
+// Returned as data rather than recorded into a metrics registry here, so this
+// package keeps knowing nothing about the engine or about how the numbers are
+// published. The caller owns that.
+//
+// Only a SUCCESSFUL transition carries timings. A failure's phase breakdown
+// would be a fifth code path through every early return for a case the engine
+// already measures end to end, and the failures worth understanding — a funding
+// shortfall, a refusal — are answered by their own counters rather than by how
+// long they took to arrive.
+type StepTimings struct {
+	// BuildScripts is every locking and unlocking script construction plus the
+	// sighash preimage: all the covenant CPU except verification.
+	BuildScripts time.Duration
+	// CreateAction is the wallet assembling the unsigned transaction, which is
+	// where a fuel coin is claimed. Local, but several database round trips.
+	CreateAction time.Duration
+	// Verify is our own pre-broadcast run of the covenant through the
+	// interpreter.
+	Verify time.Duration
+	// Sign is SignAction, and signing is what broadcasts — so this contains the
+	// arcade round trip and is the only phase with the network in it.
+	Sign time.Duration
 }
 
 // AdvanceCell moves one cell forward a generation.
@@ -63,10 +93,12 @@ func (c *Chain) AdvanceCell(
 		}
 	}()
 
+	var timings StepTimings
 	cell := tip.Cell
 	if cell < 0 || cell >= cells {
 		return nil, fmt.Errorf("chain: cell %d out of range", cell)
 	}
+	buildStart := time.Now()
 
 	// Use the row THIS cell's UTXO carries, not the global row. They diverge
 	// whenever cells sit at different generations, and the mismatch surfaces
@@ -148,7 +180,11 @@ func (c *Chain) AdvanceCell(
 	// deployment is genuinely out of coin. Blocking here for minutes instead
 	// wedges the cell — and with it the automaton's frontier — while reporting
 	// nothing at all.
+	timings.BuildScripts += time.Since(buildStart)
+
+	createStart := time.Now()
 	created, err := c.Wallet.CreateAction(ctx, args, c.Config.Originator)
+	timings.CreateAction = time.Since(createStart)
 	if err != nil {
 		return nil, fmt.Errorf("chain: create step action for cell %d: %w", cell, err)
 	}
@@ -167,6 +203,7 @@ func (c *Chain) AdvanceCell(
 		return nil, fmt.Errorf("chain: cell %d: %w", cell, err)
 	}
 
+	buildStart = time.Now()
 	unlock, err := compiled.UnlockingScript(cellscript.Spend{
 		CellIndex:    cell,
 		CurrentRow:   currentRow,
@@ -181,20 +218,26 @@ func (c *Chain) AdvanceCell(
 	if err != nil {
 		return nil, err
 	}
+	timings.BuildScripts += time.Since(buildStart)
 
 	// Verify locally before broadcasting, so a covenant failure is reported
 	// against our own script rather than as an opaque arcade rejection.
 	tx.Inputs[0].UnlockingScript = script.NewFromBytes(unlock)
-	if err := cellscript.VerifyInput(tx, 0); err != nil {
+	verifyStart := time.Now()
+	err = cellscript.VerifyInput(tx, 0)
+	timings.Verify = time.Since(verifyStart)
+	if err != nil {
 		return nil, fmt.Errorf("chain: cell %d covenant rejected locally: %w", cell, err)
 	}
 
 	// Past this line the transaction may exist on the network whatever happens.
 	broadcast = true
+	signStart := time.Now()
 	signed, err := c.Wallet.SignAction(ctx, sdk.SignActionArgs{
 		Reference: created.SignableTransaction.Reference,
 		Spends:    map[uint32]sdk.SignActionSpend{0: {UnlockingScript: unlock}},
 	}, c.Config.Originator)
+	timings.Sign = time.Since(signStart)
 	if err != nil {
 		return nil, fmt.Errorf("chain: sign step action for cell %d: %w", cell, err)
 	}
@@ -211,6 +254,7 @@ func (c *Chain) AdvanceCell(
 		TxID:       signed.Txid.String(),
 		RawTxHex:   hex.EncodeToString(finalTx.Bytes()),
 		SizeBytes:  len(finalTx.Bytes()),
+		Timings:    timings,
 	}, nil
 }
 

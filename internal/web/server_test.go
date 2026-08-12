@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dymurray/rule-110-arcade/internal/engine"
+	"github.com/dymurray/rule-110-arcade/internal/metrics"
 )
 
 // fakeAutomaton is an Automaton whose published value and change notifications
@@ -42,6 +43,8 @@ type fakeAutomaton struct {
 	// calls records the order of Changed/PublishedTail, which is the whole
 	// subject of TestEventsSubscribesBeforeItReads.
 	calls []string
+
+	registry *metrics.Registry
 }
 
 func newFakeAutomaton() *fakeAutomaton {
@@ -120,6 +123,17 @@ func (f *fakeAutomaton) counts() (snapshot, tail, stats int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.snapshotCalls, f.tailCalls, f.statsCalls
+}
+
+// Metrics returns a live registry rather than nil: /metrics renders it
+// unconditionally, and a handler test should exercise that.
+func (f *fakeAutomaton) Metrics() *metrics.Registry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.registry == nil {
+		f.registry = metrics.NewRegistry()
+	}
+	return f.registry
 }
 
 // The mutators record that they were reached at all. A locked deployment must

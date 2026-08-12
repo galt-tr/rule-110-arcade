@@ -74,7 +74,7 @@ func cmdAudit(args []string) error {
 		return err
 	}
 
-	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir)
+	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir, cfg.HistoryDBConns)
 	if err != nil {
 		return err
 	}

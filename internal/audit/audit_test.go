@@ -86,7 +86,7 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	store, err := history.Open(t.Context(), "", t.TempDir())
+	store, err := history.Open(t.Context(), "", t.TempDir(), 0)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

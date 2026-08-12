@@ -70,7 +70,21 @@ type Config struct {
 
 	// MaxDBConns bounds the storage connection pool. The benchmarks pair it
 	// with worker count (conns ~ workers + margin).
+	//
+	// It sizes ONE pool, not two: the toolbox shares a single connection pool
+	// between the metastore and the utxostore, so this is the whole of the
+	// wallet's claim on the server.
 	MaxDBConns int
+
+	// HistoryDBConns bounds the history store's pool, separately from the
+	// wallet's. 0 takes the history package's own default.
+	//
+	// Separate because they are separate pools against the same server and the
+	// sum is what matters: exceeding max_connections does not slow this
+	// application down, it halts cells, because a cell whose write-ahead record
+	// cannot be written must not advance. Budget both against the server's
+	// limit and leave room for whatever else lives there.
+	HistoryDBConns int
 
 	// MaxUnconfirmedDepth bounds how far ahead of its newest mined transaction
 	// a cell may run. It DEFAULTS TO 0, which means no bound, and that is the
@@ -247,6 +261,12 @@ func DefaultConfig() Config {
 		// One shared pool serves both the metastore and the utxostore, and the
 		// toolbox sizes it as workers plus margin. There is one worker per cell
 		// and they burst-sign together at the start of a generation.
+		//
+		// It is also the pool the monitor's status appliers draw from, with no
+		// priority and no deadline, so starving it does not merely slow the
+		// automaton down — it stops the diagram tracking the chain. Measured:
+		// raising this from 72 to 200 improved status lag eightfold at
+		// unchanged throughput.
 		MaxDBConns: 144,
 		// Unbounded. See MaxUnconfirmedDepth: teranode enforces no ancestor
 		// limit, and a finite value here silently caps the generation rate at

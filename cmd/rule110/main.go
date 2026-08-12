@@ -211,7 +211,10 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.Uint64Var(&cfg.CellSatoshis, "cell-sats", cfg.CellSatoshis, "satoshis each cell UTXO carries")
 	fs.StringVar(&cfg.PostgresDSN, "postgres-dsn", envOr("RULE110_POSTGRES_DSN", ""),
 		"PostgreSQL DSN; empty uses SQLite (much slower under a wide fan-out)")
-	fs.IntVar(&cfg.MaxDBConns, "max-db-conns", cfg.MaxDBConns, "storage connection pool size")
+	fs.IntVar(&cfg.MaxDBConns, "max-db-conns", cfg.MaxDBConns,
+		"wallet storage connection pool size; one pool, shared by the metastore and the utxostore")
+	fs.IntVar(&cfg.HistoryDBConns, "history-db-conns", cfg.HistoryDBConns,
+		"history store connection pool size (0 uses its default); budget this and -max-db-conns together against the server's max_connections")
 	fs.BoolVar(&cfg.Chronicle, "chronicle", cfg.Chronicle,
 		"verify with Chronicle-era script rules (required for Rúnar covenants)")
 	// The old help text said the 100 sat/kB floor is applied to the
@@ -523,6 +526,10 @@ func cmdRun(args []string) error {
 	start := fs.Bool("start", false, "begin advancing immediately instead of waiting for the UI")
 	autoRecover := fs.Bool("auto-recover", false,
 		"resolve cells whose tip is unknown automatically; off by default — run \"rule110 recover\" first")
+	pprofAddr := fs.String("pprof", envOr("RULE110_PPROF", ""),
+		"serve net/http/pprof on this address, and enable mutex and block profiling; empty is off")
+	perfLog := fs.Bool("perf-log", false,
+		"log one line per completed generation with the current phase quantiles, at most once a second")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -554,7 +561,7 @@ func cmdRun(args []string) error {
 	// of nothing.
 	cfg = c.Config
 
-	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir)
+	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir, cfg.HistoryDBConns)
 	if err != nil {
 		return err
 	}
@@ -578,6 +585,9 @@ func cmdRun(args []string) error {
 	genesisSize, err := chain.GenesisBytes(compiled, seed)
 	if err != nil {
 		return err
+	}
+	if *pprofAddr != "" {
+		serveProfiles(ctx, *pprofAddr, logger)
 	}
 
 	// Serve the UI BEFORE there is anything to show.
@@ -633,14 +643,23 @@ func cmdRun(args []string) error {
 	// turns SetRate and SetMode into no-ops, so setting the rate by calling the
 	// mutator the lock disables would leave a locked deployment stuck at the
 	// default, paused, with no way to start it.
-	eng, err := engine.New(ctx, c, compiled, d, store, engine.Options{
+	opts := engine.Options{
 		AutoRecover:  *autoRecover,
 		LockControls: cfg.LockControls,
 		Rate:         *rate,
 		Start:        *start,
-	}, logger)
+	}
+	if *perfLog {
+		// Its own Info-level logger, so the per-generation line is visible
+		// without lowering the level the toolbox logs at — see Options.PerfLog.
+		opts.PerfLog = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+	eng, err := engine.New(ctx, c, compiled, d, store, opts, logger)
 	if err != nil {
 		return err
+	}
+	if *pprofAddr != "" {
+		serveProfiles(ctx, *pprofAddr, logger)
 	}
 	// Hand every reader over to the engine. Anyone streaming during the cold
 	// start is holding the bootstrapper's change channel, so Adopt notifies once

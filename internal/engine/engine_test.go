@@ -31,6 +31,17 @@ func TestIndexOfGeneration(t *testing.T) {
 	if got := indexOfGeneration(nil, 1); got != -1 {
 		t.Errorf("indexOfGeneration(nil, 1) = %d, want -1", got)
 	}
+
+	// Gaps are real: the window is trimmed from the front and a cell that fell
+	// behind can create a generation out of order, so the numbers are ascending
+	// but not contiguous. A binary search that assumed contiguity would index by
+	// arithmetic and land on the wrong row.
+	sparse := []Generation{{Number: 3}, {Number: 9}, {Number: 40}, {Number: 41}}
+	for number, want := range map[uint64]int{3: 0, 9: 1, 40: 2, 41: 3, 4: -1, 39: -1, 42: -1, 0: -1} {
+		if got := indexOfGeneration(sparse, number); got != want {
+			t.Errorf("sparse: indexOfGeneration(%d) = %d, want %d", number, got, want)
+		}
+	}
 }
 
 // TestRankIsTotalAndFailedWins pins the ordering guard against out-of-order SSE
