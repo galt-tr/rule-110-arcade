@@ -1,0 +1,193 @@
+# rule110 — the automaton itself.
+#
+# A single-replica StatefulSet, and the "StatefulSet" is the load-bearing word.
+#
+# This process owns 128 live UTXO chains. Two instances advancing the same chain
+# double-spend every cell in it, and the rejection that follows is
+# indistinguishable from a genuine failure — that is how cells 34 and 51 were
+# lost. A Deployment's RollingUpdate runs the new pod ALONGSIDE the old one by
+# design; a StatefulSet's terminates the old pod first and waits for it. The
+# single-writer lease in internal/history/history.go (AcquireLease) and
+# internal/engine/worker.go (holdLease) survives an overlap, and it is a safety
+# net, not the strategy. Do not raise replicas: a second pod would come up, fail
+# to take the 30-second lease, and serve the UI read-only until the first one
+# died. That is the designed failure mode, not a way to scale.
+#
+# THE /api/control ENDPOINT IS UNAUTHENTICATED. internal/web/server.go routes
+# POST /api/control with no credential check at all, so anyone who can open a
+# connection to this pod can pause the automaton, resume it, single-step it, or
+# change its rate. That is the whole control surface. Nothing here invents an
+# auth scheme for it; the exposure is stated so it can be decided deliberately.
+# Guard it above the pod — an ingress with basic auth, an OAuth2 forward-auth
+# proxy, or a NetworkPolicy that admits only the namespaces that should reach
+# it. The Service below is ClusterIP for that reason: it is not, on its own,
+# safe to expose.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rule110
+  labels:
+    app.kubernetes.io/name: rule110
+spec:
+  replicas: 1
+  serviceName: rule110
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rule110
+  # OrderedReady with one replica means the old pod is fully gone before the new
+  # one starts. That, not the lease, is what normally keeps the writer single.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rule110
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8110"
+        prometheus.io/path: /metrics
+    spec:
+      # 60, and the floor is 45.
+      #
+      # cmd/rule110/main.go returns from web.Serve and only THEN waits, in a
+      # deferred function, for the engine to drain — up to 20 seconds — before
+      # the wallet is closed. Kubernetes sends SIGTERM, waits out this period,
+      # and sends SIGKILL. The default 30 seconds can therefore land the KILL
+      # in the middle of the drain, which is precisely the window
+      # history.StatusAttempting exists to survive: a transition broadcast but
+      # not recorded leaves that cell's real tip UNKNOWN, and the engine
+      # refuses to advance it on the next start rather than risk re-spending an
+      # output the network has already consumed. Every one of those is a cell
+      # stopped by hand until someone recovers its tip.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # fsGroup is what makes the PVC writable by the image's UID. Without it
+        # the volume is root-owned, LoadOrCreateIdentity cannot write keys.json,
+        # and the pod crash-loops on startup. See the Dockerfile for the quieter
+        # failure — a writable but EMPTY /data silently mints a new wallet and
+        # strands the old one's coins.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rule110
+          # Replace with the image you built and pushed.
+          image: ghcr.io/dymurray/rule110:latest
+          imagePullPolicy: IfNotPresent
+          args: ["run", "-start"]
+          ports:
+            - name: http
+              containerPort: 8110
+          env:
+            - name: RULE110_ARCADE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: rule110-config
+                  key: arcadeUrl
+            - name: RULE110_NETWORK
+              valueFrom:
+                configMapKeyRef:
+                  name: rule110-config
+                  key: network
+            # The DSN carries a password, so it is the one setting that comes
+            # from a Secret rather than the ConfigMap. Leaving it unset falls
+            # back to SQLite in /data, which serialises every write and collapses
+            # under a 128-way fan-out — measured at ~57-108 TPS against ~575 for
+            # PostgreSQL in the toolbox's own benchmarks.
+            - name: RULE110_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: rule110-postgres
+                  key: dsn
+            # Set explicitly rather than relying on the image default, so that
+            # reading this manifest tells you where the wallet lives.
+            - name: RULE110_DATA_DIR
+              value: /data
+            - name: RULE110_ADDR
+              value: 0.0.0.0:8110
+          # Liveness is "the process is serving HTTP" and deliberately nothing
+          # more. /healthz says nothing about the automaton making progress:
+          # restarting a pod does not conjure coin or mine a block, so tying
+          # liveness to progress would add a crash loop to whatever was already
+          # wrong — and a crash loop here is a repeated risk of the drain being
+          # cut short. See web.handleHealth.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /readyz reports leader and starved but fails on neither, on purpose:
+          # a starved automaton's UI is exactly where an operator finds the
+          # address to send coin to, and a non-leader is the standby serving
+          # correct history. Removing either endpoint from the Service would
+          # hide the thing that explains the situation. See web.handleReady.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Startup replays unsettled history and re-indexes in-flight
+          # transactions before the listener comes up, which is seconds on a
+          # long run. This lets that happen without liveness killing it.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              # No CPU limit: throttling the engine mid-generation shows up as
+              # lag and depth, not as an error, and this workload is bursty by
+              # construction (128 signings at once). Memory is limited because a
+              # leak should be killed, not swapped.
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # readOnlyRootFilesystem is on, so anything that wants a scratch
+            # file needs somewhere to put it.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    # THIS VOLUME IS THE WALLET. keys.json lives here, and an arcade-only wallet
+    # has no restore-from-seed: if this PVC is deleted, or replaced by an empty
+    # one, the coins it held are gone and the deployment quietly comes up as a
+    # different wallet with a different funding address. Set a retain policy on
+    # the StorageClass and back it up.
+    #
+    # ReadWriteOnce is correct and is also a second line of defence: two pods
+    # cannot mount it on different nodes, which is one more thing standing
+    # between this and two writers.
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # The wallet database dominates. Per-transaction storage is ~12 kB
+            # since the wallet stopped being handed an ever-growing BEEF (it was
+            # ~1.5 MB before), so 10 Gi is on the order of 800,000 transitions —
+            # roughly 6,000 generations of a 128-cell ring.
+            storage: 10Gi

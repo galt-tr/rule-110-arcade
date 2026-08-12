@@ -1,0 +1,49 @@
+# Non-secret configuration, and the Secret that holds the one setting that is.
+#
+# Everything the container reads comes in as an environment variable. The
+# complete set is RULE110_ARCADE_URL, RULE110_CHAINTRACKS_URL, RULE110_NETWORK,
+# RULE110_DATA_DIR, RULE110_POSTGRES_DSN and RULE110_ADDR; `rule110 help` lists
+# them with the flag each one is the default for. Everything else is a flag, and
+# flags go in the StatefulSet's args.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rule110-config
+  labels:
+    app.kubernetes.io/name: rule110
+data:
+  # The only endpoint that must be set. The toolbox derives the headers service
+  # from it, so RULE110_CHAINTRACKS_URL is only needed when that derivation is
+  # wrong for your deployment.
+  arcadeUrl: https://arcade.example.invalid
+  # main | test | ttn | tstn. Not "mainnet"/"testnet" — defs.ParseBSVNetworkStr
+  # is the authority on the spelling. Left at tstn, the private scaling test
+  # net, because a sample application should not default to real money.
+  network: tstn
+---
+# The DSN is a password in a connection string, which is why it is here and not
+# in the ConfigMap above.
+#
+# This manifest is a PLACEHOLDER. Do not commit a real DSN to a repository —
+# this one has already had live key material committed to it once and purged
+# from history. Create it out of band instead:
+#
+#   kubectl create secret generic rule110-postgres \
+#     --from-literal=dsn='postgres://rule110:PASSWORD@postgres:5432/rule110?sslmode=require'
+#
+# Or point an External Secrets / Sealed Secrets / CSI driver at it. The
+# application reads the value at startup only, so rotating it needs a restart.
+#
+# Leaving this out entirely is supported: an empty RULE110_POSTGRES_DSN falls
+# back to a SQLite file in /data. That is fine for a small ring and wrong for
+# 128 cells — SQLite serialises every write, and the toolbox's benchmarks put it
+# at ~57-108 TPS against ~575 for PostgreSQL.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rule110-postgres
+  labels:
+    app.kubernetes.io/name: rule110
+type: Opaque
+stringData:
+  dsn: postgres://rule110:CHANGE_ME@postgres:5432/rule110?sslmode=disable

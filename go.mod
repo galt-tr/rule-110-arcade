@@ -2,14 +2,35 @@ module github.com/dymurray/rule-110-arcade
 
 go 1.26.3
 
-// Runar and the arcade toolbox are consumed from local checkouts: this project
-// tracks their unreleased behaviour (notably the two-step SignAction seam and
-// the stateful-contract continuation), so pinning to published tags would lag.
-replace github.com/icellan/runar/packages/runar-go => /git/runar/packages/runar-go
+// Every dependency below resolves from a public git host. These three replaces
+// exist because the modules cannot be reached by their own import paths, not
+// because anyone needs a checkout on disk — `git clone && go build ./...` works
+// on a machine that has never seen runar or the toolbox.
+//
+// The arcade toolbox declares its module path as
+// github.com/bsv-blockchain/go-arcade-toolbox, but that repository is not
+// public. The work this application depends on — WithRequiredChangeOutput,
+// WithGenesisActivationHeight, WithMinBroadcastFeeRate, WithChronicleOpcodes —
+// lives on the fork, unreleased, so there is no tag to pin to instead. The
+// replace redirects the unreachable path at a specific fork commit; because
+// module paths are compared only for the module being replaced, Go accepts the
+// substitution even though the fork's go.mod still declares the bsv-blockchain
+// path.
+replace github.com/bsv-blockchain/go-arcade-toolbox => github.com/galt-tr/go-arcade-toolbox v0.0.0-20260812005348-3bc5259815bb
 
-replace github.com/icellan/runar/compilers/go => /git/runar/compilers/go
+// Runar's two modules import each other: packages/runar-go needs
+// compilers/go/codegen, and compilers/go/compiler needs
+// packages/runar-go/bn254witness. Upstream resolves that with a go.work, and
+// its published go.mod points compilers/go at v1.0.0-rc.1 — a tag that was
+// never pushed. Minimal version selection would pick that phantom tag and fail
+// to download it, so both modules are replaced at the same commit, which is the
+// only way to get a consistent pair. runar-go v0.4.5 predates the two
+// miscompilation fixes in e7221a7b ("branch-merged-local" and state framing),
+// either of which can emit an unspendable contract, so a published tag is not
+// an option here either.
+replace github.com/icellan/runar/packages/runar-go => github.com/icellan/runar/packages/runar-go v0.3.3-0.20260805193449-e7221a7b914d
 
-replace github.com/bsv-blockchain/go-arcade-toolbox => /git/go-arcade-toolbox
+replace github.com/icellan/runar/compilers/go => github.com/icellan/runar/compilers/go v0.3.3-0.20260805193449-e7221a7b914d
 
 require (
 	github.com/bsv-blockchain/go-arcade-toolbox v0.0.0-00010101000000-000000000000

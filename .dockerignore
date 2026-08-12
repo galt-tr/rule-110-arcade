@@ -1,0 +1,26 @@
+# The build context must never contain key material.
+#
+# data/ IS the wallet: keys.json plus the wallet database, with no
+# restore-from-seed behind it. Copying it into an image would publish live
+# private keys to every registry and every layer cache the image reaches. This
+# repository has already had live keys committed once and purged from history;
+# these patterns mirror .gitignore so the same mistake cannot be made through
+# the build context instead.
+data/
+data-*/
+*-backup/
+*.db
+*.db-*
+*.key
+keys.json
+*.tmp
+
+# Not needed to build. Excluding them also keeps the context small, which is
+# what lets the go.mod/go.sum layer stay cached across source changes.
+.git/
+.github/
+.claude/
+deploy/
+*.md
+/rule110
+/spike
