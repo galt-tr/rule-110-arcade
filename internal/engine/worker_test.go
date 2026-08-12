@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -455,6 +456,53 @@ func TestLeaseIsExclusiveAndReclaimable(t *testing.T) {
 	}
 	if held, err := e.store.AcquireLease(ctx, "l", "pod-a", time.Minute); err != nil || !held {
 		t.Fatalf("a released lease was not available: held=%v err=%v", held, err)
+	}
+}
+
+// TestWriteAheadFailureDoesNotBroadcast is the other half of bug 9d, and the
+// half that was still open.
+//
+// Halting a cell stops its NEXT turn. It does not unwind the turn already
+// running. So persist could mark a cell halted for an unwritable write-ahead
+// record and advanceCell would carry straight on to build, sign and broadcast
+// the transition anyway — spending the tip with nothing durable saying the
+// attempt was ever made. The next startup then derives the tip one generation
+// back and re-spends an output the network has already consumed, which is the
+// exact double spend the write-ahead record exists to prevent.
+//
+// Not hypothetical: an exhausted database connection pool halted 70 cells this
+// way on the live deployment, every one of which had broadcast regardless.
+//
+// The signal is which error surfaces. Returning early leaves the persist
+// failure as the last error; going on to build a transition replaces it with
+// one from the chain layer, and reaching the chain layer at all is the bug.
+func TestWriteAheadFailureDoesNotBroadcast(t *testing.T) {
+	e := newTestEngine(t, 4)
+	atGeneration(e, 10)
+
+	// Break the store the way an exhausted connection pool does.
+	if err := e.store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	e.advanceCell(t.Context(), 2)
+
+	e.mu.RLock()
+	halted, lastErr, tipGen := e.halted[2], e.lastError, e.tips[2].Generation
+	e.mu.RUnlock()
+
+	if strings.Contains(lastErr, "chain:") {
+		t.Errorf("advanceCell built a transition after its write-ahead record could not be "+
+			"written, so the tip would be spent with no durable record of the attempt: %s", lastErr)
+	}
+	if !strings.Contains(lastErr, "could not be recorded") {
+		t.Errorf("the write-ahead failure should be the reported error, got: %q", lastErr)
+	}
+	if !halted {
+		t.Error("the cell must also be halted, so it does not simply retry on its next turn")
+	}
+	if tipGen != 10 {
+		t.Errorf("the tip moved to generation %d despite nothing being recorded", tipGen)
 	}
 }
 

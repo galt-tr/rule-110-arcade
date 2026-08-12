@@ -186,9 +186,19 @@ func (e *Engine) advanceCell(ctx context.Context, cell int) {
 	// a process killed there would come back a generation behind and re-spend an
 	// output that is already gone. This row is what tells the next startup that
 	// the tip is unknown rather than stale. See history.StatusAttempting.
-	e.persist(history.CellTx{
+	//
+	// And if it cannot be written, do not broadcast. persist has already halted
+	// the cell at this point, but a halt only stops the cell's NEXT turn — it
+	// does not unwind this call. Continuing would spend the tip with nothing
+	// durable saying we ever tried, so the next startup would derive the tip one
+	// generation back and re-spend an output the network had already consumed.
+	// Observed live: a saturated database halted 70 cells this way, every one of
+	// which had broadcast regardless.
+	if !e.persist(history.CellTx{
 		Generation: tip.Generation + 1, Cell: cell, Status: history.StatusAttempting,
-	})
+	}) {
+		return
+	}
 
 	res, err := e.chain.AdvanceCell(ctx, e.compiled, tip, cells, rule)
 	if err != nil {

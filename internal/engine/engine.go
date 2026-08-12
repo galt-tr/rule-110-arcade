@@ -666,11 +666,17 @@ const (
 // different route. So a cell whose record cannot be written stops advancing —
 // visibly, with the error attached — rather than running on with no record of
 // what it did.
-func (e *Engine) persist(c history.CellTx) {
+// It reports whether the row was written, and a caller that is about to
+// broadcast MUST check that. Halting a cell stops its NEXT turn; it does not
+// unwind the call already in flight. Returning nothing here meant a cell whose
+// write-ahead record failed was marked halted and then went on to broadcast
+// anyway — the exact double spend the record exists to prevent, since nothing
+// durable would say the transition had ever been attempted.
+func (e *Engine) persist(c history.CellTx) bool {
 	var err error
 	for attempt := 1; attempt <= persistRetries; attempt++ {
 		if err = e.store.RecordTx(context.Background(), c); err == nil {
-			return
+			return true
 		}
 		e.logger.Warn("persist cell transaction failed; retrying",
 			"generation", c.Generation, "cell", c.Cell, "attempt", attempt, "err", err)
@@ -681,6 +687,7 @@ func (e *Engine) persist(c history.CellTx) {
 	e.haltCell(c.Cell, fmt.Sprintf(
 		"generation %d could not be recorded (%v), so this cell's position is no longer durable and "+
 			"advancing it would risk re-spending a spent output", c.Generation, err))
+	return false
 }
 
 // haltCell stops one cell and says why, once.
