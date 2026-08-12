@@ -448,6 +448,95 @@ func (s *Store) DeleteAttempt(ctx context.Context, generation uint64, cell int) 
 	return nil
 }
 
+// DeepTip is what derivation needs about a cell buried under more unsettled
+// records than the ordinary window covers.
+type DeepTip struct {
+	// Settled is the newest record naming a transaction the network accepted.
+	// This is the cell's real tip however far back it is.
+	Settled    Tip
+	HasSettled bool
+
+	// Failed is the newest rejection above Settled, and Attempt the newest
+	// unresolved write-ahead record above it. Both can be present; an attempt
+	// outranks a rejection, because an attempt means the tip is UNKNOWN while a
+	// rejection means it is known and the chain simply stops there.
+	Failed     Tip
+	HasFailed  bool
+	Attempt    Tip
+	HasAttempt bool
+}
+
+// DeepTip answers, for one cell, where its chain actually stops.
+//
+// CellTips reads a fixed shallow window because in the healthy case one record
+// is enough. That window is not enough for a cell that was rejected and then
+// kept being rejected: the build that produced this deployment's older history
+// advanced a cell's tip onto the output of a REJECTED transaction, so a single
+// rejection cascaded — every later attempt spent an output that did not exist
+// and was refused in turn. Cells 34, 51 and 91 of the live automaton each carry
+// about 170 consecutive failures on top of a last good transaction near
+// generation 300.
+//
+// Derivation seeing only failures concludes "this cell's tip cannot be derived"
+// and an operator reads that as a cell that is lost. It is not lost: the tip is
+// unambiguous, it is just further down than the window reaches. A long run of
+// rejections is not ambiguity — it is a cascade with a known cause, and the
+// newest ACCEPTED record is the answer regardless of how much wreckage sits on
+// top of it.
+//
+// This is deliberately a per-cell fallback rather than a wider default window.
+// The common path stays exactly as it was, and the cost of digging is paid only
+// by the handful of cells that need it.
+func (s *Store) DeepTip(ctx context.Context, cell int) (DeepTip, error) {
+	var out DeepTip
+
+	newest := func(statuses ...string) (Tip, bool, error) {
+		holders := make([]string, len(statuses))
+		args := []any{cell}
+		for i, st := range statuses {
+			holders[i] = "?"
+			args = append(args, st)
+		}
+		q := `SELECT cell, generation, txid, status, coalesce(err,'') FROM cell_txs
+		      WHERE cell = ? AND status IN (` + strings.Join(holders, ",") + `)
+		      ORDER BY generation DESC LIMIT 1`
+		var t Tip
+		err := s.db.QueryRowContext(ctx, s.rebind(q), args...).
+			Scan(&t.Cell, &t.Generation, &t.TxID, &t.Status, &t.Err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Tip{}, false, nil
+		}
+		if err != nil {
+			return Tip{}, false, fmt.Errorf("history: deep tip for cell %d: %w", cell, err)
+		}
+		return t, true, nil
+	}
+
+	var err error
+	out.Settled, out.HasSettled, err = newest(string(StatusMined), string(StatusBroadcast))
+	if err != nil {
+		return out, err
+	}
+
+	// Only records ABOVE the settled tip say anything about where the chain
+	// stops. Anything below it was superseded by the tip itself.
+	out.Failed, out.HasFailed, err = newest(string(StatusFailed))
+	if err != nil {
+		return out, err
+	}
+	if out.HasFailed && out.HasSettled && out.Failed.Generation <= out.Settled.Generation {
+		out.HasFailed = false
+	}
+	out.Attempt, out.HasAttempt, err = newest(string(StatusAttempting))
+	if err != nil {
+		return out, err
+	}
+	if out.HasAttempt && out.HasSettled && out.Attempt.Generation <= out.Settled.Generation {
+		out.HasAttempt = false
+	}
+	return out, nil
+}
+
 // RejectedTxIDs reports which of the given txids the record says the network
 // refused.
 //

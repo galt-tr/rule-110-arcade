@@ -112,22 +112,60 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 
 		base, ok := newestSettled(rows)
 		if !ok {
-			// Nothing within reach names a transaction the network was told
-			// about, so there is no tip to derive and none may be guessed at.
-			//
-			// This halts the CELL rather than failing the whole derivation. One
-			// cell buried under failures must not stop the other 127 — and it must
-			// not stop `rule110 recover` either, which derives before it can do
-			// anything, so failing here would leave an operator with no way in.
-			// The tip is left zero, which is safe precisely because a halted cell
-			// is never advanced. Unknown is deliberately NOT set: there is nothing
-			// here for recovery to reason from, so a human has to look.
-			out[cell].Halted = true
-			out[cell].HaltReason = fmt.Sprintf(
-				"none of this cell's newest %d records names a broadcast transaction "+
-					"(newest is generation %d, status %q), so its tip cannot be derived",
-				len(rows), rows[0].Generation, rows[0].Status)
-			claims[cell] = claim{}
+			// The shallow window is all wreckage. Dig for the newest record the
+			// network actually accepted before concluding anything: a cell whose
+			// rejection cascaded carries a long run of failures over a tip that is
+			// perfectly well defined, and reporting that cell as underivable reads
+			// as "lost" when it is merely buried. See history.Store.DeepTip.
+			deep, err := store.DeepTip(ctx, cell)
+			if err != nil {
+				return nil, err
+			}
+			if !deep.HasSettled {
+				// Genuinely nothing: no record anywhere names a transaction the
+				// network was told about, so there is no tip to derive and none may
+				// be guessed at.
+				//
+				// This halts the CELL rather than failing the whole derivation. One
+				// cell buried under failures must not stop the other 127 — and it must
+				// not stop `rule110 recover` either, which derives before it can do
+				// anything, so failing here would leave an operator with no way in.
+				// The tip is left zero, which is safe precisely because a halted cell
+				// is never advanced. Unknown is deliberately NOT set: there is nothing
+				// here for recovery to reason from, so a human has to look.
+				out[cell].Halted = true
+				out[cell].HaltReason = fmt.Sprintf(
+					"no record for this cell names a transaction the network accepted "+
+						"(newest is generation %d, status %q), so its tip cannot be derived",
+					rows[0].Generation, rows[0].Status)
+				claims[cell] = claim{}
+				continue
+			}
+
+			// The tip is known. The cell still does not advance — something above
+			// the tip failed or is unresolved, which is why the window was full of
+			// wreckage — but now the halt names a position an operator and
+			// `rule110 recover` can act on instead of a dead end.
+			base = deep.Settled
+			claims[cell] = claim{gen: base.Generation, txid: base.TxID}
+			txids = append(txids, base.TxID)
+
+			switch {
+			case deep.HasAttempt:
+				out[cell].Unknown = true
+				out[cell].Halted = true
+				out[cell].Attempted = base.Generation + 1
+				out[cell].HaltReason = fmt.Sprintf(
+					"generation %d was attempted but never resolved, so this cell's tip is UNKNOWN: "+
+						"a transition may have been broadcast without being recorded. Run \"rule110 recover\"",
+					deep.Attempt.Generation)
+			case deep.HasFailed:
+				out[cell].Halted = true
+				out[cell].HaltReason = fmt.Sprintf(
+					"this cell's chain ends at generation %d, buried under rejections up to "+
+						"generation %d: %s",
+					base.Generation, deep.Failed.Generation, orUnknown(deep.Failed.Err))
+			}
 			continue
 		}
 		claims[cell] = claim{gen: base.Generation, txid: base.TxID}

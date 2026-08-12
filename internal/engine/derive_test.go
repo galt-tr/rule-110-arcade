@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -387,6 +388,58 @@ func TestLegacyTipThatWasRejectedIsNotAFloor(t *testing.T) {
 	if err := CheckMigrationFloor(t.Context(), f.store, positions,
 		[]chain.CellChain{{Cell: 3, TxID: real, Generation: 994}}); err == nil {
 		t.Error("started with the store behind a legacy tip that was MINED; that output really is spent")
+	}
+}
+
+// TestCascadedRejectionsStillYieldATip reproduces the shape cells 34, 51 and 91
+// of the live automaton are in, and that the shallow derivation window reported
+// as unrecoverable.
+//
+// The build that wrote this deployment's older history advanced a cell's tip
+// when a transition was BROADCAST rather than when it was accepted. So one
+// rejection cascaded: the cell's next attempt spent the rejected transaction's
+// output, which does not exist, and was refused in turn — about 170 times over,
+// on top of a last good transaction near generation 300.
+//
+// A window of 8 records sees nothing but failures and concludes the tip cannot
+// be derived, which reads as "this cell is lost". It is not. A long run of
+// rejections is a cascade with a known cause, not ambiguity, and the newest
+// ACCEPTED record is the tip no matter how much wreckage is stacked on it.
+func TestCascadedRejectionsStillYieldATip(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+
+	const cell, lastGood = 2, 5
+	tip := f.genesisTip(cell)
+	for range lastGood {
+		tip = f.advance(t, cell, tip, history.StatusMined)
+	}
+
+	// Bury it under far more consecutive rejections than tipDepth can see.
+	for gen := uint64(lastGood + 1); gen <= lastGood+170; gen++ {
+		if err := f.store.RecordTx(ctx, history.CellTx{
+			Cell: cell, Generation: gen, TxID: strings.Repeat("0", 58) + fmt.Sprintf("%06x", gen),
+			Status: history.StatusFailed, Err: "arcade: REJECTED: PROCESSING (4)",
+		}); err != nil {
+			t.Fatalf("record rejection at %d: %v", gen, err)
+		}
+	}
+
+	positions := f.derive(t)
+	got := positions[cell]
+
+	if !got.Halted {
+		t.Fatal("a cell under 170 rejections must not advance")
+	}
+	if got.Tip.Generation != lastGood {
+		t.Errorf("derived tip generation %d, want %d — the newest ACCEPTED record is the tip "+
+			"however deep the wreckage above it goes", got.Tip.Generation, lastGood)
+	}
+	if got.Unknown {
+		t.Error("rejections are not ambiguity: the tip is known, so Unknown must stay clear")
+	}
+	if strings.Contains(got.HaltReason, "cannot be derived") {
+		t.Errorf("the halt still reports the cell as underivable, which reads as lost: %q", got.HaltReason)
 	}
 }
 
