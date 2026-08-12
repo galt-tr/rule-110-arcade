@@ -309,58 +309,101 @@ test('an unlocked deployment offers the clock controls', () => {
   }
 });
 
-test('the funding panel stays hidden while the automaton is healthy', () => {
-  // With a target loaded, so this asserts the interesting case: funding is
-  // available and simply not needed, rather than not configured.
-  app.setFundTarget({
-    address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
-    lockingScript: '76a914aa88ac',
-    network: 'ttn',
-    minSatoshis: 10000,
-    suggestedSatoshis: 500000,
-  });
+const FUND_TARGET = {
+  address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
+  lockingScript: '76a914aa88ac',
+  network: 'ttn',
+  minSatoshis: 10000,
+  suggestedSatoshis: 500000,
+};
 
+// The panel is permanent once funding is possible. It used to appear only when
+// the automaton was starved, which was wrong twice: it made "you can pay for
+// this" look like an error state on an exhibit whose whole premise is that
+// strangers keep it alive, and it hid the one useful control at the one moment
+// it mattered, because the panel sat below a canvas thousands of pixels tall.
+test('the funding panel is always offered, not only in trouble', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
+  flushFrames();
+
+  assert.strictEqual(byId('fund').hidden, false,
+    'a healthy automaton hides the only way to keep it healthy');
+  assert.strictEqual(byId('fund').className, '',
+    'a healthy automaton is showing an alarm state');
+  assert.strictEqual(byId('fundBtn').disabled, false, 'the fund button is disabled while healthy');
+});
+
+// A deployment that does not take public funding has no panel at all, rather
+// than an empty one.
+test('no funding panel when the deployment does not take payments', () => {
+  app.setFundTarget(null);
   apply(snapshot(tail(0, 4)));
   flushFrames();
   assert.strictEqual(byId('fund').hidden, true,
-    'a standing donation box on a healthy automaton is noise');
+    'a panel was offered by a deployment with no funding endpoint');
 });
 
-test('the funding panel appears when the automaton is starved', () => {
-  // The panel only renders once the target has loaded; the fetch is stubbed to
-  // reject, so drive the module's own loader state the way loadFundTarget does.
-  app.setFundTarget({
-    address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
-    lockingScript: '76a914aa88ac',
-    network: 'ttn',
-    minSatoshis: 10000,
-    suggestedSatoshis: 500000,
-  });
-
-  apply(snapshot(tail(0, 4), { starved: true }));
+// The leading indicator. Starvation is only declared after a 20-second grace,
+// so a page that waits for `starved` looks healthy right up until it halts.
+// One coin funds one cell transition, so fewer coins than cells means the next
+// generation cannot complete.
+test('running low is called out before the automaton actually stops', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { starved: false, poolCoins: CELLS - 1, waitingOnCoin: 0 }));
   flushFrames();
-  assert.strictEqual(byId('fund').hidden, false,
-    'a starved automaton must show where to send coin');
+
+  assert.strictEqual(byId('fund').className, 'low',
+    'a pool too small for one generation was not flagged');
 });
 
-test('the funding panel appears while the deployment is still bootstrapping', () => {
-  app.setFundTarget({
-    address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
-    lockingScript: '76a914aa88ac',
-    network: 'ttn',
-    minSatoshis: 10000,
-    suggestedSatoshis: 500000,
-  });
+// Cells already retrying a shortfall is the same warning reached from the other
+// side, and it fires even when the coin count still looks respectable.
+test('cells waiting on coin also count as running low', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { starved: false, poolCoins: CELLS * 10, waitingOnCoin: 3 }));
+  flushFrames();
 
+  assert.strictEqual(byId('fund').className, 'low',
+    'cells were already retrying shortfalls and the page said nothing');
+});
+
+test('a starved automaton says so unmistakably', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { starved: true, poolCoins: 0 }));
+  flushFrames();
+
+  assert.strictEqual(byId('fund').className, 'stopped',
+    'the automaton has halted for want of coin and the panel is not in its alarm state');
+  assert.match(byId('fundTitle').textContent, /STOPPED/,
+    'the headline does not say it has stopped');
+});
+
+test('a cold deployment says what it needs to start', () => {
+  app.setFundTarget(FUND_TARGET);
   apply(snapshot([], {
     starved: false,
     bootstrap: { phase: 'funding', address: 'mpz7', minSatoshis: 500000, have: 0 },
   }));
   flushFrames();
-  assert.strictEqual(byId('fund').hidden, false,
-    'a cold deployment must show what it is waiting for');
+
+  assert.strictEqual(byId('fund').className, 'stopped');
   assert.ok(byId('fundWhy').textContent.includes('500,000'),
     'the payer was not told how much is needed');
+});
+
+// Once paid, the panel stops asking and reports progress instead — otherwise it
+// keeps demanding money that is already being spent.
+test('a funded bootstrap reports progress instead of asking again', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot([], {
+    bootstrap: { phase: 'fuel', address: 'mpz7', minSatoshis: 500000, have: 900000 },
+  }));
+  flushFrames();
+
+  assert.strictEqual(byId('fund').className, 'working');
+  assert.strictEqual(byId('fundBtn').disabled, true,
+    'still soliciting payment while spending the last one');
 });
 
 for (const [name, fn] of tests) {
