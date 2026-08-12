@@ -43,16 +43,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # NO `latest`. The GitOps repository that consumes this image pins a tag
-      # and treats a moving one as a defect: an image that changes underneath a
-      # pinned manifest makes the cluster's state unreproducible, and the thing
-      # running here owns live UTXO chains. Every image is reachable by the
-      # commit that built it; a release is additionally reachable by its
-      # version.
+      # NO `latest` — see flavor below, which is what enforces it.
+      #
+      # The GitOps repository that consumes this image pins a tag and treats a
+      # moving one as a defect: an image that changes underneath a pinned
+      # manifest makes the cluster's state unreproducible, and the thing running
+      # here owns live UTXO chains. Every image is reachable by the commit that
+      # built it; a release is additionally reachable by its version.
+      #
+      # Note the published semver tags carry NO leading "v": the action strips
+      # it. The git tag is v0.1.0 and the image tag is 0.1.0. Anything pinning
+      # an image has to use the latter.
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # latest=false, and it has to be said explicitly. The action's default
+          # is latest=auto, which quietly adds a `latest` tag for the newest
+          # semver — so the first release published one despite the comment
+          # below saying it would not. A comment is not a setting.
+          flavor: |
+            latest=false
           tags: |
             type=sha,format=long,prefix=
             type=semver,pattern={{version}}
