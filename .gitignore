@@ -1,5 +1,25 @@
+# Build output.
 /rule110
 /spike
+
+# Wallet databases. There is no restore-from-seed in an arcade-only wallet, so
+# these files ARE the wallet.
 *.db
 *.db-*
+
+# The data directory holds keys.json and the deployment state.
+#
+# The trailing patterns are not redundant. A copy named data-sqlite-backup/ once
+# escaped the `/data/` rule and committed live wallet and funder private keys to
+# this repository — they sat in history until they were purged. Anything that
+# looks like a data directory, anywhere in the tree, is ignored by default.
 /data/
+data/
+data-*/
+*-backup/
+*.key
+keys.json
+
+# Write-then-rename temporaries: both SaveState and LoadOrCreateIdentity write
+# to path + ".tmp" before renaming into place.
+*.tmp
