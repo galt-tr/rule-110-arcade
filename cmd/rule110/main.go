@@ -512,8 +512,13 @@ func cmdFuel(args []string) error {
 	cfg := chain.DefaultConfig()
 	fs := flag.NewFlagSet("fuel", flag.ContinueOnError)
 	network := bindCommon(fs, &cfg)
-	count := fs.Uint64("count", 300, "how many coins to mint")
-	sats := fs.Uint64("sats", 20000, "value of each coin (must cover one cell transition's fee)")
+	// Defaults come from the pool configuration rather than from literals, so
+	// -sats tracks -fuel-sats and -count tracks -fuel-pool. They used to be 20000
+	// and 300 against a pool denomination of 1000, which meant plain
+	// `rule110 fuel` minted coins the funder could never spend — see below.
+	count := fs.Uint64("count", cfg.FuelPoolSize, "how many coins to mint")
+	sats := fs.Uint64("sats", cfg.FuelDenomination,
+		"value of each coin; under -throughput this MUST equal -fuel-sats")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -522,6 +527,21 @@ func cmdFuel(args []string) error {
 		return err
 	}
 	cfg.Network = net
+
+	// A coin whose value is not the pool denomination is invisible to the
+	// funder. Under the throughput strategy, claiming is
+	// `... AND satoshis = <denomination>` (utxostore ClaimExact) — an exact
+	// match, not a minimum — so minting at any other value produces coins that
+	// sit in the pool basket forever. The symptom is the worst kind: the mint
+	// succeeds, the balance looks healthy, and every cell transition reports
+	// "not enough funds" until someone works out why. Refuse instead.
+	if _, denom, _, on := cfg.FuelPool(); on && *sats != denom {
+		return fmt.Errorf(
+			"-sats %d does not match the pool denomination -fuel-sats %d: "+
+				"the funder claims coins of exactly the denomination, so these would never be spent "+
+				"(pass -fuel-sats %d to mint for a differently configured pool)",
+			*sats, denom, *sats)
+	}
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
