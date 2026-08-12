@@ -76,7 +76,7 @@ func cmdDepthProbe(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := engine.CheckMigrationFloor(ctx, d.store, positions, d.facts.LegacyTips()); err != nil {
+	if err := engine.CheckMigrationFloor(ctx, d.store, d.chain.Oracle, positions, d.facts.LegacyTips()); err != nil {
 		return err
 	}
 	if *cell < 0 || *cell >= d.facts.Cells {

@@ -1176,3 +1176,15 @@ func orNoReason(rejection string) string {
 	}
 	return fmt.Sprintf("%q", rejection)
 }
+
+// RefusedByNetwork reports whether arcade's verdict is that the network refused
+// this transaction outright.
+//
+// Deliberately NOT the negation of acceptedByNetwork. Most statuses mean arcade
+// is still holding the transaction and the network has not spoken; only these
+// two say it spoke against. A caller waiving a safety check needs "definitely
+// refused", not "not yet accepted", and conflating the two would waive it on
+// every transaction still in flight.
+func RefusedByNetwork(s arcade.Status) bool {
+	return s == arcade.StatusRejected || s == arcade.StatusDoubleSpendAttempted
+}

@@ -567,7 +567,21 @@ func fetchRaw(ctx context.Context, l chain.Ledger, txids []string) (map[string][
 // the rejected set would get a check that refuses to start on an intact
 // deployment — a failure that only shows up against a legacy file nobody has in
 // a test environment. Making it impossible to omit is worth the store argument.
-func CheckMigrationFloor(ctx context.Context, store *history.Store,
+// The "was it refused" question goes to the NETWORK, with our own record used
+// only as a cache. That distinction is not pedantry — it was a live bug. This
+// check first asked the store alone, on the reasoning that a rejection resolves
+// to a `failed` row. Recovery then learned to RETRACT those rows, which is
+// correct (a rejection built on a superseded parent is wreckage, not evidence
+// about the tip) and which deleted the very thing this check was reading. The
+// deployment could not start: three legacy tips it had previously proved refused
+// were suddenly unexplained, and it refused to run over a store that was
+// perfectly intact.
+//
+// Whether a transaction exists is not a fact our database owns. Asking arcade
+// makes the answer independent of anything recovery, pruning or an operator does
+// to the record. A nil oracle falls back to the record alone, which is the old
+// behaviour and is what the offline tests use.
+func CheckMigrationFloor(ctx context.Context, store *history.Store, oracle chain.TxStatus,
 	positions []CellPosition, legacy []chain.CellChain) error {
 
 	txids := make([]string, 0, len(legacy))
@@ -589,10 +603,18 @@ func CheckMigrationFloor(ctx context.Context, store *history.Store,
 		if rejected[l.TxID] {
 			continue
 		}
-		if got := positions[l.Cell].Tip.Generation; got < l.Generation {
-			behind = append(behind, fmt.Sprintf("cell %d: derived %d, state.json says %d",
-				l.Cell, got, l.Generation))
+		got := positions[l.Cell].Tip.Generation
+		if got >= l.Generation {
+			continue
 		}
+		// The record does not say this one was refused, but the record is not the
+		// authority and may have had the row retracted. Ask the network before
+		// refusing to start over it.
+		if refused, known := networkRefused(ctx, oracle, l.TxID); known && refused {
+			continue
+		}
+		behind = append(behind, fmt.Sprintf("cell %d: derived %d, state.json says %d",
+			l.Cell, got, l.Generation))
 	}
 	if len(behind) == 0 {
 		return nil
@@ -604,6 +626,25 @@ func CheckMigrationFloor(ctx context.Context, store *history.Store,
 			"run \"rule110 import-tips\" to backfill the store from the legacy record "+
 			"(it verifies every entry and is a dry run by default)",
 		len(behind), strings.Join(behind, "\n  "))
+}
+
+// networkRefused asks arcade whether txid was refused, reporting separately
+// whether an answer was obtained at all.
+//
+// The two return values matter. An unreachable arcade, an absent oracle, or a
+// transaction arcade has never heard of are all "not known", and a floor is NOT
+// waived on a guess: an unanswered question leaves the legacy tip standing as a
+// floor and the deployment refuses to start, which is the safe direction. Only a
+// definite REJECTED waives it.
+func networkRefused(ctx context.Context, oracle chain.TxStatus, txid string) (refused, known bool) {
+	if oracle == nil {
+		return false, false
+	}
+	rec, err := oracle.GetTx(ctx, txid)
+	if err != nil || rec == nil {
+		return false, false
+	}
+	return chain.RefusedByNetwork(rec.Status), true
 }
 
 func orUnknown(s string) string {

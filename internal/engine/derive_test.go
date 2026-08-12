@@ -384,7 +384,7 @@ func TestLegacyStateAheadOfHistoryRefusesToStart(t *testing.T) {
 		{Cell: 2, TxID: strings.Repeat("aa", 32), Generation: 837},
 		{Cell: 6, TxID: strings.Repeat("bb", 32), Generation: 806},
 	}
-	err := CheckMigrationFloor(t.Context(), f.store, positions, legacy)
+	err := CheckMigrationFloor(t.Context(), f.store, nil, positions, legacy)
 	if err == nil {
 		t.Fatal("started with the history store hundreds of generations behind state.json; " +
 			"every cell would re-spend a spent output")
@@ -397,7 +397,7 @@ func TestLegacyStateAheadOfHistoryRefusesToStart(t *testing.T) {
 
 	// Deriving AHEAD of the legacy file is expected — it was written on a timer
 	// and is routinely stale — and must not be refused.
-	if err := CheckMigrationFloor(t.Context(), f.store, positions, []chain.CellChain{
+	if err := CheckMigrationFloor(t.Context(), f.store, nil, positions, []chain.CellChain{
 		{Cell: 2, TxID: strings.Repeat("aa", 32), Generation: 0},
 	}); err != nil {
 		t.Errorf("refused a legacy file that is merely stale: %v", err)
@@ -432,7 +432,7 @@ func TestLegacyTipThatWasRejectedIsNotAFloor(t *testing.T) {
 	}
 
 	legacy := []chain.CellChain{{Cell: 2, TxID: phantom, Generation: 994}}
-	if err := CheckMigrationFloor(t.Context(), f.store, positions, legacy); err != nil {
+	if err := CheckMigrationFloor(t.Context(), f.store, nil, positions, legacy); err != nil {
 		t.Errorf("refused to start because the legacy file points at a transaction the record says "+
 			"was REJECTED; that transaction has no output, so it is not a floor: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestLegacyTipThatWasRejectedIsNotAFloor(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record the mined tip: %v", err)
 	}
-	if err := CheckMigrationFloor(t.Context(), f.store, positions,
+	if err := CheckMigrationFloor(t.Context(), f.store, nil, positions,
 		[]chain.CellChain{{Cell: 3, TxID: real, Generation: 994}}); err == nil {
 		t.Error("started with the store behind a legacy tip that was MINED; that output really is spent")
 	}

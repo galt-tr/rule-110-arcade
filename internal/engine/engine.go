@@ -323,7 +323,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 	if err != nil {
 		return nil, err
 	}
-	if err := CheckMigrationFloor(ctx, store, positions, d.LegacyTips()); err != nil {
+	if err := CheckMigrationFloor(ctx, store, c.Oracle, positions, d.LegacyTips()); err != nil {
 		return nil, err
 	}
 	e.applyPositions(positions)
