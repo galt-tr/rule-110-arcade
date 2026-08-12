@@ -42,23 +42,13 @@ func (c *Chain) FanOutFuel(ctx context.Context, count, satoshis uint64) ([]FuelR
 		return nil, fmt.Errorf("chain: coin value must be positive")
 	}
 
-	// Mint where the funder will look. Under the throughput strategy that is the
-	// denominated pool basket; otherwise the funder claims from ordinary change.
-	// Getting this wrong is silent: the coins exist, the balance looks healthy,
-	// and every transition still reports "not enough funds" forever.
-	basket := wdk.BasketNameForChange
-	if pool, _, _, enabled := c.Config.FuelPool(); enabled {
-		basket = pool
-	}
-
 	var results []FuelResult
 	for minted := uint64(0); minted < count; {
 		batch := min(count-minted, fanoutPerTx)
 
-		shape := wdk.ShapedChange{
-			Count:    batch,
-			Satoshis: primitives.SatoshiValue(satoshis),
-			Basket:   primitives.StringUnder300(basket),
+		shape, err := c.Config.fuelShape(batch, satoshis)
+		if err != nil {
+			return results, err
 		}
 
 		// Each round spends the previous round's change, and that coin is not
@@ -79,6 +69,54 @@ func (c *Chain) FanOutFuel(ctx context.Context, count, satoshis uint64) ([]FuelR
 		minted += batch
 	}
 	return results, nil
+}
+
+// fuelShape describes one fan-out round: how many coins, of what value, into
+// which basket — and, crucially, out of which basket they are FUNDED.
+//
+// Both baskets have a silent failure behind them, which is why this is one
+// function with one comment rather than two literals at the call site.
+//
+// The DESTINATION is where the funder will look for the coins. Under the
+// throughput strategy that is the denominated pool; otherwise the funder claims
+// from ordinary change. Minting into the wrong one is invisible: the coins
+// exist, the balance reads healthy, and every transition still reports "not
+// enough funds" forever.
+//
+// The SOURCE is the fix for the cold-start deadlock recorded against this
+// project — `rule110 fuel` failing with "not enough funds" on a fresh wallet
+// that plainly held a deposit, worked around by turning throughput off. storage's
+// fanOutSourceBasket routes a fan-out by its destination: a pool-destination
+// shape draws from the RESERVE basket unless SourceBasket overrides it. The
+// reserve is the keeper's staging area, filled by aggregating change crumbs, so
+// on a fresh wallet it is empty while the deposit internalize just credited sits
+// in change. The one command whose job is to create the pool could not fund
+// itself. The keeper never had the bug only because its RecycleBasket setting
+// becomes this same field.
+//
+// Sourcing from change unconditionally is deliberate rather than conditional on
+// the reserve being empty. This path exists to turn DEPOSITS into fuel, and a
+// deposit always lands in change — InternalizeAction credits the change basket.
+// The reserve belongs to the keeper, which drains it through its own leaf path.
+func (c *Config) fuelShape(count, satoshis uint64) (wdk.ShapedChange, error) {
+	if count == 0 {
+		return wdk.ShapedChange{}, fmt.Errorf("chain: coin count must be positive")
+	}
+	if satoshis == 0 {
+		return wdk.ShapedChange{}, fmt.Errorf("chain: coin value must be positive")
+	}
+
+	basket := string(wdk.BasketNameForChange)
+	if pool, _, _, enabled := c.FuelPool(); enabled {
+		basket = pool
+	}
+
+	return wdk.ShapedChange{
+		Count:        count,
+		Satoshis:     primitives.SatoshiValue(satoshis),
+		Basket:       primitives.StringUnder300(basket),
+		SourceBasket: primitives.StringUnder300(wdk.BasketNameForChange),
+	}, nil
 }
 
 // RunFuelKeeper keeps the denominated pool topped up for as long as ctx lives.

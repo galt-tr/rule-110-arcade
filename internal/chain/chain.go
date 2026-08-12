@@ -111,7 +111,7 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 	oracle := arcade.New(logger, nil, defs.Arcade{
 		Enabled:       true,
 		URL:           cfg.ArcadeURL,
-		EventsURL:     cfg.ArcadeURL,
+		EventsURL:     cfg.eventsURL(),
 		CallbackToken: callbackToken,
 		// Every transition, not just terminal ones: the diagram is showing the
 		// lifecycle, so the intermediate states are the point.

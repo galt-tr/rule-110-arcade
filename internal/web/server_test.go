@@ -20,8 +20,14 @@ import (
 // the test drives directly.
 type fakeAutomaton struct {
 	mu        sync.Mutex
-	published []byte
+	published *[]byte
 	changed   chan struct{}
+
+	// locked is what Stats reports, and therefore what handleControl refuses on.
+	locked bool
+
+	// driven records every mutator the HTTP layer actually reached.
+	driven []string
 
 	snapshotCalls, tailCalls, statsCalls int
 
@@ -38,13 +44,27 @@ func newFakeAutomaton() *fakeAutomaton {
 // publisher and notify() do together.
 func (f *fakeAutomaton) publish(payload string) {
 	f.mu.Lock()
-	f.published = []byte(payload)
+	// A FRESH slice, and therefore a fresh pointer, on every publish — the
+	// engine's PublishTail does the same, and subscribers use that pointer to
+	// tell a new frame from the one they already sent.
+	b := []byte(payload)
+	f.published = &b
 	close(f.changed)
 	f.changed = make(chan struct{})
 	f.mu.Unlock()
 }
 
-func (f *fakeAutomaton) PublishedTail() ([]byte, bool) {
+// notifyOnly wakes subscribers WITHOUT publishing anything new, which is what
+// the engine's notify() does on every recorded cell and status batch between
+// the publisher's throttled rebuilds.
+func (f *fakeAutomaton) notifyOnly() {
+	f.mu.Lock()
+	close(f.changed)
+	f.changed = make(chan struct{})
+	f.mu.Unlock()
+}
+
+func (f *fakeAutomaton) PublishedTail() (*[]byte, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "read")
@@ -85,7 +105,7 @@ func (f *fakeAutomaton) Stats() engine.Snapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statsCalls++
-	return engine.Snapshot{Cells: 128}
+	return engine.Snapshot{Cells: 128, Locked: f.locked}
 }
 
 func (f *fakeAutomaton) counts() (snapshot, tail, stats int) {
@@ -94,9 +114,24 @@ func (f *fakeAutomaton) counts() (snapshot, tail, stats int) {
 	return f.snapshotCalls, f.tailCalls, f.statsCalls
 }
 
-func (f *fakeAutomaton) SetMode(engine.Mode) {}
-func (f *fakeAutomaton) SetRate(float64)     {}
-func (f *fakeAutomaton) Step()               {}
+// The mutators record that they were reached at all. A locked deployment must
+// refuse BEFORE the engine is touched, so "was it called" is the assertion, not
+// "what did it do".
+func (f *fakeAutomaton) SetMode(engine.Mode) { f.drove("SetMode") }
+func (f *fakeAutomaton) SetRate(float64)     { f.drove("SetRate") }
+func (f *fakeAutomaton) Step()               { f.drove("Step") }
+
+func (f *fakeAutomaton) drove(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.driven = append(f.driven, name)
+}
+
+func (f *fakeAutomaton) drivenCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.driven...)
+}
 
 func testServer(f *fakeAutomaton) *httptest.Server {
 	return httptest.NewServer(New(f, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
@@ -376,4 +411,120 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// TestLockedControlsAreRefused is the guard for the one endpoint a public
+// deployment cannot afford to leave open.
+//
+// POST /api/control has no authentication of any kind, so on a public URL it is
+// one request from anyone: pause the automaton, single-step it, or set the rate
+// to something the chain cannot serve. Hiding the buttons in the browser is
+// presentation. The refusal has to be here, it has to cover every action rather
+// than the obvious ones, and it has to happen before the engine is reached.
+func TestLockedControlsAreRefused(t *testing.T) {
+	for _, body := range []string{
+		`{"action":"play"}`,
+		`{"action":"pause"}`,
+		`{"action":"step"}`,
+		`{"action":"rate","rate":20}`,
+	} {
+		f := newFakeAutomaton()
+		f.locked = true
+		srv := testServer(f)
+
+		res, err := http.Post(srv.URL+"/api/control", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Body.Close()
+		srv.Close()
+
+		if res.StatusCode != http.StatusForbidden {
+			t.Errorf("%s returned %d, want %d", body, res.StatusCode, http.StatusForbidden)
+		}
+		if driven := f.drivenCalls(); len(driven) != 0 {
+			t.Errorf("%s reached the engine (%v); a locked deployment must refuse before it", body, driven)
+		}
+	}
+}
+
+// Unlocked, the same requests must still drive the engine — the lock is a
+// deployment choice, not a removal of the feature.
+func TestUnlockedControlsStillReachTheEngine(t *testing.T) {
+	f := newFakeAutomaton()
+	srv := testServer(f)
+	defer srv.Close()
+
+	res, err := http.Post(srv.URL+"/api/control", "application/json", strings.NewReader(`{"action":"play"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("control returned %d, want 200", res.StatusCode)
+	}
+	if driven := f.drivenCalls(); len(driven) != 1 || driven[0] != "SetMode" {
+		t.Errorf("play drove %v, want one SetMode", driven)
+	}
+}
+
+// TestEventsDoesNotResendAnUnchangedTail is the guard for what a public viewer
+// actually costs.
+//
+// The engine coalesces the CONTENT of a publish but not the notifications:
+// notify() fires on every recorded cell, every status batch and every clock
+// tick, while PublishTails rebuilds at most once per PublishInterval. The
+// subscriber loop wakes on each notification, so without a check it wrote a
+// byte-identical frame every time — hundreds of kilobytes each, at 256 cells,
+// many times a second, per connected browser.
+func TestEventsDoesNotResendAnUnchangedTail(t *testing.T) {
+	f := newFakeAutomaton()
+	// Publish BEFORE connecting. handleEvents writes no response headers until
+	// its first flush, so against an engine that has published nothing the
+	// client's Do() blocks until the 15s keepalive — which is a slow test, not a
+	// stranded frame, but it hides everything after it.
+	f.publish(`{"generation":1}`)
+
+	srv := testServer(f)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	frames := readFrames(t, res.Body)
+	if got := nextFrame(t, frames, 5*time.Second, "no initial frame"); got != `{"generation":1}` {
+		t.Fatalf("first frame = %q", got)
+	}
+
+	// Wake the subscriber repeatedly with no new publish in between, SPACED so
+	// the handler completes a loop for each one. Firing them back to back is not
+	// the same test: a closed channel wakes the select once, so a tight burst
+	// collapses into a single pass and would not resend anything even without
+	// the check below. A settling generation notifies steadily, not instantly.
+	for range 10 {
+		f.notifyOnly()
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Nothing new was published, so nothing may have been sent.
+	select {
+	case dup := <-frames:
+		t.Fatalf("the stream re-sent %q after notifications that published nothing; "+
+			"every connected browser pays for this frame again on each notify()", dup)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// And a real publish still gets through — the check must suppress
+	// duplicates, not updates.
+	f.publish(`{"generation":2}`)
+	if got := nextFrame(t, frames, 5*time.Second, "the next publish was never sent"); got != `{"generation":2}` {
+		t.Errorf("frame after the second publish = %q, want it", got)
+	}
 }

@@ -1,0 +1,88 @@
+# Publishes the runtime image to GHCR.
+#
+# Split from ci.yml rather than bolted onto it, because the two answer different
+# questions. ci runs on every branch and every pull request and proves the code
+# is sound; this runs only where a pushed image is meaningful and needs write
+# credentials to a public registry. Keeping the credential-bearing job off
+# pull-request events is the point of the split — a fork's PR must never be able
+# to publish under this repository's name.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Least privilege, and `packages: write` is the only elevation. GITHUB_TOKEN is
+# scoped to this repository, so no long-lived registry secret has to exist.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+# One publish at a time per ref. Two runs racing on the same tag is how a
+# registry ends up serving an image nobody can trace back to a commit.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # NO `latest`. The GitOps repository that consumes this image pins a tag
+      # and treats a moving one as a defect: an image that changes underneath a
+      # pinned manifest makes the cluster's state unreproducible, and the thing
+      # running here owns live UTXO chains. Every image is reachable by the
+      # commit that built it; a release is additionally reachable by its
+      # version.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=rule110
+            org.opencontainers.image.description=Rule 110 proved in Bitcoin Script, one UTXO chain per cell
+
+      # linux/amd64 only, deliberately. The build stage needs CGO for the
+      # tree-sitter frontend in the Runar compiler, so a second architecture
+      # means QEMU-emulating a cgo build — minutes become tens of minutes — and
+      # the only consumer is an x86 EKS node group.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The CGO build stage is the slow part and it changes rarely. Without
+          # a cache every push recompiles the whole dependency tree.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The manifests reference an image by digest-backed tag, so print the one
+      # that was just published rather than making someone open the registry to
+      # find out what to pin.
+      - name: what to pin
+        run: |
+          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

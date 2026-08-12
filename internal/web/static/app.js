@@ -5,13 +5,13 @@
 // the pattern behind the leading edge — the automaton and the chain are the
 // same picture.
 //
-// The renderer is incremental, and it has to be. A push carries a 48-generation
-// tail roughly ten times a second, and the diagram holds up to 2048 generations
-// of 128 cells; repainting all of it per push is a quarter of a million fillRect
-// calls per frame, about 2.6M a second, for a few dozen cells that actually
-// changed. So the canvas is treated as a durable surface: rows are painted once,
-// scrolled with the bitmap when the window slides, and repainted only when their
-// generation is genuinely replaced.
+// The renderer is incremental, and it has to be. A push carries a short tail
+// several times a second, and the diagram holds a thousand-odd generations of a
+// 256-cell ring; repainting all of it per push is a quarter of a million
+// fillRect calls per frame for a few dozen cells that actually changed. So the
+// canvas is treated as a durable surface: rows are painted once, scrolled with
+// the bitmap when the window slides, and repainted only when their generation is
+// genuinely replaced.
 
 // Read the palette from CSS so the stylesheet stays the single source of
 // truth, but fall back to literals: an empty custom property is silently
@@ -31,12 +31,14 @@ const COLOR = {
   failedDead: color('--failed-dead', '#5c2226'),
 };
 
-/** How many generations the client keeps. Matches the server's own bound.
+/** How many generations the client keeps. Matches the server's own bound
+ *  (engine.maxHistory); holding more than the server will ever send is memory
+ *  spent on generations that can never be refreshed.
  *
  * The client used to keep everything it was ever sent, which is a slow fuse:
  * canvas height is generations x cellPx, browsers refuse a dimension over about
  * 32767px, and past that the diagram does not degrade — it goes blank. */
-const MAX_HISTORY = 2048;
+const MAX_HISTORY = 1024;
 
 /** Trimming reindexes, so trim in chunks rather than once per generation. */
 const TRIM_SLACK = 64;
@@ -48,12 +50,27 @@ const TRIM_SLACK = 64;
  * way in you see fewer rows, and zooming out brings them back. */
 const MAX_CANVAS_PX = 32000;
 
+/** Ceiling on canvas AREA, in pixels.
+ *
+ * The dimension cap above is necessary and not sufficient. Cost is width times
+ * height, and width is now cells x cellPx: a 256-cell ring at 8px is 2048px
+ * wide, so a legal 32000px height is 65 megapixels — a quarter of a gigabyte of
+ * bitmap, doubled while reflow holds the carry copy. Desktop browsers swap and
+ * stutter; iOS Safari refuses outright somewhere near 16M and the diagram goes
+ * blank, which is the same failure the dimension cap was added to prevent and
+ * was reached a different way. */
+const MAX_CANVAS_AREA = 16e6;
+
 const canvas = document.getElementById('grid');
 const ctx = canvas.getContext('2d');
 const tip = document.getElementById('tip');
 const wrap = document.getElementById('canvas-wrap');
 
-let cellPx = 8;       // driven by the zoom control, not the viewport
+// 4px, not 8. Width is cells x cellPx and the ring is 256: at 8px the diagram
+// opens 2048px wide, which is wider than most viewports, so the live edge starts
+// off-screen behind a horizontal scrollbar. Zooming in is a deliberate act;
+// having to zoom out to see anything is not.
+let cellPx = 4;       // driven by the zoom control, not the viewport
 let follow = true;    // auto-scroll only while pinned to the newest row
 
 /** Everything the client holds, accumulated across pushes.
@@ -163,9 +180,17 @@ function reindex() {
   }
 }
 
-/** How many rows fit under the canvas dimension ceiling at this zoom. */
-function renderableRows() {
-  return Math.max(1, Math.floor(MAX_CANVAS_PX / cellPx));
+/** How many rows fit under the canvas ceilings at this zoom.
+ *
+ * Two limits, and the area one only exists because the ring got wider: the
+ * height cap alone is satisfied by a canvas far too large to allocate once the
+ * width is a couple of thousand pixels. Whichever binds first wins; zooming out
+ * relaxes both. */
+function renderableRows(cells) {
+  const byHeight = Math.floor(MAX_CANVAS_PX / cellPx);
+  const width = Math.max(1, (cells || 1) * cellPx);
+  const byArea = Math.floor(MAX_CANVAS_AREA / (width * cellPx));
+  return Math.max(1, Math.min(byHeight, byArea));
 }
 
 /** Bring the bitmap's geometry in line with the window about to be drawn,
@@ -281,7 +306,7 @@ function draw() {
   if (!s) return;
   document.getElementById('empty').hidden = state.history.length > 0;
 
-  const limit = renderableRows();
+  const limit = renderableRows(s.cells);
   view = state.history.length > limit
     ? state.history.slice(state.history.length - limit)
     : state.history;
@@ -381,7 +406,23 @@ function scheduleRender() {
 function render() {
   if (!state.snap) return;
   renderStats(state.snap);
+  renderControls(state.snap);
+  renderFund(state.snap);
   draw();
+}
+
+/** Hide the clock controls when the deployment refuses them.
+ *
+ * Presentation only — the server returns 403 for every one of these whether or
+ * not the buttons exist. Zoom and follow stay: they are client-side and affect
+ * nobody else. */
+function renderControls(s) {
+  for (const id of ['play', 'pause', 'step']) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = !!s.locked;
+  }
+  const rateLabel = document.getElementById('rateLabel');
+  if (rateLabel) rateLabel.hidden = !!s.locked;
 }
 
 function apply(s) {
@@ -443,6 +484,165 @@ const rateOut = document.getElementById('rateOut');
 rate.oninput = () => { rateOut.textContent = (+rate.value).toFixed(2) + ' gen/s'; };
 rate.onchange = () => control('rate', { rate: +rate.value });
 
+// ---------------------------------------------------------------------------
+// Funding
+// ---------------------------------------------------------------------------
+
+/** The payment instruction from GET /api/funding, or null if this deployment
+ *  does not take public funding (the endpoint 404s). */
+let fundTarget = null;
+
+/** Show the panel when the deployment is actually asking for money: while it is
+ *  bootstrapping and has none, or once it has run out. Not otherwise — a
+ *  standing donation box on a healthy automaton is noise. */
+function renderFund(s) {
+  const panel = document.getElementById('fund');
+  if (!panel) return;
+
+  // No target means /api/funding 404'd: this deployment does not take public
+  // funding, so the panel can never be useful. Hide it explicitly rather than
+  // returning and leaving whatever state it was in — that is correct only by
+  // accident of the markup starting hidden.
+  if (!fundTarget) {
+    panel.hidden = true;
+    return;
+  }
+
+  const wanted = !!s.bootstrap || !!s.starved;
+  panel.hidden = !wanted;
+  if (!wanted) return;
+
+  const phase = s.bootstrap?.phase;
+  const title = document.getElementById('fundTitle');
+  const why = document.getElementById('fundWhy');
+
+  if (phase && phase !== 'funding' && phase !== 'waiting') {
+    // Money has arrived and the deployment is spending it. Keep the panel up so
+    // the sequence is visible, but stop asking.
+    title.textContent = phase === 'fuel' ? 'Minting fuel…' : 'Creating generation 0…';
+    why.textContent = 'Funded. This takes a few seconds.';
+    document.getElementById('fundBtn').disabled = true;
+    return;
+  }
+
+  document.getElementById('fundBtn').disabled = false;
+  if (s.bootstrap) {
+    title.textContent = 'Fund this automaton to start it';
+    const need = s.bootstrap.minSatoshis || 0;
+    const have = s.bootstrap.have || 0;
+    why.textContent =
+      `Nothing has run yet. It needs about ${need.toLocaleString()} satoshis to mint ` +
+      `its first fuel and create generation 0; it has ${have.toLocaleString()}.`;
+  } else {
+    title.textContent = 'This automaton has run out of coin';
+    why.textContent =
+      'Every cell transition costs a fee, so it stops when the fuel pool empties. ' +
+      'Any amount restarts it.';
+  }
+}
+
+/** Say something to the payer, and leave it said. */
+function fundSay(msg, kind) {
+  const el = document.getElementById('fundStatus');
+  el.textContent = msg;
+  el.className = 'fund-status' + (kind ? ' ' + kind : '');
+  el.hidden = !msg;
+}
+
+async function loadFundTarget() {
+  const res = await fetch('/api/funding');
+  if (!res.ok) return; // public funding is off; the panel stays hidden forever
+  fundTarget = await res.json();
+
+  document.getElementById('fundAddress').textContent = fundTarget.address;
+  document.getElementById('fundNetwork').textContent = fundTarget.network;
+  const amount = document.getElementById('fundAmount');
+  amount.value = String(fundTarget.suggestedSatoshis || fundTarget.minSatoshis || 0);
+  amount.min = String(fundTarget.minSatoshis || 0);
+  scheduleRender();
+}
+
+document.getElementById('fundBtn').onclick = async () => {
+  const btn = document.getElementById('fundBtn');
+  const satoshis = Number(document.getElementById('fundAmount').value);
+
+  if (!Number.isFinite(satoshis) || satoshis < (fundTarget.minSatoshis || 0)) {
+    fundSay(`The minimum is ${(fundTarget.minSatoshis || 0).toLocaleString()} satoshis.`, 'bad');
+    return;
+  }
+
+  btn.disabled = true;
+  try {
+    fundSay('Looking for a wallet…');
+    if (!await Wallet.probe()) {
+      fundSay(Wallet.explain(new Error('none')), 'bad');
+      document.getElementById('fundManual').open = true;
+      return;
+    }
+
+    // Coarse guard only. BRC-100 cannot say WHICH test network a wallet is on,
+    // so this catches a mainnet wallet and nothing subtler; the authoritative
+    // check is our own arcade refusing the broadcast, which is safe to rely on
+    // because the wallet was asked not to send.
+    const net = await Wallet.network();
+    const wantMainnet = fundTarget.network === 'main';
+    if (net && (net === 'mainnet') !== wantMainnet) {
+      fundSay(`This deployment runs on ${fundTarget.network}, but your wallet is on ${net}. ` +
+        `Nothing has been spent.`, 'bad');
+      return;
+    }
+
+    fundSay('Waiting for you to approve the payment…');
+    const { beef, txid } = await Wallet.fundWith(fundTarget.lockingScript, satoshis);
+
+    fundSay('Broadcasting and crediting…');
+    const res = await fetch('/api/fund', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ beef }),
+    });
+    if (!res.ok) {
+      fundSay((await res.text()).trim() || 'The payment was refused.', 'bad');
+      return;
+    }
+
+    const out = await res.json();
+    fundSay(`Thank you — ${out.satoshis.toLocaleString()} satoshis credited.`, 'good');
+    // Best effort: let the wallet mark its own noSend action as sent.
+    Wallet.settle(txid || out.txid);
+  } catch (err) {
+    fundSay(Wallet.explain(err), 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+document.getElementById('fundCopy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(fundTarget.address);
+    fundSay('Address copied.', 'good');
+  } catch {
+    fundSay('Could not copy; select the address by hand.', 'bad');
+  }
+};
+
+document.getElementById('fundTxidBtn').onclick = async () => {
+  const txid = document.getElementById('fundTxid').value.trim();
+  if (!txid) return;
+  fundSay('Looking that transaction up…');
+  const res = await fetch('/api/fund', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ txid }),
+  });
+  if (!res.ok) {
+    fundSay((await res.text()).trim() || 'That transaction could not be credited.', 'bad');
+    return;
+  }
+  const out = await res.json();
+  fundSay(`Thank you — ${out.satoshis.toLocaleString()} satoshis credited.`, 'good');
+};
+
 /** Which cell is under the pointer, or null. */
 function cellAt(ev) {
   if (!state.snap || !view.length) return null;
@@ -492,9 +692,16 @@ const events = new EventSource('/api/events');
 events.onmessage = (ev) => apply(JSON.parse(ev.data));
 
 fetch('/api/state').then(r => r.json()).then(apply).catch(() => {});
+loadFundTarget().catch(() => {});
 
 // Exposed for the renderer test, which drives this file under a DOM stub. Not
 // used by the page itself.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { apply, state, paint, MAX_HISTORY, MAX_CANVAS_PX };
+  module.exports = {
+    apply, state, paint, MAX_HISTORY, MAX_CANVAS_PX,
+    // The panel is driven by GET /api/funding, which the harness has no network
+    // for. Exposing the setter is cheaper than stubbing fetch well enough to
+    // deliver a body, and it is the same field loadFundTarget assigns.
+    setFundTarget(t) { fundTarget = t; },
+  };
 }

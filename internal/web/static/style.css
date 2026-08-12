@@ -18,6 +18,12 @@
      look healthy — but not bright, or the diagram would read it as alive and
      the pattern would be wrong. */
   --failed-dead: #5c2226;
+
+  /* The funding panel. Warm against a cold diagram, because it is the one part
+     of the page that asks the viewer for something. */
+  --fund-line: #6b5a2a;
+  --fund-good: #7fd6a0;
+  --fund-bad: var(--failed);
 }
 
 * { box-sizing: border-box; }
@@ -160,3 +166,78 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 #tip b { color: var(--accent); }
 
 #tip .hint { color: var(--muted); }
+
+/* ---------------------------------------------------------------------------
+   Funding
+
+   Shown only when the deployment is actually asking for money -- bootstrapping
+   with nothing, or starved. app.js decides; this is only how it looks.
+   --------------------------------------------------------------------------- */
+
+#fund {
+  margin: 0;
+  padding: 14px 16px;
+  background: var(--panel);
+  border-top: 1px solid var(--fund-line);
+}
+
+#fund h2 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+#fund p { margin: 0 0 10px; }
+.muted { color: var(--muted); font-size: 12px; }
+
+.fund-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.fund-row label { color: var(--muted); font-size: 12px; }
+
+#fund input[type="number"],
+#fund input[type="text"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font: inherit;
+}
+#fund input[type="number"] { width: 12ch; }
+#fund input[type="text"] { flex: 1 1 40ch; min-width: 0; }
+
+/* The address is the fallback path's whole payload, so it has to survive being
+   selected, copied and read aloud. Wrapping beats truncation. */
+.addr {
+  display: inline-block;
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--accent);
+  word-break: break-all;
+}
+
+.fund-status { font-size: 12px; color: var(--muted); }
+.fund-status.good { color: var(--fund-good); }
+.fund-status.bad { color: var(--fund-bad); }
+
+#fund summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+#fund button:disabled {
+  opacity: 0.5;
+  cursor: default;
+  border-color: var(--line);
+}

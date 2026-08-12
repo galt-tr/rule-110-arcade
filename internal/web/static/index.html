@@ -31,15 +31,19 @@
     <button id="pause" title="Stop the clock">❚❚ Pause</button>
     <button id="step"  title="Advance exactly one generation">▶| Step</button>
     <label class="zoom">
+      <!-- 1..8, not 1..16. Canvas cost is width x height, and width is now
+           cells x cellPx with a 256-cell ring: at 16px that is 4096px wide
+           against a capped height, and the area alone exceeds what iOS Safari
+           will allocate. See renderableRows in app.js. -->
       <span>zoom</span>
-      <input id="zoom" type="range" min="1" max="16" step="1" value="8">
-      <output id="zoomOut">8px</output>
+      <input id="zoom" type="range" min="1" max="8" step="1" value="4">
+      <output id="zoomOut">4px</output>
     </label>
     <label class="follow">
       <input id="follow" type="checkbox" checked>
       <span>follow</span>
     </label>
-    <label class="rate">
+    <label class="rate" id="rateLabel">
       <span>rate</span>
       <input id="rate" type="range" min="0.05" max="10" step="0.05" value="1">
       <output id="rateOut">1.00 gen/s</output>
@@ -57,9 +61,40 @@
   </div>
 </footer>
 
+<!-- The funding panel. Hidden unless the deployment is asking for money: while
+     it is bootstrapping and has none, or once it has run out. -->
+<section id="fund" hidden>
+  <h2 id="fundTitle">Fund this automaton</h2>
+  <p id="fundWhy" class="muted"></p>
+
+  <div class="fund-row">
+    <label for="fundAmount">amount</label>
+    <input id="fundAmount" type="number" min="0" step="1000" inputmode="numeric">
+    <span class="muted">sat</span>
+    <button id="fundBtn" type="button">Fund with your wallet</button>
+  </div>
+
+  <p id="fundStatus" class="fund-status" hidden></p>
+
+  <details id="fundManual">
+    <summary>Pay by hand instead</summary>
+    <p class="muted">
+      Send to this address on <b id="fundNetwork">this network</b>, then paste the
+      transaction id once it is mined.
+    </p>
+    <code id="fundAddress" class="addr"></code>
+    <button id="fundCopy" type="button">copy</button>
+    <div class="fund-row">
+      <input id="fundTxid" type="text" placeholder="transaction id" spellcheck="false">
+      <button id="fundTxidBtn" type="button">Credit it</button>
+    </div>
+  </details>
+</section>
+
 <div id="err" hidden></div>
 <div id="tip" hidden></div>
 
+<script src="wallet.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

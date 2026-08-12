@@ -139,25 +139,79 @@ type Snapshot struct {
 	// a slow network from the outside, and we lost real time to that. If this
 	// sits high, the fuel pool is the bottleneck, not the chain.
 	WaitingOnCoin int `json:"waitingOnCoin"`
+
+	// Bootstrap is present ONLY while a cold deployment is being brought up,
+	// and absent once generation 0 exists. The engine never sets it — see
+	// package boot, which serves this shape before there is an engine at all.
+	//
+	// It is a field on the snapshot rather than its own endpoint so the browser
+	// keeps one payload, one fetch and one stream across the handover.
+	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
+
+	// Locked reports that the clock cannot be driven from outside: no play,
+	// pause, step or rate change, for the life of the process.
+	//
+	// It is here so the browser can render the truth rather than offering
+	// controls that will be refused. It is NOT how the refusal happens — the
+	// engine's own setters and the HTTP handler each refuse independently,
+	// because a control surface that is only hidden is not locked at all.
+	Locked bool `json:"locked"`
+}
+
+// Bootstrap is how far a cold deployment has got towards existing.
+//
+// It carries the funding address and the shortfall because that is the only
+// thing a visitor can act on: an automaton with no coin has nothing to show and
+// exactly one thing to ask for.
+type Bootstrap struct {
+	// Phase is one of waiting, funding, fuel, genesis.
+	Phase string `json:"phase"`
+	// Address is where to send coin, and Network which chain it is on.
+	Address string `json:"address"`
+	Network string `json:"network"`
+	// MinSatoshis is what must arrive before anything is spent; Have is what
+	// has arrived.
+	MinSatoshis uint64 `json:"minSatoshis"`
+	Have        uint64 `json:"have"`
+	// Err is the last failure, if the machine is retrying.
+	Err string `json:"err,omitempty"`
 }
 
 // maxHistory bounds how many generations the UI keeps.
-const maxHistory = 2048
+//
+// Every generation holds one entry per cell, so this is a per-cell multiple:
+// 1024 generations of a 256-cell ring is ~262,000 CellTx values held resident
+// and copied by every full Snapshot. 2048 was chosen against a 128-cell ring and
+// doubling the ring doubled the cost of the choice as well as the choice itself.
+const maxHistory = 1024
 
 // PublishInterval is the floor between tail publishes — the rate ceiling for
-// pushed UI updates. A generation of 128 cells produces 128 notifications and
-// the UI only needs the resulting state.
-const PublishInterval = 100 * time.Millisecond
+// pushed UI updates. A generation produces one notification per cell and the UI
+// only needs the resulting state.
+//
+// 500ms against a clock locked at 0.5 gen/s gives roughly four frames per
+// generation, which is enough to watch a row fill in without paying to
+// re-marshal state that has not changed. It is a floor and not a delay, so an
+// isolated change still appears at once — see PublishTails.
+const PublishInterval = 500 * time.Millisecond
 
 // TailGenerations is how many generations a streamed update carries.
 //
 // A snapshot holds every cell of every generation, so the full history grows
-// without bound as a payload: 128 cells with txids is roughly 10 KB per
-// generation, and re-sending all of it several times a second would reach
-// megabytes per message well before the diagram got interesting. Streamed
-// updates therefore carry only the recent tail and the client merges it into
-// the history it already has; older generations are terminal and do not change.
-const TailGenerations = 48
+// without bound as a payload: a 256-cell generation carrying txids is ~27 KB,
+// and re-sending all of it several times a second would reach megabytes per
+// message well before the diagram got interesting. Streamed updates therefore
+// carry only the recent tail and the client merges it into the history it
+// already has; older generations are terminal and do not change.
+//
+// 8, not the 48 this held against a 128-cell ring, and the reason is not only
+// the payload. A longer tail is often reached for to deliver late status
+// changes, and it cannot: a mined verdict lands roughly rate × block-interval
+// generations behind the frontier — hundreds, on this network — so no tail
+// anyone would stream reaches it. The fix for that is pushing the changed set
+// rather than a window. Raising this number buys bandwidth cost and no
+// correctness.
+const TailGenerations = 8
 
 // Options are the choices a deployment makes about how the engine behaves that
 // are not properties of the chain.
@@ -169,11 +223,59 @@ type Options struct {
 	// It defaults OFF, and that is a considered position rather than caution for
 	// its own sake. The asymmetry decides it: what recovery prevents is a halted
 	// cell — visible, non-destructive, fixable by hand — while a bug in it runs
-	// 128 times unattended immediately after a crash, which is precisely when
-	// the deployment is least well understood. `rule110 recover` shows exactly
-	// what it would do, against the real wallet, before anything is allowed to
-	// do it on its own.
+	// once per cell unattended immediately after a crash, which is precisely
+	// when the deployment is least well understood. `rule110 recover` shows
+	// exactly what it would do, against the real wallet, before anything is
+	// allowed to do it on its own.
 	AutoRecover bool
+
+	// LockControls makes SetMode, SetRate and Step no-ops, fixing the clock at
+	// whatever the process started with.
+	//
+	// The refusal is here, in the engine, and not only in the HTTP handler that
+	// is the reason for wanting it. POST /api/control has no authentication, so
+	// on a public deployment the handler must refuse — but a policy enforced
+	// only at the edge is one refactor away from being enforced nowhere, and the
+	// thing being protected is a live ring of UTXO chains. Both layers refuse;
+	// neither relies on the other.
+	//
+	// Starvation is deliberately NOT covered. clearStarvation and the worker's
+	// own transition into ModeStarved write the mode field directly, under the
+	// lock, because those are the engine describing what happened to it rather
+	// than an operator driving it.
+	LockControls bool
+
+	// Rate is the clock's starting speed in generations per second, and Start
+	// runs it immediately instead of coming up paused.
+	//
+	// These are Options rather than a SetRate/SetMode pair at the call site
+	// because LockControls turns those two into no-ops. Configuring a locked
+	// engine by calling the mutators the lock exists to disable is a
+	// contradiction that resolves silently and in the worst direction — a
+	// public deployment that comes up permanently paused and cannot be started.
+	// A zero Rate means the default of one generation per second.
+	Rate  float64
+	Start bool
+}
+
+// startMode is the clock's initial state.
+//
+// A locked engine always starts running: with the mutators disabled there is no
+// later opportunity to start it, so coming up paused would be permanent.
+func startMode(o Options) Mode {
+	if o.Start || o.LockControls {
+		return ModeRunning
+	}
+	return ModePaused
+}
+
+// startRate applies the same clamp SetRate does, so a rate that arrives through
+// Options cannot reach somewhere a rate that arrives through the API could not.
+func startRate(o Options) float64 {
+	if o.Rate == 0 {
+		return 1
+	}
+	return clampRate(o.Rate)
 }
 
 // Engine owns the automaton's state and its clock.
@@ -318,12 +420,18 @@ type Engine struct {
 // every request path. This is the one idea worth taking from the reference
 // application, which feels instant for exactly this reason: what it serves is
 // always a value computed somewhere else.
-func (e *Engine) PublishedTail() ([]byte, bool) {
+//
+// A POINTER, so a caller can tell "the same tail I already have" from "a new
+// one" without comparing bytes. PublishTail stores a fresh pointer on each
+// rebuild and never mutates a slice it has published, which makes pointer
+// identity exact. Subscribers need this because they are woken by notify(),
+// which fires far more often than the tail is rebuilt.
+func (e *Engine) PublishedTail() (*[]byte, bool) {
 	p := e.published.Load()
 	if p == nil {
 		return nil, false
 	}
-	return *p, true
+	return p, true
 }
 
 // PublishTail rebuilds and marshals the tail snapshot, making it the value
@@ -399,8 +507,8 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		opts:          opts,
 		deployment:    d,
 		tips:          make([]chain.CellChain, d.Cells),
-		mode:          ModePaused,
-		rate:          1,
+		mode:          startMode(opts),
+		rate:          startRate(opts),
 		lastMined:     make(map[int]uint64, d.Cells),
 		changed:       make(chan struct{}),
 		txIndex:       make(map[string]txLoc),
@@ -411,7 +519,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		retries:       make(map[int]retryState),
 		statusWrites:  make(chan history.StatusUpdate, statusWriteQueue),
 		store:         store,
-		owner:         instanceOwner(),
+		owner:         InstanceOwner(),
 		// Nothing may advance until the tips have been re-derived while this
 		// instance actually holds the writer lease. They are derived here too,
 		// so the UI has something true to show immediately, but between here and
@@ -662,6 +770,7 @@ func (e *Engine) snapshot(limit int) Snapshot {
 		Starved:        e.mode == ModeStarved,
 		FundingAddress: e.fundingAddress,
 		Leader:         e.leader,
+		Locked:         e.opts.LockControls,
 		HaltedCells:    len(e.halted),
 		Lag:            e.target - min(e.target, frontier),
 		Depth:          e.deepestLocked(),
@@ -687,6 +796,9 @@ func (e *Engine) notify() {
 // Resuming from starved clears the shortfall timer too, so an operator who has
 // just sent coin does not have to wait out the grace period.
 func (e *Engine) SetMode(m Mode) {
+	if e.opts.LockControls {
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if m == ModeRunning {
@@ -704,11 +816,18 @@ func (e *Engine) SetMode(m Mode) {
 	e.notify()
 }
 
+// clampRate bounds a requested rate to something a chain can serve. Shared by
+// SetRate and the Options path so there is one answer to what a rate may be.
+func clampRate(r float64) float64 { return min(max(r, 0.05), 20) }
+
 // SetRate sets generations per second, clamped to something a chain can serve.
 func (e *Engine) SetRate(r float64) {
+	if e.opts.LockControls {
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.rate = min(max(r, 0.05), 20)
+	e.rate = clampRate(r)
 	e.notify()
 }
 
@@ -717,6 +836,9 @@ func (e *Engine) SetRate(r float64) {
 // With no barrier there is nothing to trigger, only a target to raise: each cell
 // chases it at its own pace and the step completes when the slowest one lands.
 func (e *Engine) Step() {
+	if e.opts.LockControls {
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.target < e.frontierLocked()+1 {
@@ -841,11 +963,17 @@ func (e *Engine) haltCell(cell int, reason string) {
 	e.notify()
 }
 
-// instanceOwner is this process's identity in the single-writer election.
+// InstanceOwner is this process's identity in the single-writer election.
 //
 // The hostname is the pod name under Kubernetes, which makes the lease row
 // legible to an operator; the suffix keeps two processes on one host distinct.
-func instanceOwner() string {
+//
+// Exported because the cold start takes the SAME lease before the engine
+// exists — see package boot. It has to be the same string: a bootstrapper that
+// claimed under a different owner would hold the lease against the engine that
+// follows it in the same process, and the engine would sit out the full TTL
+// waiting for itself.
+func InstanceOwner() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown"

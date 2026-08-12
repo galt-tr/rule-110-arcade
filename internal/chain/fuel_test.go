@@ -71,6 +71,63 @@ func TestChunkIsSizedToTheLeafItFunds(t *testing.T) {
 	}
 }
 
+// TestFanOutDrawsFromTheChangeBasket is the regression guard for the cold-start
+// deadlock: on a fresh wallet `rule110 fuel` reported "not enough funds" while
+// the deposit sat plainly in the wallet, and the recorded workaround was to turn
+// the throughput strategy off entirely.
+//
+// The cause is one unset field, and it is invisible from this repository alone.
+// storage's fanOutSourceBasket routes a fan-out by its DESTINATION: a shape
+// whose Basket is the pool draws its funding from the RESERVE basket, unless
+// SourceBasket says otherwise. The reserve is the keeper's own staging area — it
+// is filled by aggregating change crumbs — so on a fresh wallet it is empty,
+// while the deposit internalize just credited is in change. The one command
+// whose job is to create the pool therefore could not fund itself.
+//
+// The keeper never hit this only because its RecycleBasket setting becomes this
+// same field. Naming the source here is what lets the cold start run
+// fund -> fuel -> genesis with throughput left on.
+func TestFanOutDrawsFromTheChangeBasket(t *testing.T) {
+	cfg := DefaultConfig()
+	shape, err := cfg.fuelShape(100, cfg.FuelDenomination)
+	if err != nil {
+		t.Fatalf("fuelShape: %v", err)
+	}
+
+	if string(shape.SourceBasket) != string(wdk.BasketNameForChange) {
+		t.Errorf("source basket = %q, want %q — an unset source routes a pool-destination "+
+			"fan-out to the reserve, which is empty on a fresh wallet while the deposit is in change",
+			shape.SourceBasket, wdk.BasketNameForChange)
+	}
+
+	// The destination is the other half of the pairing: minting into the wrong
+	// basket fails silently, because the coins exist and the balance looks
+	// healthy while every transition still reports "not enough funds".
+	pool, _, _, enabled := cfg.FuelPool()
+	if !enabled {
+		t.Fatal("the default configuration has no fuel pool")
+	}
+	if string(shape.Basket) != pool {
+		t.Errorf("destination basket = %q, want the pool %q", shape.Basket, pool)
+	}
+}
+
+// With the throughput strategy off there is no pool, so a fan-out must mint into
+// change — the basket the funder claims from in that mode.
+func TestFanOutWithoutAPoolMintsIntoChange(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Throughput = false
+
+	shape, err := cfg.fuelShape(100, cfg.FuelDenomination)
+	if err != nil {
+		t.Fatalf("fuelShape: %v", err)
+	}
+	if string(shape.Basket) != string(wdk.BasketNameForChange) {
+		t.Errorf("destination basket = %q, want %q with no pool to fill",
+			shape.Basket, wdk.BasketNameForChange)
+	}
+}
+
 // The keeper configuration is derived, not written out, so this is the guard
 // that deriving it did not quietly drop one of the deployment's overrides.
 func TestKeeperConfigCarriesTheDeploymentsOverrides(t *testing.T) {

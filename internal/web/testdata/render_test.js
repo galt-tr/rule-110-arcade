@@ -96,6 +96,17 @@ global.EventSource = class {
   constructor() { this.onmessage = null; }
 };
 global.fetch = () => Promise.reject(new Error('no network in the renderer test'));
+// wallet.js in the browser; the panel only calls into it on a click, which
+// these tests do not simulate. navigator and location are deliberately NOT
+// stubbed: both are read-only globals in Node, and nothing app.js evaluates at
+// load time touches either.
+global.Wallet = {
+  probe: () => Promise.resolve(null),
+  network: () => Promise.resolve(null),
+  fundWith: () => Promise.reject(new Error('no wallet in the renderer test')),
+  settle: () => Promise.resolve(),
+  explain: (e) => String(e),
+};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -267,6 +278,91 @@ test('scrolling the window forgets the rows that left it', () => {
 // ---------------------------------------------------------------------------
 
 let failed = 0;
+// ---------------------------------------------------------------------------
+// Controls and funding
+//
+// Both are presentation only -- the server refuses a locked control whether or
+// not the button exists, and the funding panel cannot conjure money -- but both
+// decide what a stranger arriving at a public URL is told, which is worth
+// pinning.
+// ---------------------------------------------------------------------------
+
+test('a locked deployment hides the clock controls but keeps zoom and follow', () => {
+  apply(snapshot(tail(0, 4), { locked: true }));
+  flushFrames();
+
+  for (const id of ['play', 'pause', 'step', 'rateLabel']) {
+    assert.strictEqual(byId(id).hidden, true,
+      `${id} is still offered on a deployment that refuses it`);
+  }
+  // Zoom and follow are client-side and affect nobody else.
+  assert.strictEqual(byId('zoom').hidden, false, 'zoom was hidden; it is local to the viewer');
+  assert.strictEqual(byId('follow').hidden, false, 'follow was hidden; it is local to the viewer');
+});
+
+test('an unlocked deployment offers the clock controls', () => {
+  apply(snapshot(tail(0, 4), { locked: false }));
+  flushFrames();
+
+  for (const id of ['play', 'pause', 'step', 'rateLabel']) {
+    assert.strictEqual(byId(id).hidden, false, `${id} was hidden on an unlocked deployment`);
+  }
+});
+
+test('the funding panel stays hidden while the automaton is healthy', () => {
+  // With a target loaded, so this asserts the interesting case: funding is
+  // available and simply not needed, rather than not configured.
+  app.setFundTarget({
+    address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
+    lockingScript: '76a914aa88ac',
+    network: 'ttn',
+    minSatoshis: 10000,
+    suggestedSatoshis: 500000,
+  });
+
+  apply(snapshot(tail(0, 4)));
+  flushFrames();
+  assert.strictEqual(byId('fund').hidden, true,
+    'a standing donation box on a healthy automaton is noise');
+});
+
+test('the funding panel appears when the automaton is starved', () => {
+  // The panel only renders once the target has loaded; the fetch is stubbed to
+  // reject, so drive the module's own loader state the way loadFundTarget does.
+  app.setFundTarget({
+    address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
+    lockingScript: '76a914aa88ac',
+    network: 'ttn',
+    minSatoshis: 10000,
+    suggestedSatoshis: 500000,
+  });
+
+  apply(snapshot(tail(0, 4), { starved: true }));
+  flushFrames();
+  assert.strictEqual(byId('fund').hidden, false,
+    'a starved automaton must show where to send coin');
+});
+
+test('the funding panel appears while the deployment is still bootstrapping', () => {
+  app.setFundTarget({
+    address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
+    lockingScript: '76a914aa88ac',
+    network: 'ttn',
+    minSatoshis: 10000,
+    suggestedSatoshis: 500000,
+  });
+
+  apply(snapshot([], {
+    starved: false,
+    bootstrap: { phase: 'funding', address: 'mpz7', minSatoshis: 500000, have: 0 },
+  }));
+  flushFrames();
+  assert.strictEqual(byId('fund').hidden, false,
+    'a cold deployment must show what it is waiting for');
+  assert.ok(byId('fundWhy').textContent.includes('500,000'),
+    'the payer was not told how much is needed');
+});
+
 for (const [name, fn] of tests) {
   // Each test starts from a clean surface; the module is a singleton.
   state.history.length = 0;

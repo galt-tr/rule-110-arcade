@@ -10,9 +10,10 @@
 //	fund      internalize a mined funding transaction
 //	run       start the automaton and its web UI
 //
-// The subcommands are ordered, not a menu: address, then a payment, then fund
-// once that payment is MINED, then fuel, then genesis, then run. See usage and
-// the README runbook.
+// `run` brings an empty deployment up by itself: it serves the UI, shows a
+// funding address, and creates generation 0 once somebody pays it. The other
+// subcommands are the same sequence done by hand, and remain the way to
+// internalize a payment that is already on chain, to audit, and to recover.
 package main
 
 import (
@@ -24,12 +25,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 
+	"github.com/dymurray/rule-110-arcade/internal/boot"
 	"github.com/dymurray/rule-110-arcade/internal/ca"
 	"github.com/dymurray/rule-110-arcade/internal/cellscript"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
@@ -93,17 +96,31 @@ func usage() {
 
 Usage: rule110 <subcommand> [flags]
 
-The subcommands are a sequence, not a menu. A new deployment runs them in order:
+Starting a new deployment takes one command:
+
+  rule110 run -arcade-url <url> -public-funding
+
+An empty data directory is not an error. run serves the UI, shows its funding
+address, and mints fuel and creates generation 0 by itself once a payment lands.
+With -public-funding the page carries a Fund button any BRC-100 wallet can use.
+
+The same sequence by hand, which is still what to reach for when a payment is
+already on chain:
 
   1  rule110 address                 print the funding address (offline; needs no arcade)
   2  send coin to that address       from any wallet
-  3  wait for that payment to be MINED
+  3  wait for that payment to be MINED  (this path only: a raw transaction
+                                     carries no ancestry, so nothing but a
+                                     merkle proof shows it is real)
   4  rule110 fund -tx <hex> -bump <hex>
-                                     internalize it; BOTH flags are required, because
-                                     the wallet verifies the merkle proof in -bump
+                                     internalize it; BOTH flags are required
   5  rule110 fuel                    mint the coins one generation fans out across
   6  rule110 genesis                 create generation 0: one UTXO per cell
   7  rule110 run                     start the automaton and its web UI
+
+Order matters at one place in particular: fuel BEFORE genesis. Under the
+throughput strategy genesis is funded from the pool, so creating it first finds
+an empty pool and fails against a wallet that plainly holds money.
 
 Also:
   rule110 audit                      re-derive the recorded history and check it against
@@ -129,10 +146,15 @@ Run "rule110 <subcommand> -h" for that subcommand's flags with their defaults.
 Environment. Each is only the default for the matching flag, which wins:
   RULE110_ARCADE_URL       -arcade-url        arcade instance to broadcast through (required)
   RULE110_CHAINTRACKS_URL  -chaintracks-url   headers service; empty derives it from -arcade-url
+  RULE110_EVENTS_URL       -events-url        arcade status stream; empty uses -arcade-url. Point it
+                                              at the sse service directly inside a cluster
+  RULE110_LOCK_CONTROLS    -lock-controls     refuse play/pause/step/rate; /api/control is
+                                              unauthenticated, so this is the lock
+  RULE110_PUBLIC_FUNDING   -public-funding    expose /api/funding and /api/fund
   RULE110_NETWORK          -network           main | test | ttn | tstn  (default tstn)
   RULE110_DATA_DIR         -data-dir          wallet database and key file — this IS the wallet
   RULE110_POSTGRES_DSN     -postgres-dsn      storage DSN; empty uses SQLite, which is much
-                                              slower under a 128-way fan-out
+                                              slower under a full generation's fan-out
   RULE110_ADDR             -addr              web UI listen address (run only)
 
 Flags every subcommand accepts, beyond the five above:
@@ -158,7 +180,7 @@ Subcommand flags:
   fuel         -count, -sats
   genesis      -cells, -rule, -seed
   step         -cell
-  run          -addr, -rate, -start
+  run          -addr, -rate, -start, -auto-recover
   depth-probe  -cell, -max
   audit        -from, -to, -last, -max-failures, -gaps
 
@@ -173,6 +195,8 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 		"arcade instance to broadcast through (required)")
 	fs.StringVar(&cfg.ChainTracksURL, "chaintracks-url", envOr("RULE110_CHAINTRACKS_URL", ""),
 		"headers service; empty derives it from the arcade URL")
+	fs.StringVar(&cfg.EventsURL, "events-url", envOr("RULE110_EVENTS_URL", ""),
+		"arcade status stream; empty uses the arcade URL. Point it at the sse service directly in-cluster")
 	fs.StringVar(&cfg.DataDir, "data-dir", envOr("RULE110_DATA_DIR", cfg.DataDir),
 		"wallet database and key file — losing this loses the coins")
 	fs.StringVar(&cfg.Originator, "originator", cfg.Originator, "BRC-100 originator (FQDN-shaped)")
@@ -210,6 +234,14 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 		"monitor workers applying arcade status batches")
 	fs.BoolVar(&cfg.FullStatusUpdates, "full-status", cfg.FullStatusUpdates,
 		"subscribe to every status transition (~4x the events; turn off above ~3 gen/s)")
+	fs.BoolVar(&cfg.LockControls, "lock-controls", envBool("RULE110_LOCK_CONTROLS", cfg.LockControls),
+		"refuse every play/pause/step/rate request; /api/control is unauthenticated, so this is the lock")
+	fs.BoolVar(&cfg.PublicFunding, "public-funding", envBool("RULE110_PUBLIC_FUNDING", cfg.PublicFunding),
+		"expose /api/funding and /api/fund so any BRC-100 wallet can pay this deployment's costs")
+	fs.Uint64Var(&cfg.MinPaymentSatoshis, "min-payment", cfg.MinPaymentSatoshis,
+		"smallest public payment worth accepting; 0 derives it from -fuel-sats")
+	fs.Uint64Var(&cfg.FirstFuelCoins, "first-fuel", cfg.FirstFuelCoins,
+		"fuel coins the cold-start bootstrap mints before genesis; 0 derives it from the ring size")
 
 	network := fs.String("network", envOr("RULE110_NETWORK", string(defs.NetworkTSTN)),
 		"main | test | ttn (Teranode test net) | tstn (private scaling test net)")
@@ -505,14 +537,16 @@ func cmdRun(args []string) error {
 	}
 	defer func() { _ = c.Close(context.Background()) }()
 
-	d, err := c.LoadDeployment()
-	if err != nil {
-		return fmt.Errorf("%w\n(run \"rule110 genesis\" first to create generation 0)", err)
-	}
-	compiled, err := cellscript.Compile(d.Cells, d.Rule)
-	if err != nil {
-		return err
-	}
+	// Take the VALIDATED configuration back.
+	//
+	// Open receives a Config by value and validates its own copy, and Validate
+	// is not only a check — it fills in the settings derived from others
+	// (MinPaymentSatoshis from the fuel denomination, FirstFuelCoins from the
+	// ring size) and normalises the arcade URL. Reading those off the local
+	// copy gets zeroes, and a zero here is silent in the worst way: the cold
+	// start would ask the fan-out for no coins and advertise a minimum payment
+	// of nothing.
+	cfg = c.Config
 
 	store, err := history.Open(ctx, cfg.PostgresDSN, cfg.DataDir)
 	if err != nil {
@@ -520,18 +554,93 @@ func cmdRun(args []string) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	eng, err := engine.New(ctx, c, compiled, d, store, engine.Options{AutoRecover: *autoRecover}, logger)
+	// The ring's shape comes from the deployment when there is one, and from the
+	// configuration when there is not. Only the first case is a fact; the second
+	// is a proposal, which the cold start is about to turn into one.
+	cells, rule := cfg.Cells, cfg.Rule
+	if existing, lerr := c.LoadDeployment(); lerr == nil {
+		cells, rule = existing.Cells, existing.Rule
+	}
+	compiled, err := cellscript.Compile(cells, rule)
+	if err != nil {
+		return err
+	}
+	seed, err := seedFor(cells)
+	if err != nil {
+		return err
+	}
+	genesisSize, err := chain.GenesisBytes(compiled, seed)
 	if err != nil {
 		return err
 	}
 
+	// Serve the UI BEFORE there is anything to show.
+	//
+	// This is the whole point of the cold start being in-process: a fresh volume
+	// has no coin, and the only way to get some is to ask — which needs a page,
+	// which needs a server. `run` used to fail here telling the operator to go
+	// run three other subcommands, which a container simply restarts and says
+	// again.
+	boots := boot.New(c, compiled, boot.Options{
+		Seed:             seed,
+		Throughput:       cfg.Throughput,
+		FuelDenomination: cfg.FuelDenomination,
+		FirstFuelCoins:   cfg.FirstFuelCoins,
+		MinBootstrap:     cfg.BootstrapMinimum(genesisSize),
+		Network:          string(cfg.Network),
+		LockControls:     cfg.LockControls,
+		Leader:           leaseHolder(ctx, store, logger),
+	}, logger)
+
+	var webOpts []web.Option
+	if cfg.PublicFunding {
+		webOpts = append(webOpts, web.WithFunder(newFunder(c, cfg.BootstrapMinimum(genesisSize))))
+	}
+	srv := web.New(boots, logger, webOpts...)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ctx, *addr) }()
+
+	printBanner(cfg, compiled, *addr)
+
+	d, err := boots.Run(ctx)
+	if err != nil {
+		// A cancelled context on the way up is a clean shutdown, not a failure.
+		if ctx.Err() != nil {
+			return <-serveErr
+		}
+		return err
+	}
+
+	// The cold start may have created a ring of a different shape than the one
+	// compiled above — it cannot, today, but the deployment is the authority and
+	// compiling against anything else would bind cells to the wrong script.
+	if d.Cells != cells || d.Rule != rule {
+		if compiled, err = cellscript.Compile(d.Cells, d.Rule); err != nil {
+			return err
+		}
+	}
+
+	// The clock's starting state is configuration, not a command: -lock-controls
+	// turns SetRate and SetMode into no-ops, so setting the rate by calling the
+	// mutator the lock disables would leave a locked deployment stuck at the
+	// default, paused, with no way to start it.
+	eng, err := engine.New(ctx, c, compiled, d, store, engine.Options{
+		AutoRecover:  *autoRecover,
+		LockControls: cfg.LockControls,
+		Rate:         *rate,
+		Start:        *start,
+	}, logger)
+	if err != nil {
+		return err
+	}
+	// Hand every reader over to the engine. Anyone streaming during the cold
+	// start is holding the bootstrapper's change channel, so Adopt notifies once
+	// — without it they would block on a channel nothing closes again.
+	boots.Adopt(eng)
+
 	if st, err := store.Stats(ctx); err == nil {
 		fmt.Printf("history: %d generations, %d transactions recorded (%d still settling)\n",
 			st.Generations, st.Txs, st.Unsettled)
-	}
-	eng.SetRate(*rate)
-	if *start {
-		eng.SetMode(engine.ModeRunning)
 	}
 	// Wait for the engine to drain on the way out. Run returns once every cell
 	// worker has stopped at its loop top and the tips have been checkpointed;
@@ -559,15 +668,11 @@ func cmdRun(args []string) error {
 		}
 	}()
 
-	fmt.Printf("rule 110 · %d cells · generation %d\n", d.Cells, eng.Snapshot().Generation)
-	fmt.Printf("arcade:  %s\n", cfg.ArcadeURL)
+	fmt.Printf("running · %d cells · generation %d\n", d.Cells, eng.Snapshot().Generation)
 	fmt.Printf("genesis: %s\n", d.GenesisTxID)
-	if basket, denom, target, on := cfg.FuelPool(); on {
-		fmt.Printf("fuel:    %d x %d sat in %q, kept topped up\n", target, denom, basket)
-	}
-	fmt.Printf("\n  UI ready at %s\n\n", uiURL(*addr))
 
-	return web.New(eng, logger).Serve(ctx, *addr)
+	// The server is already up; block on it, as this function used to.
+	return <-serveErr
 }
 
 func cmdFuel(args []string) error {
@@ -731,4 +836,21 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envBool is envOr for a flag.
+//
+// An unparseable value falls back rather than failing, because these come from
+// a Kubernetes ConfigMap where the difference between "true" and "True" should
+// not crash-loop a pod — strconv.ParseBool accepts both, along with 1/0/t/f.
+func envBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }

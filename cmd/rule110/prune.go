@@ -56,6 +56,21 @@ func cmdPrune(args []string) error {
 	cfg.Network = net
 	opts.DryRun = !*apply
 
+	// The ring size must come from the deployment, not from the defaults.
+	//
+	// bindCommon deliberately does not bind -cells — the ring is fixed when
+	// genesis creates the UTXOs — so without this the pruner sizes its retention
+	// floor from whatever DefaultConfig happens to say. That is not a crash, it
+	// is worse: the floor is cells × (retain+1) rows of lookback, so a default
+	// half the real ring size retains half the generations asked for and prunes
+	// transactions the operator believed were protected.
+	d, err := chain.LoadDeploymentFrom(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("prune: reading the ring size from the recorded deployment: %w\n"+
+			"  the pruner sizes its retention floor from the cell count, so it will not guess one", err)
+	}
+	cfg.Cells = d.Cells
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
