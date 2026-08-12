@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -692,4 +693,64 @@ func TestPersistFailureHaltsTheCell(t *testing.T) {
 	if e.turnReady(2) {
 		t.Error("a halted cell must not be ready to advance")
 	}
+}
+
+// TestHaltingTheSlowestCellDoesNotFreezeTheClock is the underflow that took the
+// whole automaton down on the live deployment.
+//
+// frontierLocked is the minimum generation over cells that are NOT halted, so
+// halting the slowest cell removes it from that minimum and the frontier jumps
+// UPWARD — past the target, which had been tracking the laggard. The clock's
+// `target - frontier < maxLag` is unsigned, so it underflowed to about 2^64,
+// which is not less than maxLag, and the clock never raised the target again.
+//
+// Nothing said so. Snapshot's Lag saturates, so the UI reported a calm lag of 0
+// while the clock was dead, and derivation reproduced the same shape on restart.
+// Observed: cell 44 was the slowest cell at generation 905, was refused, halted,
+// and 115 healthy cells stopped with it.
+func TestHaltingTheSlowestCellDoesNotFreezeTheClock(t *testing.T) {
+	e := newTestEngine(t, 4)
+	atGeneration(e, 100)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.chain.Config.MaxLag = 32
+	// Cell 0 is the laggard the target is tracking; everyone else is far ahead,
+	// which is the shape recovery produces when it resumes long-halted cells.
+	e.tips[0].Generation = 100
+	for i := 1; i < 4; i++ {
+		e.tips[i].Generation = 900
+	}
+	e.target = 100
+	e.mu.Unlock()
+
+	// The laggard is refused and halts. The frontier is now 900, past the target.
+	e.haltCell(0, "refused")
+
+	e.mu.RLock()
+	frontier, target := e.frontierLocked(), e.target
+	e.mu.RUnlock()
+	if frontier <= target {
+		t.Fatalf("frontier %d must exceed target %d for this test to be about anything", frontier, target)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go e.clock(ctx)
+	defer cancel()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		e.mu.RLock()
+		moved := e.target > target
+		e.mu.RUnlock()
+		if moved {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	e.mu.RLock()
+	got := e.target
+	e.mu.RUnlock()
+	t.Fatalf("the clock never raised the target past %d after the slowest cell halted and the "+
+		"frontier jumped to %d; the automaton is frozen and Lag reports 0", got, frontier)
 }

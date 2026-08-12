@@ -77,12 +77,34 @@ func (e *Engine) clock(ctx context.Context) {
 	for {
 		e.mu.RLock()
 		mode, rate := e.mode, e.rate
-		frontier, target, maxLag := e.frontierLocked(), e.target, e.chain.Config.MaxLag
+		frontier, maxLag := e.frontierLocked(), e.chain.Config.MaxLag
 		e.mu.RUnlock()
 
-		if mode == ModeRunning && target-frontier < maxLag {
+		// The frontier can overtake the target, so this subtraction has to
+		// saturate. frontier is the minimum over cells that are NOT halted, so
+		// halting the slowest cell REMOVES it from that minimum and the frontier
+		// jumps upward — past the target, which was tracking the laggard.
+		//
+		// Unguarded, `target - frontier` then underflows to about 2^64, which is
+		// not less than maxLag, so the clock stops raising the target and never
+		// starts again: every cell sits at or above a target that no longer moves,
+		// and the automaton is frozen with nothing in any log to say why. It
+		// survives a restart, because derivation reproduces the same shape.
+		//
+		// Snapshot's Lag has always saturated (`target - min(target, frontier)`),
+		// which is what made this so hard to see: the UI reports a calm lag of 0
+		// while the clock is dead. Observed live — cell 44 was the slowest cell at
+		// generation 905, was refused, halted, and took the whole ring down with
+		// it. SetMode already re-seeds the target this way, but only at a mode
+		// change; nothing re-seeded it when a halt moved the frontier mid-run.
+		if mode == ModeRunning {
 			e.mu.Lock()
-			e.target++
+			if e.target < frontier {
+				e.target = frontier
+			}
+			if e.target-frontier < maxLag {
+				e.target++
+			}
 			e.mu.Unlock()
 			e.wake()
 		}
