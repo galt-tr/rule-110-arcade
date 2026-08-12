@@ -92,6 +92,46 @@ pool ends coin contention (4 → 267 tx/s), single-writer lease, graceful fundin
 starvation with unattended resume, bounded reconciler, wallet-DB pruner,
 Dockerfile, Kubernetes manifests, CI, README.
 
+## The status pipeline, after v2.0
+
+The UI lagged arcade, and the cause was that this process held **two** SSE
+connections on the same callback token: the wallet monitor's, and one the engine
+opened for itself. The toolbox documents that as pathological — arcade's
+`GET /events` has no per-client filter, so the second connection received a full
+duplicate of every event and doubled arcade's per-event fan-out cost, against a
+fan-out already measured as the bottleneck.
+
+The engine's copy was also the slow-consumer case that behaviour punishes. It
+applied each event synchronously on the SSE reader goroutine, under the engine's
+global write lock, across a Postgres round trip — so a reader that should have
+been draining its socket was instead parked on the database, once per event. The
+toolbox's own playbook names the mistake: *"Do not hold a global lock across a
+synchronous database write."*
+
+What changed:
+
+- **One connection.** `monitor.WithStatusObserver` (added to the toolbox) hands
+  each applied batch to the engine off the connection that already exists. The
+  engine's own subscription is gone, and with it an in-memory replay cursor that
+  reset to `""` on every restart — arcade replays only NON-terminal statuses to a
+  cold connection, so terminal statuses that landed while we were down were being
+  lost. The monitor's cursor is durable.
+- **No database write under the lock.** Ownership is decided under a read lock,
+  the whole batch applies under one write-lock acquisition, and persistence goes
+  to a batching writer that coalesces on a linger into one multi-row `UPDATE`.
+- **Snapshots cost what they emit.** `SnapshotTail` built the full 2048-generation
+  copy and discarded 97.7% of it, per push, per client. It now copies only the
+  tail, and a publisher marshals that tail once for every subscriber.
+- **Pushes are leading-edge.** The stream used to wait for a change and *then*
+  sleep 100 ms, taxing every update to coalesce the few that needed it. The floor
+  is now applied between publishes, not before one, and the handler subscribes
+  before it reads — closing a race that left a stale final frame after pause.
+
+Measured on the live deployment, one generation stepped from paused: 128 cells
+broadcast, first status through the observer ~1.9 s later, all 128 proved within
+~4 s, 0 failed, 0 halted, and the UI's state agreed with arcade's `/tx/` for a
+sampled transaction.
+
 ## Measured, not assumed
 
 - **No mempool ancestor limit on this network.** 600 transactions, ≥250 deep,
@@ -107,7 +147,12 @@ Dockerfile, Kubernetes manifests, CI, README.
 
 ## Open work
 
-### 1. Retry an intermittent refusal instead of halting for ever — *highest value*
+Everything below is now tracked as a GitHub issue in `galt-tr/rule-110-arcade`,
+along with the performance defects found while fixing the status pipeline
+(issues 8–13). This section stays as the narrative; the issues carry the same
+detail item by item.
+
+### 1. Retry an intermittent refusal instead of halting for ever — *highest value* — [#1](https://github.com/galt-tr/rule-110-arcade/issues/1)
 
 Today one refusal kills a cell until an operator runs `rule110 recover`. Since
 refusals are intermittent, that is monotonic erosion: the ring loses cells one
@@ -125,7 +170,7 @@ spend; and if the tip *has* been spent, arcade answers `UTXO_SPENT` and
 Guard against reintroducing the bug 9a cascade: the retry must rebuild from the
 cell's real derived tip, never from the rejected transaction's output.
 
-### 2. Pause coasts up to 32 generations
+### 2. Pause coasts up to 32 generations — [#2](https://github.com/galt-tr/rule-110-arcade/issues/2)
 
 Pressing pause at generation 20 left it running to 52 before settling — exactly
 `maxLag`, about 100 seconds, with `lag` draining 25 → 22 → 15 → 10 → 0.
@@ -137,7 +182,7 @@ but that argument covers the *current* generation, not 32 of them. Fix: on
 pause, set `e.target = frontierLocked()`. Verify `TestPausedStillFinishesAStep`
 still passes rather than assuming it.
 
-### 3. `rule110 fuel` and `genesis` cannot bootstrap in throughput mode
+### 3. `rule110 fuel` and `genesis` cannot bootstrap in throughput mode — [#3](https://github.com/galt-tr/rule-110-arcade/issues/3)
 
 Both fail with `not enough funds` on a fresh wallet holding 30 BSV, after a
 4-minute retry, with an error that misleads on both counts it raises (the
@@ -152,14 +197,14 @@ Workaround, and how this deployment was bootstrapped: `-throughput=false`
 documented sequence may simply be unnecessary — worth deciding before changing
 the funder.
 
-### 4. Replay the cascade cells (previous deployment only)
+### 4. Replay the cascade cells (previous deployment only) — [#4](https://github.com/galt-tr/rule-110-arcade/issues/4)
 
 Four or five cells on the *old* deployment carried ~170 stacked rejections each
 over tips near generation 300, needing ~1,380 replayed transitions apiece to
 rejoin the ring. Recovery deliberately refuses them (`maxWreckage = 3`). Not
 applicable to the current fresh ring; keep the design note in case it recurs.
 
-### 5. Fuel keeper soak
+### 5. Fuel keeper soak — [#5](https://github.com/galt-tr/rule-110-arcade/issues/5)
 
 The keeper looked healthy on the previous deployment — the pool gained while
 running at 4 gen/s, where it had earlier drained toward starvation. That
@@ -167,14 +212,14 @@ improvement was never soaked long enough to close honestly, and the earlier
 flapping was entangled with connection exhaustion and a saturated co-tenant
 database. Re-measure on this clean deployment before declaring it fixed.
 
-### 6. Append-only history log — deferred by choice
+### 6. Append-only history log — deferred by choice — [#6](https://github.com/galt-tr/rule-110-arcade/issues/6)
 
 Would replace `cell_txs` as the system of record, touching the engine, the store
 and the web layer. Deliberately not in v2.0: shipping a system-of-record rewrite
 with no soak time into a release whose whole point is stability is how records
 get lost.
 
-### 7. Unexplained rejection class
+### 7. Unexplained rejection class — [#7](https://github.com/galt-tr/rule-110-arcade/issues/7)
 
 `PROCESSING (4): failed to validate transaction` still has no root cause. Ruled
 out by direct comparison of a mined and a rejected transaction from the same

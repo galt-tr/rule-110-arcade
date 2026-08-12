@@ -47,6 +47,8 @@ const retryPause = 500 * time.Millisecond
 func (e *Engine) Run(ctx context.Context) {
 	go e.trackFunds(ctx)
 	go e.watchStatus(ctx)
+	go e.writeStatuses(ctx)
+	go e.PublishTails(ctx, PublishInterval)
 	go e.reconcile(ctx)
 	go e.clock(ctx)
 	go e.holdLease(ctx)

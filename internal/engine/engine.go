@@ -9,10 +9,12 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dymurray/rule-110-arcade/internal/ca"
@@ -142,6 +144,11 @@ type Snapshot struct {
 // maxHistory bounds how many generations the UI keeps.
 const maxHistory = 2048
 
+// PublishInterval is the floor between tail publishes — the rate ceiling for
+// pushed UI updates. A generation of 128 cells produces 128 notifications and
+// the UI only needs the resulting state.
+const PublishInterval = 100 * time.Millisecond
+
 // TailGenerations is how many generations a streamed update carries.
 //
 // A snapshot holds every cell of every generation, so the full history grows
@@ -266,6 +273,83 @@ type Engine struct {
 	// changed is closed and replaced whenever the snapshot changes, so
 	// subscribers can wait without polling.
 	changed chan struct{}
+
+	// statusWrites carries applied status updates to the batching writer. It
+	// exists so that applying a status never waits on the database: the apply
+	// runs on the monitor's applier goroutine, and a database round trip there
+	// stalls the SSE reader for the whole process. Drained by writeStatuses.
+	statusWrites chan history.StatusUpdate
+
+	// published is the most recent tail snapshot, already marshalled. See
+	// PublishTail.
+	published atomic.Pointer[[]byte]
+}
+
+// PublishedTail returns the most recently published tail snapshot as JSON, and
+// whether there is one yet.
+//
+// The bytes are shared and must not be modified. Every SSE subscriber writes the
+// same slice, so the cost of a push is one marshal for the process rather than
+// one per client — and the marshal happens on the publisher's goroutine, off
+// every request path. This is the one idea worth taking from the reference
+// application, which feels instant for exactly this reason: what it serves is
+// always a value computed somewhere else.
+func (e *Engine) PublishedTail() ([]byte, bool) {
+	p := e.published.Load()
+	if p == nil {
+		return nil, false
+	}
+	return *p, true
+}
+
+// PublishTail rebuilds and marshals the tail snapshot, making it the value
+// PublishedTail returns. It reports whether the snapshot could be marshalled.
+func (e *Engine) PublishTail() bool {
+	data, err := json.Marshal(e.SnapshotTail())
+	if err != nil {
+		e.logger.Error("marshal tail snapshot", "err", err)
+		return false
+	}
+	e.published.Store(&data)
+	return true
+}
+
+// PublishTails keeps the published tail snapshot current until ctx is done.
+//
+// Coalescing lives here rather than in each subscriber: one publisher doing the
+// work once beats N connections each rebuilding and re-marshalling the same
+// state.
+//
+// minInterval is a floor between publishes, not a delay before one. The
+// difference is the whole point: a generation of 128 cells settling produces 128
+// notifications and the UI needs only the result, but an isolated change — a
+// pause, a rate change, one cell mined on a quiet ring — should appear at once.
+// Sleeping first would tax every update to coalesce the few that need it.
+func (e *Engine) PublishTails(ctx context.Context, minInterval time.Duration) {
+	var last time.Time
+	for {
+		// Subscribe BEFORE publishing, so a change landing during the publish
+		// wakes the next iteration instead of being stranded until some later
+		// one. Held across the throttle below for the same reason.
+		changed := e.Changed()
+
+		if wait := minInterval - time.Since(last); wait > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+
+		e.PublishTail()
+		last = time.Now()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-changed:
+		}
+	}
 }
 
 // New creates an engine positioned where the history store and the chain say
@@ -297,6 +381,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		halted:        make(map[int]bool),
 		haltReason:    make(map[int]string),
 		waitingOnCoin: make(map[int]bool),
+		statusWrites:  make(chan history.StatusUpdate, statusWriteQueue),
 		store:         store,
 		owner:         instanceOwner(),
 		// Nothing may advance until the tips have been re-derived while this
@@ -463,38 +548,62 @@ func loadHistory(ctx context.Context, store *history.Store, cellCount int, front
 
 // SnapshotTail is Snapshot with the history trimmed to the most recent
 // generations, for streaming.
+//
+// It builds only the tail. This used to call Snapshot and then slice the result,
+// which copied all of maxHistory — 2048 generations of 128 cells, a quarter of a
+// million structs under the read lock — to emit 48 of them, on every push, for
+// every connected client. A pending writer blocks behind that copy.
 func (e *Engine) SnapshotTail() Snapshot {
-	s := e.Snapshot()
-	if len(s.History) > TailGenerations {
-		s.History = s.History[len(s.History)-TailGenerations:]
-	}
-	return s
+	return e.snapshot(TailGenerations)
 }
 
-// Snapshot returns the current view. Safe for concurrent use.
-func (e *Engine) Snapshot() Snapshot {
+// Snapshot returns the current view, with the full in-memory history. Safe for
+// concurrent use.
+func (e *Engine) Snapshot() Snapshot { return e.snapshot(0) }
+
+// Stats returns the scalar view with no history at all.
+//
+// For callers that never look at the diagram — /metrics is scraped on a timer
+// whether or not a browser is connected, and paying a full history copy for a
+// dozen gauges is pure waste.
+func (e *Engine) Stats() Snapshot { return e.snapshot(-1) }
+
+// snapshot builds the view, copying at most limit trailing generations: 0 means
+// all of them, negative means none.
+func (e *Engine) snapshot(limit int) Snapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
+	from := 0
+	if limit > 0 && len(e.history) > limit {
+		from = len(e.history) - limit
+	} else if limit < 0 {
+		from = len(e.history)
+	}
 
 	// Copy the CELLS, not just the generation headers. Generation.Cells is a
 	// slice, so copying the outer slice alone leaves every backing array shared
 	// with the live engine — and the caller marshals it after this lock is
-	// released, while recordCell and applyStatus are writing into those same
-	// arrays. That is a genuine data race on a string header, not a stale read.
-	history := make([]Generation, len(e.history))
-	for i, g := range e.history {
+	// released, while recordCell and applyStatusBatch are writing into those
+	// same arrays. That is a genuine data race on a string header, not a stale
+	// read.
+	history := make([]Generation, 0, len(e.history)-from)
+	for _, g := range e.history[from:] {
 		cells := make([]CellTx, len(g.Cells))
 		copy(cells, g.Cells)
 		g.Cells = cells
-		history[i] = g
+		history = append(history, g)
 	}
 
 	// Count the newest row only. "Proved" means a node accepted the transition,
 	// which is where script validation happens; TxBroadcast is arcade's receipt,
 	// not the network's verdict, so it does not count yet.
+	//
+	// Read from e.history rather than the copy, so the counts are right even
+	// when no history was copied at all.
 	failed, proved := 0, 0
-	if n := len(history); n > 0 {
-		for _, c := range history[n-1].Cells {
+	if n := len(e.history); n > 0 {
+		for _, c := range e.history[n-1].Cells {
 			switch c.State {
 			case TxFailed:
 				failed++

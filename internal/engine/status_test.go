@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
 
@@ -16,6 +18,19 @@ import (
 // newTestEngine builds an engine with a real (temporary, SQLite) store and no
 // network, which is enough to exercise the bookkeeping.
 func newTestEngine(t *testing.T, cells int, gens ...uint64) *Engine {
+	t.Helper()
+	return newTestEngineOpts(t, cells, true, gens...)
+}
+
+// newTestEngineQueued is newTestEngine WITHOUT the status writer running, for
+// tests that inspect the write queue itself — a running writer drains it before
+// the test can look.
+func newTestEngineQueued(t *testing.T, cells int, gens ...uint64) *Engine {
+	t.Helper()
+	return newTestEngineOpts(t, cells, false, gens...)
+}
+
+func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64) *Engine {
 	t.Helper()
 	store, err := history.Open(t.Context(), "", t.TempDir())
 	if err != nil {
@@ -36,7 +51,12 @@ func newTestEngine(t *testing.T, cells int, gens ...uint64) *Engine {
 		halted:     map[int]bool{},
 		haltReason: map[int]string{},
 		lastMined:  map[int]uint64{},
-		owner:      "test",
+		// Persistence is asynchronous now, so the tests run the real writer
+		// rather than a stand-in — otherwise they would assert against a queue
+		// nothing ever drains. Assertions on the store go through
+		// waitForPersistedStatus.
+		statusWrites: make(chan history.StatusUpdate, statusWriteQueue),
+		owner:        "test",
 		// The tests exercise a writer that has already re-derived under its
 		// lease; the non-leader and re-derive paths have their own tests.
 		leader: true,
@@ -48,7 +68,46 @@ func newTestEngine(t *testing.T, cells int, gens ...uint64) *Engine {
 		}
 		e.history = append(e.history, g)
 	}
+
+	if startWriter {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); e.writeStatuses(ctx) }()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+	}
 	return e
+}
+
+// waitForPersistedStatus blocks until the store shows txid at want, or fails.
+//
+// The status write path is deliberately asynchronous — it must never make the
+// SSE applier wait on the database — so a test that reads the store immediately
+// after applying is racing the writer, not asserting on it.
+func waitForPersistedStatus(t *testing.T, e *Engine, txid string, want history.Status) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last history.Status
+	for time.Now().Before(deadline) {
+		rows, err := e.store.Load(t.Context(), 0, 4096)
+		if err != nil {
+			t.Fatalf("load history: %v", err)
+		}
+		for _, g := range rows {
+			for _, c := range g.Cells {
+				if c.TxID == txid {
+					last = c.Status
+					if c.Status == want {
+						return
+					}
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("status of %s never reached %q (last saw %q)", txid, want, last)
 }
 
 // TestStatusSurvivesHistoryTrim is the regression guard for txIndex holding
@@ -61,6 +120,18 @@ func newTestEngine(t *testing.T, cells int, gens ...uint64) *Engine {
 func TestStatusSurvivesHistoryTrim(t *testing.T) {
 	e := newTestEngine(t, 4, 100, 101, 102, 103)
 	const txid = "aa"
+
+	// The row has to exist in the store for the persistence half of this test to
+	// assert anything: without it Unsettled returns nothing and the check below
+	// passes for the wrong reason.
+	if err := e.store.RecordGeneration(t.Context(), 100, ""); err != nil {
+		t.Fatalf("record generation: %v", err)
+	}
+	if err := e.store.RecordTx(t.Context(), history.CellTx{
+		Generation: 100, Cell: 2, TxID: txid, Status: history.StatusBroadcast,
+	}); err != nil {
+		t.Fatalf("record tx: %v", err)
+	}
 
 	e.mu.Lock()
 	e.history[0].Cells[2] = CellTx{Cell: 2, TxID: txid, State: TxBroadcast}
@@ -82,7 +153,9 @@ func TestStatusSurvivesHistoryTrim(t *testing.T) {
 			}
 		}
 	}
+
 	// And it must still have been persisted, since the store is the record.
+	waitForPersistedStatus(t, e, txid, history.StatusMined)
 	settled, err := e.store.Unsettled(t.Context())
 	if err != nil {
 		t.Fatalf("unsettled: %v", err)
