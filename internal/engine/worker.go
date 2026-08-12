@@ -579,7 +579,7 @@ func (e *Engine) rederiveIfNeeded(ctx context.Context) {
 		e.mu.Unlock()
 		return
 	}
-	if err := CheckMigrationFloor(positions, e.deployment.LegacyTips()); err != nil {
+	if err := CheckMigrationFloor(ctx, e.store, positions, e.deployment.LegacyTips()); err != nil {
 		e.logger.ErrorContext(ctx, "refusing to advance", "err", err)
 		e.mu.Lock()
 		e.lastError = err.Error()

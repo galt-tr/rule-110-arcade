@@ -304,10 +304,44 @@ func fetchRaw(ctx context.Context, l chain.Ledger, txids []string) (map[string][
 // Deriving something HIGHER than the legacy file is expected and fine: the file
 // was written on a timer and is routinely a few generations stale. Only lower is
 // impossible, and impossible means stop.
-func CheckMigrationFloor(positions []CellPosition, legacy []chain.CellChain) error {
+//
+// Legacy tips the record says the network REFUSED are skipped rather than
+// treated as a floor. This is not a loosening of the check — it is the check
+// being correct about what a floor is.
+// The file was written by a build that advanced a cell's tip on broadcast rather
+// than on acceptance, so a cell halted by a rejection carries the REJECTED
+// transaction as its recorded tip. That transaction has no output. Derivation
+// landing "below" it is derivation being right: it fell back to the last
+// transaction that was actually accepted. Treating a phantom as a floor would
+// refuse to start forever on a deployment whose store is perfectly intact, and
+// the only way out an operator would find is `import-tips`, which would then
+// point the cell AT the phantom. See history.Store.RejectedTxIDs.
+//
+// The lookup happens in here rather than being a parameter deliberately. Every
+// caller of this function is on a startup path, and a caller that forgot to pass
+// the rejected set would get a check that refuses to start on an intact
+// deployment — a failure that only shows up against a legacy file nobody has in
+// a test environment. Making it impossible to omit is worth the store argument.
+func CheckMigrationFloor(ctx context.Context, store *history.Store,
+	positions []CellPosition, legacy []chain.CellChain) error {
+
+	txids := make([]string, 0, len(legacy))
+	for _, l := range legacy {
+		if l.TxID != "" {
+			txids = append(txids, l.TxID)
+		}
+	}
+	rejected, err := store.RejectedTxIDs(ctx, txids)
+	if err != nil {
+		return err
+	}
+
 	var behind []string
 	for _, l := range legacy {
 		if l.Cell < 0 || l.Cell >= len(positions) || l.TxID == "" {
+			continue
+		}
+		if rejected[l.TxID] {
 			continue
 		}
 		if got := positions[l.Cell].Tip.Generation; got < l.Generation {

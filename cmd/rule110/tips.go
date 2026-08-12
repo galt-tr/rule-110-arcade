@@ -153,7 +153,7 @@ func cmdRecover(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := engine.CheckMigrationFloor(positions, d.facts.LegacyTips()); err != nil {
+	if err := engine.CheckMigrationFloor(ctx, d.store, positions, d.facts.LegacyTips()); err != nil {
 		return err
 	}
 
@@ -271,8 +271,35 @@ func cmdImportTips(args []string) error {
 		return err
 	}
 
+	// Ask the record which of these the network actually refused, BEFORE any of
+	// the structural checks below — because every structural check passes on a
+	// rejected transaction. Its bytes hash to its txid and its output 0 carries
+	// exactly the covenant this cell's row demands; the only thing wrong with it
+	// is that it does not exist. state.json was written by a build that advanced
+	// a cell's tip on broadcast rather than on acceptance, so for every cell
+	// halted by a rejection the file's tip IS the rejection. Importing one would
+	// point the cell at a phantom outpoint and clear a halt that is protecting
+	// it. See history.Store.RejectedTxIDs.
+	txids := make([]string, 0, len(legacy))
+	for _, t := range legacy {
+		if t.TxID != "" {
+			txids = append(txids, t.TxID)
+		}
+	}
+	refusedByNetwork, err := d.store.RejectedTxIDs(ctx, txids)
+	if err != nil {
+		return err
+	}
+
 	for _, t := range legacy {
 		if t.Cell < 0 || t.Cell >= d.facts.Cells || t.TxID == "" {
+			continue
+		}
+		if refusedByNetwork[t.TxID] {
+			rejected = append(rejected, fmt.Sprintf(
+				"cell %d generation %d (%s): the record says the network REFUSED this transaction, so it "+
+					"has no output to spend — the derived tip is correct and this cell is halted for a real reason",
+				t.Cell, t.Generation, t.TxID))
 			continue
 		}
 		if t.Generation > highest {

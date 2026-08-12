@@ -323,7 +323,7 @@ func TestLegacyStateAheadOfHistoryRefusesToStart(t *testing.T) {
 		{Cell: 2, TxID: strings.Repeat("aa", 32), Generation: 837},
 		{Cell: 6, TxID: strings.Repeat("bb", 32), Generation: 806},
 	}
-	err := CheckMigrationFloor(positions, legacy)
+	err := CheckMigrationFloor(t.Context(), f.store, positions, legacy)
 	if err == nil {
 		t.Fatal("started with the history store hundreds of generations behind state.json; " +
 			"every cell would re-spend a spent output")
@@ -336,10 +336,57 @@ func TestLegacyStateAheadOfHistoryRefusesToStart(t *testing.T) {
 
 	// Deriving AHEAD of the legacy file is expected — it was written on a timer
 	// and is routinely stale — and must not be refused.
-	if err := CheckMigrationFloor(positions, []chain.CellChain{
+	if err := CheckMigrationFloor(t.Context(), f.store, positions, []chain.CellChain{
 		{Cell: 2, TxID: strings.Repeat("aa", 32), Generation: 0},
 	}); err != nil {
 		t.Errorf("refused a legacy file that is merely stale: %v", err)
+	}
+}
+
+// TestLegacyTipThatWasRejectedIsNotAFloor covers the case that actually occurred
+// on the live deployment, and that the floor check as first written would have
+// wedged permanently.
+//
+// state.json was produced by a build whose recordCell advanced a cell's tip when
+// a transition was BROADCAST, not when it was accepted. So every cell halted by
+// an arcade rejection carries the rejected transaction as its recorded tip —
+// generation 994 on cell 12, where 991 was the last one mined. Derivation
+// correctly falls back to 991. Naively that reads as "the store is 3 generations
+// behind the file", which is the exact shape of the catastrophe the floor check
+// exists to prevent, so it refuses to start; and the remedy it names,
+// `import-tips`, would then write the rejected transaction in as the tip and
+// point the cell at an outpoint that does not exist.
+//
+// A floor is only a floor if the transaction under it has an output.
+func TestLegacyTipThatWasRejectedIsNotAFloor(t *testing.T) {
+	f := newFixture(t)
+	positions := f.derive(t)
+
+	phantom := strings.Repeat("cc", 32)
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Cell: 2, Generation: 994, TxID: phantom, Status: history.StatusFailed,
+		Err: "arcade: REJECTED: PROCESSING (4)",
+	}); err != nil {
+		t.Fatalf("record the rejection: %v", err)
+	}
+
+	legacy := []chain.CellChain{{Cell: 2, TxID: phantom, Generation: 994}}
+	if err := CheckMigrationFloor(t.Context(), f.store, positions, legacy); err != nil {
+		t.Errorf("refused to start because the legacy file points at a transaction the record says "+
+			"was REJECTED; that transaction has no output, so it is not a floor: %v", err)
+	}
+
+	// The guard must still fire for a legacy tip that was genuinely accepted —
+	// otherwise this fix has removed the protection instead of sharpening it.
+	real := strings.Repeat("dd", 32)
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Cell: 3, Generation: 994, TxID: real, Status: history.StatusMined,
+	}); err != nil {
+		t.Fatalf("record the mined tip: %v", err)
+	}
+	if err := CheckMigrationFloor(t.Context(), f.store, positions,
+		[]chain.CellChain{{Cell: 3, TxID: real, Generation: 994}}); err == nil {
+		t.Error("started with the store behind a legacy tip that was MINED; that output really is spent")
 	}
 }
 

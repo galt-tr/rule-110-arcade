@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // postgres driver
@@ -445,6 +446,56 @@ func (s *Store) DeleteAttempt(ctx context.Context, generation uint64, cell int) 
 		return fmt.Errorf("history: delete attempt for cell %d generation %d: %w", cell, generation, err)
 	}
 	return nil
+}
+
+// RejectedTxIDs reports which of the given txids the record says the network
+// refused.
+//
+// This exists for the legacy migration path, and the distinction it draws is the
+// one that matters most there. A rejected transaction is perfectly well-formed:
+// its bytes hash to its txid and its output carries the right covenant, so every
+// structural check `import-tips` can make on it passes. What it does not have is
+// an output — the network never accepted it, so nothing it "created" exists to
+// be spent.
+//
+// state.json was written by a build whose recordCell advanced a cell's tip on
+// broadcast rather than on acceptance, so for any cell halted by a rejection the
+// file's tip IS the rejected transaction. Trusting it would point the cell at a
+// phantom outpoint and un-halt a cell that is halted for a real reason. Asking
+// the record directly is the only way to tell the two apart, and it is a bounded
+// question — one lookup for at most `cells` txids.
+func (s *Store) RejectedTxIDs(ctx context.Context, txids []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(txids) == 0 {
+		return out, nil
+	}
+	// Built rather than using ANY(): this store runs on both SQLite and Postgres
+	// and array parameters are not portable between them.
+	holders := make([]string, len(txids))
+	args := make([]any, 0, len(txids)+1)
+	for i, id := range txids {
+		holders[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, string(StatusFailed))
+	q := `SELECT txid FROM cell_txs WHERE txid IN (` + strings.Join(holders, ",") + `) AND status = ?`
+
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), args...)
+	if err != nil {
+		return nil, fmt.Errorf("history: look up rejected txids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("history: scan rejected txid: %w", err)
+		}
+		out[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history: look up rejected txids: %w", err)
+	}
+	return out, nil
 }
 
 // AcquireLease takes or renews a named lease, returning whether it is held.
