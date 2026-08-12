@@ -583,7 +583,14 @@ type DeepTip struct {
 func (s *Store) DeepTip(ctx context.Context, cell int) (DeepTip, error) {
 	var out DeepTip
 
-	newest := func(statuses ...string) (Tip, bool, error) {
+	// named is whether the row has to carry a transaction id. A settled row must —
+	// a row naming nothing is not something the network was told about, whatever
+	// its status says — while a `failed` row legitimately names nothing when the
+	// transition died before it could be signed, and an `attempting` row is written
+	// before there is a txid to write. Filtering in SQL rather than after the fact
+	// matters: the answer wanted is the newest QUALIFYING row, and rejecting the
+	// row the query returned would hide an older, perfectly good one behind it.
+	newest := func(named bool, statuses ...string) (Tip, bool, error) {
 		holders := make([]string, len(statuses))
 		args := []any{cell}
 		for i, st := range statuses {
@@ -591,8 +598,13 @@ func (s *Store) DeepTip(ctx context.Context, cell int) (DeepTip, error) {
 			args = append(args, st)
 		}
 		q := `SELECT cell, generation, txid, status, coalesce(err,'') FROM cell_txs
-		      WHERE cell = ? AND status IN (` + strings.Join(holders, ",") + `)
-		      ORDER BY generation DESC LIMIT 1`
+		      WHERE cell = ? AND status IN (` + strings.Join(holders, ",") + `)`
+		if named {
+			// txid is NOT NULL with a '' default, so this is the whole of how "names
+			// a transaction" is spelled in this table.
+			q += ` AND txid <> ''`
+		}
+		q += ` ORDER BY generation DESC LIMIT 1`
 		var t Tip
 		err := s.db.QueryRowContext(ctx, s.rebind(q), args...).
 			Scan(&t.Cell, &t.Generation, &t.TxID, &t.Status, &t.Err)
@@ -605,22 +617,33 @@ func (s *Store) DeepTip(ctx context.Context, cell int) (DeepTip, error) {
 		return t, true, nil
 	}
 
+	// The settled set is exactly the one engine.newestSettled accepts — the same
+	// three statuses, and the same requirement that the row name a transaction —
+	// and the two have to agree. Derivation reads the shallow window first and digs
+	// only when that window holds nothing settled, so a row one of them counts and
+	// the other does not is a cell the shallow path calls buried and the dig then
+	// calls LOST. `seen` was that row: it is what the status stream records between
+	// broadcast and mined, so a cell whose last accepted transaction had not been
+	// mined yet reported "no record for this cell names a transaction the network
+	// accepted" and derived no tip at all, when its tip was perfectly well defined
+	// and merely buried under wreckage.
 	var err error
-	out.Settled, out.HasSettled, err = newest(string(StatusMined), string(StatusBroadcast))
+	out.Settled, out.HasSettled, err = newest(true,
+		string(StatusMined), string(StatusBroadcast), string(StatusSeen))
 	if err != nil {
 		return out, err
 	}
 
 	// Only records ABOVE the settled tip say anything about where the chain
 	// stops. Anything below it was superseded by the tip itself.
-	out.Failed, out.HasFailed, err = newest(string(StatusFailed))
+	out.Failed, out.HasFailed, err = newest(false, string(StatusFailed))
 	if err != nil {
 		return out, err
 	}
 	if out.HasFailed && out.HasSettled && out.Failed.Generation <= out.Settled.Generation {
 		out.HasFailed = false
 	}
-	out.Attempt, out.HasAttempt, err = newest(string(StatusAttempting))
+	out.Attempt, out.HasAttempt, err = newest(false, string(StatusAttempting))
 	if err != nil {
 		return out, err
 	}

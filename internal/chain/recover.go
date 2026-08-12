@@ -412,14 +412,21 @@ func isHexDigit(c byte) bool {
 func RecoverSpentTip(ctx context.Context, l Ledger, oracle TxStatus, compiled *cellscript.Compiled,
 	tip CellChain, rejection string, next ca.Row, onRecord OnRecord) (Recovery, error) {
 
+	// gen is the generation this cell would ADVANCE to, which is what everything
+	// below is verified against. It is deliberately derived from the tip rather
+	// than taken from the caller's record: the candidate is adopted only if it
+	// spends the tip and carries the covenant for the row above it, so tip+1 is
+	// the only generation it can be. The rejection MESSAGE may have been recorded
+	// further up — see engine.CellPosition.RejectedAt — so nothing here says which
+	// row it came off, only what it is evidence about.
 	cell, gen := tip.Cell, tip.Generation+1
 
 	// 1. The rejection names a transaction.
 	txid, ok := SpentBy(rejection)
 	if !ok {
 		return halt(fmt.Sprintf(
-			"cell %d: generation %d was rejected, but the recorded reason does not parse as a UTXO_SPENT "+
-				"naming exactly one transaction, so there is no candidate to verify: %q",
+			"cell %d: generation %d cannot be recovered from the recorded rejection, which does not parse "+
+				"as a UTXO_SPENT naming exactly one transaction, so there is no candidate to verify: %q",
 			cell, gen, rejection)), nil
 	}
 
@@ -428,22 +435,23 @@ func RecoverSpentTip(ctx context.Context, l Ledger, oracle TxStatus, compiled *c
 	if err != nil {
 		// A failed lookup is not evidence that the transaction is unknown to us.
 		return halt(fmt.Sprintf(
-			"cell %d: generation %d was rejected as already spent by %s, but our own record could not be "+
-				"searched for it, so nothing is known: %v", cell, gen, txid, err)), nil
+			"cell %d: the rejection holding this cell below generation %d names %s as having already spent "+
+				"its tip, but our own record could not be searched for it, so nothing is known: %v",
+			cell, gen, txid, err)), nil
 	}
 	if mine {
 		return halt(fmt.Sprintf(
-			"cell %d: generation %d was rejected as already spent by %s — but that transaction IS on our "+
-				"record, so this is not a lost transition, it is the record disagreeing with itself. "+
-				"A human decides", cell, gen, txid)), nil
+			"cell %d: the rejection holding this cell below generation %d names %s as having already spent "+
+				"its tip — but that transaction IS on our record, so this is not a lost transition, it is "+
+				"the record disagreeing with itself. A human decides", cell, gen, txid)), nil
 	}
 
 	// 3. Its bytes are real and hash to the name arcade gave us.
 	raw, err := l.RawTx(ctx, txid)
 	if err != nil {
 		return halt(fmt.Sprintf(
-			"cell %d: generation %d was rejected as already spent by %s, but that transaction's bytes could "+
-				"not be read, so it cannot be verified as ours: %v", cell, gen, txid, err)), nil
+			"cell %d: %s is named as having already spent this cell's tip, but that transaction's bytes "+
+				"could not be read, so it cannot be verified as ours: %v", cell, txid, err)), nil
 	}
 	tx, err := parseTip(cell, txid, raw)
 	if err != nil {
@@ -508,8 +516,8 @@ func RecoverSpentTip(ctx context.Context, l Ledger, oracle TxStatus, compiled *c
 	return Recovery{
 		Verdict: VerdictAdopt, Tip: adopted, Steps: []CellChain{adopted},
 		Reason: fmt.Sprintf(
-			"cell %d: generation %d was refused because %s had already spent this cell's tip — and that "+
-				"transaction is a transition of ours that was never recorded: it spends %s:%d, carries "+
+			"cell %d: this cell could not reach generation %d because %s had already spent its tip — and "+
+				"that transaction is a transition of ours that was never recorded: it spends %s:%d, carries "+
 				"cell %d's covenant for generation %d at output 0, is on no record of ours, and arcade "+
 				"reports it %s. Adopting it; tip moves %d -> %d. Nothing is re-spent",
 			cell, gen, txid, tip.TxID, tip.Vout, cell, gen, string(rec.Status),
@@ -584,31 +592,56 @@ func RecoverSpentTip(ctx context.Context, l Ledger, oracle TxStatus, compiled *c
 // look up at all.
 //
 // The mirrored error is cheap by comparison. If the tip this is checked against
-// is itself superseded — the tip fix has not run yet, or could not verify its
-// candidate — then resuming re-spends an output that is already spent, and the
+// is itself superseded — the tip fix has not run yet, could not verify its
+// candidate, or the transition above the tip was broadcast and then lost its
+// record entirely, which is the hole a non-adjacent rejection now sits over —
+// then resuming re-spends an output that is already spent, and the
 // answer is another UTXO_SPENT rejection naming the transaction that really holds
 // the generation, which is precisely what RecoverSpentTip repairs. One wasted
 // transaction, no coin at risk.
 //
-// # Adjacency, and the cascade
+// # Where the rejection sits, and the cascade
 //
-// rejected must be exactly tip.Generation+1. A rejection further up is a CASCADE:
-// the cell built on a phantom, and every attempt after it spent the previous
-// rejected transaction's output and was refused in turn. Cells 34, 51, 64 and 91
-// carry about 170 of those each over tips near generation 300, and every one of
-// them WOULD pass the test below — they all spend phantoms rather than the tip —
-// so the adjacency check is the whole of what keeps this away from them. Nor
-// would resuming help: the 169 rejections underneath the newest would still halt
-// the cell at the next startup. Untangling that is a human's job, not this one's.
+// This used to require `rejected == tip.Generation+1`. It no longer does, and the
+// reason is worth being precise about, because adjacency looked like a safety
+// property here and was not one.
+//
+// A rejection at tip+2 or beyond was built on the output of the rejection below
+// it — an output that has never existed — so it CANNOT spend the current tip.
+// The verdict this function reaches therefore applies to it almost by
+// construction. That is an argument for adjacency being redundant, not for the
+// check being skipped: the resume below is still reached only by fetching the
+// transaction, checking its bytes against the txid the record holds, and finding
+// another parent in its inputs. Nothing is ever concluded from the generation
+// arithmetic alone, because "it must have been built on a phantom" is an
+// inference about a transaction nobody has read, and the whole burden of proof
+// argued above is that a resume is a decision to spend.
+//
+// Requiring adjacency also stalled the repair it exists for, which is how the
+// change came about. Retracting one rejection moves the next up to tip+2, so cell
+// 12 of the live deployment — tip 991, failures at 993 and 994 after 992 was
+// retracted — was examined at the empty generation 992 by every subsequent pass
+// and reported as needing nothing while it stayed dead.
+//
+// The CASCADE is still refused, and it is refused on what actually distinguishes
+// it: how many rejections are stacked above the tip. Cells 34, 51, 64 and 91
+// carry about 170 each over tips near generation 300, every one of which would
+// pass the test below — they all spend phantoms — and resuming them would achieve
+// nothing anyway, since the ones underneath would halt the cell again at the next
+// startup. That count is the caller's to take, because only the caller can see
+// the store; see engine.maxWreckage, which is where the line is drawn once for
+// every rejection path. This function is not safe by virtue of that caller being
+// careful — everything it concludes it reads out of a transaction — but it is not
+// the place that can tell one refused transition from a pile of them.
 func RecoverStaleRejection(ctx context.Context, l Ledger, tip CellChain,
 	rejected uint64, rejectedTxID, rejection string) (Recovery, error) {
 
 	cell := tip.Cell
-	if rejected != tip.Generation+1 {
+	if rejected <= tip.Generation {
 		return halt(fmt.Sprintf(
 			"cell %d: the rejection under examination is at generation %d but the tip is at generation %d; "+
-				"only a rejection DIRECTLY above the tip describes a single refused transition, and anything "+
-				"further up is a cascade this must not touch",
+				"a rejection at or below the tip is one the tip itself superseded, so the record "+
+				"contradicts itself and there is no transition here to re-create",
 			cell, rejected, tip.Generation)), nil
 	}
 	if rejectedTxID == "" {
@@ -675,7 +708,7 @@ func RecoverStaleRejection(ctx context.Context, l Ledger, tip CellChain,
 				"built on a parent this cell no longer has, so its refusal says nothing about the tip and the "+
 				"tip was never offered to the network in it. Resuming from generation %d; the cell "+
 				"re-creates generation %d. What was set aside: %s",
-			cell, rejected, rejectedTxID, tip.TxID, tip.Vout, tip.Generation, rejected,
+			cell, rejected, rejectedTxID, tip.TxID, tip.Vout, tip.Generation, tip.Generation+1,
 			orNoReason(rejection)),
 	}, nil
 }
@@ -748,17 +781,39 @@ func IsNotBroadcast(recorded string) bool {
 // # What resuming costs if it is wrong
 //
 // Nothing is adopted and the tip does not move: the cell re-creates the
-// generation it already failed to create. If — contrary to both facts above —
-// something HAD been signed and broadcast, the rebuild would be a second
-// transaction spending a live output. That is why the evidence here has to be
-// positive and doubled rather than merely plausible.
+// generation above its tip. If — contrary to both facts above — something HAD
+// been signed and broadcast, the rebuild would be a second transaction spending a
+// live output. That is why the evidence here has to be positive and doubled
+// rather than merely plausible.
+//
+// # Where the row sits is not part of the evidence
+//
+// This used to require `failed == tip.Generation+1` and call anything higher a
+// cascade. Adjacency was never load-bearing HERE, and this is the one decision in
+// this file of which that is true: both facts above are statements about our own
+// code path at the moment the row was written — the sentinel is wrapped in
+// immediately before SignAction, and there is no txid because there was never a
+// transaction — and they are exactly as true of a row at tip+3 as of one at
+// tip+1. Nothing was signed, so nothing can be double spent by rebuilding,
+// wherever the row sits.
+//
+// Requiring it also broke the repair. Retracting a row moves the next failure to
+// tip+2, so a cell carrying two such rows was cleared by one pass and then
+// abandoned by every pass after it, each one reporting success. What keeps a
+// CASCADE out is the caller counting how many rejections are stacked above the
+// tip, not where the one under examination sits; see engine.maxWreckage.
+//
+// A row at or below the tip is still refused, and that is a different question
+// from adjacency: the tip is a transaction the network ACCEPTED at that
+// generation, so a `failed` row there is the record contradicting itself and
+// there is no transition below the tip left to rebuild.
 func RecoverNotBroadcast(tip CellChain, failed uint64, failedTxID, recorded string) (Recovery, error) {
 	cell := tip.Cell
-	if failed != tip.Generation+1 {
+	if failed <= tip.Generation {
 		return halt(fmt.Sprintf(
 			"cell %d: the failure under examination is at generation %d but the tip is at generation %d; "+
-				"only a failure DIRECTLY above the tip describes the transition this cell is trying to "+
-				"make, and anything further up is a cascade this must not touch",
+				"a failure at or below the tip is one the tip itself superseded, so the record contradicts "+
+				"itself and there is no transition here to rebuild",
 			cell, failed, tip.Generation)), nil
 	}
 	if !IsNotBroadcast(recorded) {
@@ -782,7 +837,7 @@ func RecoverNotBroadcast(tip CellChain, failed uint64, failedTxID, recorded stri
 				"which is set before SignAction, and the record names no transaction — so nothing reached "+
 				"the network and this cell's tip %s:%d is untouched. Resuming from generation %d; the cell "+
 				"re-creates generation %d. What failed: %s",
-			cell, failed, ErrNotBroadcast.Error(), tip.TxID, tip.Vout, tip.Generation, failed,
+			cell, failed, ErrNotBroadcast.Error(), tip.TxID, tip.Vout, tip.Generation, tip.Generation+1,
 			orNoReason(recorded)),
 	}, nil
 }
@@ -822,8 +877,7 @@ func RecoverNotBroadcast(tip CellChain, failed uint64, failedTxID, recorded stri
 //
 // # Every condition
 //
-//  1. The refusal sits directly above the tip. Further up is a cascade; see
-//     RecoverStaleRejection.
+//  1. The refusal sits at exactly tip.Generation+1.
 //  2. It is not a UTXO_SPENT. Those belong to RecoverSpentTip, and its halts are
 //     specific uncertainties — most importantly a foreign double spend, where
 //     the cell's chain is genuinely over and re-spending would churn forever
@@ -836,6 +890,22 @@ func RecoverNotBroadcast(tip CellChain, failed uint64, failedTxID, recorded stri
 //     RecoverStaleRejection's case, which resumes on stronger evidence and
 //     without needing this flag at all. Retrying here would answer the wrong
 //     question about the wrong output.
+//
+// # Why condition 1 stays, when the others dropped it
+//
+// RecoverNotBroadcast and RecoverStaleRejection no longer test where the record
+// sits, because what they establish is true of it wherever it sits. This one is
+// different: it is meaningful ONLY for a transaction that spends the CURRENT tip,
+// which condition 4 proves from the bytes — and a record above tip+1 was built on
+// the output of the record below it, so it cannot be that transaction. The
+// generation test is the same fact stated cheaply, and keeping it means an
+// operator who points the flag at such a cell reads a reason naming the mismatch
+// instead of a fetch that could only ever end in condition 4.
+//
+// It is emphatically NOT a cascade guard here. Cascades are refused by the caller
+// counting the pile above the tip (see engine.maxWreckage), and this being the
+// last repair asked — the only one that resumes without establishing what
+// happened — is exactly why it must not be the place that decision is made.
 func RetryRefusal(ctx context.Context, l Ledger, tip CellChain, rejected uint64,
 	rejectedTxID, rejection string) (Recovery, error) {
 
@@ -843,8 +913,10 @@ func RetryRefusal(ctx context.Context, l Ledger, tip CellChain, rejected uint64,
 	if rejected != tip.Generation+1 {
 		return halt(fmt.Sprintf(
 			"cell %d: the rejection under examination is at generation %d but the tip is at generation %d; "+
-				"only a rejection DIRECTLY above the tip describes a single refused transition, and "+
-				"anything further up is a cascade this must not touch",
+				"a retry rebuilds the transition ABOVE THE TIP, so it is only ever justified by a refusal "+
+				"of a transaction that spent the tip — and a record anywhere else was built on an output "+
+				"this cell no longer has. That is the superseded-parent case, which resumes on its own "+
+				"evidence and needs no retry flag",
 			cell, rejected, tip.Generation)), nil
 	}
 	if IsUTXOSpent(rejection) {

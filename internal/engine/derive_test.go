@@ -256,6 +256,50 @@ func TestFailedNewestRecordHaltsTheCell(t *testing.T) {
 	}
 }
 
+// TestASingleRejectionAboveTheTipIsUnchanged pins the ordinary cell against the
+// change that let recovery examine a record further up.
+//
+// One refused transition directly above the tip is what almost every halted cell
+// is, and nothing about it may have moved: the same tip, the same flags, the same
+// transaction offered for examination, and the same sentence in the same words —
+// asserted literally, because the halt reason is what an operator reads and it is
+// now written by the same code that decides which row recovery acts on.
+func TestASingleRejectionAboveTheTipIsUnchanged(t *testing.T) {
+	f := newFixture(t)
+	const cell = 3
+	tip := f.advance(t, cell, f.genesisTip(cell), history.StatusMined)
+
+	refused := f.build(t, cell, tip, 3)
+	const why = "arcade: REJECTED: PROCESSING (4): failed to validate transaction"
+	if err := f.store.RecordTx(t.Context(), history.CellTx{
+		Generation: refused.Generation, Cell: cell, TxID: refused.TxID,
+		Status: history.StatusFailed, Err: why,
+	}); err != nil {
+		t.Fatalf("record the refusal: %v", err)
+	}
+
+	p := f.derive(t)[cell]
+	if !p.Halted || p.Unknown {
+		t.Fatalf("cell %d = %+v, want halted by a rejection rather than flagged unknown", cell, p)
+	}
+	if p.Tip.TxID != tip.TxID || p.Tip.Generation != tip.Generation {
+		t.Errorf("tip = %s at generation %d, want the last accepted record %s at %d",
+			p.Tip.TxID, p.Tip.Generation, tip.TxID, tip.Generation)
+	}
+	if !p.Rejected || p.RejectionTxID != refused.TxID || p.RejectionErr != why {
+		t.Errorf("cell %d = %+v, want the refusal offered for examination", cell, p)
+	}
+	if p.RejectedAt != tip.Generation+1 || p.RejectedAt != refused.Generation {
+		t.Errorf("RejectedAt = %d, want the tip's own successor at %d", p.RejectedAt, refused.Generation)
+	}
+	want := fmt.Sprintf(
+		"generation %d was rejected, so this cell's chain ends at generation %d: %s",
+		refused.Generation, tip.Generation, why)
+	if p.HaltReason != want {
+		t.Errorf("the halt reason for the ordinary case changed.\n got: %q\nwant: %q", p.HaltReason, want)
+	}
+}
+
 // An unresolved write-ahead record means the tip is UNKNOWN rather than merely
 // stale, so the cell is halted AND flagged for recovery — and the tip reported
 // is the last one actually broadcast.

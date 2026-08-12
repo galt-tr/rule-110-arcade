@@ -21,6 +21,44 @@ import (
 // right answer there is to stop and say so rather than to dig.
 const tipDepth = 8
 
+// maxWreckage is how many rejections may sit above a cell's tip before the cell
+// is a CASCADE rather than a cell with one broken transition on top of it. Past
+// it no repair is offered for that cell and a human decides.
+//
+// This is the guard that used to be spelled "the rejection must be at tip+1".
+// Adjacency was a proxy for it, and a wrong one: it also refused cell 12 of the
+// live deployment, whose two leftover rejections at generations 993 and 994 over
+// a tip at 991 are ordinary wreckage that clears in two passes. What actually
+// distinguishes the cells that must not be touched is the SIZE of the pile.
+// Cells 34, 51, 64 and 91 carry about 170 stacked rejections each over tips near
+// generation 300: those cells were allowed to build on phantom outputs for
+// hundreds of generations, so re-creating their chains is a decision about the
+// automaton's history rather than about one refused transaction. Resuming them
+// would not even help — the rejections underneath the newest would halt the cell
+// again at the next startup.
+//
+// It COUNTS the failures above the tip rather than measuring a run upward from
+// tip+1, and that difference is the whole of why the count is trustworthy where
+// adjacency was not. A repair retracts one row per pass, so the bottom of any
+// pile is routinely missing: "consecutive from tip+1" reads cell 12's two
+// leftovers as zero, and — far worse — reads a 169-deep cascade whose bottom row
+// the previous pass retracted as zero too, which would hand exactly the four
+// cells above to recovery.
+//
+// Three is the largest pile the live deployment's ordinary wreckage shows: cell
+// 12's record was 991 mined and then 992, 993 and 994 all failed — one break, and
+// the two transitions the old build stacked on its phantom output before the cell
+// was noticed. It is a judgement rather than a measurement, so it is stated once
+// here and the count is written into the halt reason, which is where an operator
+// reads what was actually found.
+const maxWreckage = 3
+
+// The deep path in DeriveTips leans on this: a cell whose wreckage does not fit
+// inside the derivation window has more rejections above its tip than maxWreckage
+// allows, without anything having to count them. A negative constant here is a
+// compile error, which is the point.
+const _ = uint(tipDepth - maxWreckage - 1)
+
 // CellPosition is one cell's derived position, and why.
 //
 // Every field is a conclusion drawn from the history store plus the bytes of the
@@ -44,20 +82,35 @@ type CellPosition struct {
 	Attempted uint64
 	Unknown   bool
 
-	// Rejected is set when the generation DIRECTLY above the tip FAILED, and
+	// Rejected is set when a FAILED record above the tip is one recovery may
+	// examine, and RejectedAt is that record's generation.
+	//
+	// RejectedAt is carried rather than recomputed from the tip, and that is the
+	// whole of the fix for the way repair used to stall. Recovery asked about
+	// tip.Generation+1, on the assumption that a failure halting a cell is always
+	// the tip's own successor. It is not, once a pass has retracted a row: cell 12
+	// of the live deployment sat at tip 991 with failures at 993 and 994 after 992
+	// had been retracted. Derivation halted on 993; recovery examined 992, which
+	// was empty; so every pass decided there was nothing to do and reported
+	// success while the cell stayed dead. Repeated `recover -apply` runs converged
+	// on a no-op with 23 cells halted.
+	//
+	// The record is the OLDEST failure above the tip. That is the break itself:
+	// everything above it was built on an output the break never produced, so the
+	// oldest is the only one that can possibly be a verdict about the TIP, and
+	// retracting it is what lets the next pass see the one above it. In the
+	// ordinary case — a single refused transition — it is tip+1, and nothing about
+	// such a cell has changed.
+	//
+	// It is NOT set when the failures above the tip are a CASCADE; see
+	// maxWreckage, which is where that line is drawn for every rejection path at
+	// once, and noteRejection, which is the only place it is drawn.
+	//
 	// RejectionErr is the recorded reason — usually arcade's own words for why,
 	// but not always: a transition that died locally before it could be signed
 	// used to be recorded here too, carrying our own chain.ErrNotBroadcast
 	// sentinel instead. See chain.RecoverNotBroadcast, which is what those cells
 	// are recovered by.
-	//
-	// "Directly above" is the whole of the condition. A rejection one generation
-	// past the tip is a single refused transition with a reason attached, and its
-	// reason may name the transaction that really holds that generation — see
-	// chain.RecoverSpentTip. A rejection further up is a CASCADE: the cell built
-	// on a phantom output and every later attempt was refused in turn, so the
-	// newest reason describes the wreckage rather than the original event, and
-	// nothing in it points at a recoverable tip.
 	//
 	// The raw recorded message is carried rather than HaltReason's prose because
 	// recovery parses it. HaltReason is written for a human and is free to be
@@ -71,6 +124,7 @@ type CellPosition struct {
 	// before anything was signed, and that emptiness is itself evidence: it is
 	// the second of the two facts chain.RecoverNotBroadcast requires.
 	Rejected      bool
+	RejectedAt    uint64
 	RejectionErr  string
 	RejectionTxID string
 }
@@ -180,7 +234,40 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 			claims[cell] = claim{gen: base.Generation, txid: base.TxID}
 			txids = append(txids, base.TxID)
 
+			// A rejection is asked about FIRST here, which is the opposite of the
+			// order everywhere else — Recover dispatches on Unknown before Rejected,
+			// and history.DeepTip's own comment argues that an attempt outranks a
+			// rejection because an attempt means the tip is unknown.
+			//
+			// That argument is about one crash. It does not hold at this depth: a cell
+			// reaches this branch only when NOTHING in its newest tipDepth records
+			// settled, so a rejection above the tip here is part of a pile deeper than
+			// maxWreckage allows however it is counted. Leaving Unknown set on top of
+			// such a pile would be a way straight round the cascade guard and into
+			// chain.RecoverCell, which walks the WALLET's actions forward — and in a
+			// cascade those link one to the next (every attempt spent the previous
+			// refused transaction's output) while carrying the wallet's own lifecycle
+			// status rather than arcade's verdict. It would adopt refused transactions
+			// as this cell's tip.
+			//
+			// A pile of unresolved ATTEMPTS with no rejection in it is a different
+			// thing — several transitions signed without any being recorded, which is
+			// the crash chain.RecoverCell walks — and still goes to recovery.
 			switch {
+			case deep.HasFailed:
+				// No repair is offered for a cell that got here, and Rejected is
+				// deliberately left unset: the wreckage above this tip is deeper than
+				// the window, which is the cascade condition, and cells 34, 51, 64 and
+				// 91 are what it is for. The tip itself has also only been dug up, not
+				// yet verified against its bytes, so there is nothing here a repair
+				// could safely reason from even if the pile were small.
+				out[cell].Halted = true
+				out[cell].HaltReason = fmt.Sprintf(
+					"this cell's chain ends at generation %d, buried under rejections up to "+
+						"generation %d: %s. Nothing in this cell's %d newest records settled, so this is "+
+						"a cascade rather than one refused transition; recovery will not touch it and a "+
+						"human decides",
+					base.Generation, deep.Failed.Generation, orUnknown(deep.Failed.Err), len(rows))
 			case deep.HasAttempt:
 				out[cell].Unknown = true
 				out[cell].Halted = true
@@ -189,13 +276,6 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 					"generation %d was attempted but never resolved, so this cell's tip is UNKNOWN: "+
 						"a transition may have been broadcast without being recorded. Run \"rule110 recover\"",
 					deep.Attempt.Generation)
-			case deep.HasFailed:
-				out[cell].Halted = true
-				out[cell].HaltReason = fmt.Sprintf(
-					"this cell's chain ends at generation %d, buried under rejections up to "+
-						"generation %d: %s",
-					base.Generation, deep.Failed.Generation, orUnknown(deep.Failed.Err))
-				noteRejection(&out[cell], base.Generation, deep.Failed)
 			}
 			continue
 		}
@@ -203,26 +283,71 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 		txids = append(txids, base.TxID)
 
 		// Everything above the tip is a record of something that did not settle.
+		//
+		// The rows are gathered rather than acted on inside the loop. The two kinds
+		// have a precedence — an unresolved attempt outranks a rejection, exactly as
+		// in Recover's own dispatch — and the loop's iteration order is not it:
+		// records arrive newest first, so writing HaltReason as they go makes the
+		// message describe whichever record happens to sit lowest. That is how the
+		// message and the decision came apart in the first place.
+		//
+		// The tip being INSIDE the window is what makes the count exact: the window
+		// is the newest tipDepth records, so if the tip is in it then every record
+		// above the tip is in it too.
+		var failed, attempt history.Tip
+		failures, attempts := 0, 0
 		for _, r := range rows {
 			if r.Generation <= base.Generation {
 				break
 			}
 			switch r.Status {
 			case history.StatusFailed:
-				out[cell].Halted = true
-				out[cell].HaltReason = fmt.Sprintf(
-					"generation %d was rejected, so this cell's chain ends at generation %d: %s",
-					r.Generation, base.Generation, orUnknown(r.Err))
-				noteRejection(&out[cell], base.Generation, r)
+				// Newest first, so each assignment moves this DOWN and what survives
+				// the loop is the OLDEST failure above the tip — the break itself,
+				// rather than one of the refusals stacked on top of it.
+				failed = r
+				failures++
 			case history.StatusAttempting:
-				out[cell].Unknown = true
-				out[cell].Halted = true
-				out[cell].Attempted = base.Generation + 1
-				out[cell].HaltReason = fmt.Sprintf(
-					"generation %d was attempted but never resolved, so this cell's tip is UNKNOWN: "+
-						"a transition may have been broadcast without being recorded. Run \"rule110 recover\"",
-					r.Generation)
+				attempt = r
+				attempts++
 			}
+		}
+		cascade := failures > maxWreckage
+		if failures > 0 {
+			noteRejection(&out[cell], base.Generation, failed, failures)
+		}
+		if attempts > 0 && !cascade {
+			// Last, so that its reason wins: Recover dispatches on Unknown before it
+			// looks at Rejected, and the reason an operator reads has to be about the
+			// record recovery is going to act on.
+			//
+			// Which is exactly why a cascade withholds Unknown as well as Rejected.
+			// Dispatching on Unknown first means an unresolved attempt sitting on top
+			// of the pile would be a way straight round the guard and into
+			// chain.RecoverCell — which walks the WALLET's actions forward, and in a
+			// cascade those link one to the next (every attempt spent the previous
+			// refused transaction's output) while carrying the wallet's own lifecycle
+			// status rather than arcade's verdict. It would adopt refused transactions
+			// as this cell's tip, which is the direction that destroys a cell rather
+			// than stalling it. An attempt above a cascade is wreckage too: the cell
+			// was already halted, so nothing legitimate was in flight.
+			//
+			// Attempted stays the tip's own successor rather than the row's own
+			// generation, which is this path's one remaining gap and is deliberately
+			// left as it was. chain.RecoverCell reasons about tip+1 and
+			// DeleteAttempt retracts tip+1, so an unresolved record sitting HIGHER
+			// than that is decided about a generation it is not at — the same shape
+			// as the rejection bug above. It is left alone because narrowing it here
+			// would stop RecoverCell walking the wallet's own signed successors
+			// forward, which is a live repair, and no such record has been seen. The
+			// message names where the row actually is, so at least the report says so.
+			out[cell].Unknown = true
+			out[cell].Halted = true
+			out[cell].Attempted = base.Generation + 1
+			out[cell].HaltReason = fmt.Sprintf(
+				"generation %d was attempted but never resolved, so this cell's tip is UNKNOWN: "+
+					"a transition may have been broadcast without being recorded. Run \"rule110 recover\"",
+				attempt.Generation)
 		}
 	}
 
@@ -266,28 +391,54 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 	return out, nil
 }
 
-// noteRejection records a rejection that sits DIRECTLY on the cell's tip, and
-// only such a rejection.
+// noteRejection records the failure derivation halted on, and writes the halt
+// reason from that same record.
 //
-// Both derivation paths call it with their own idea of "the failure above the
-// tip" — the shallow window walks every record above the tip, the deep dig
-// returns only the newest — and the generation test is what makes the two mean
-// the same thing. Without it the deep path would hand a cascade's 170th
-// rejection to recovery as if it described the break, and recovery would parse
-// a message about an output that never existed.
+// One record decides both, and that is the point. They used to be able to
+// disagree: derivation halted on the oldest failure above the tip and said so in
+// the message, while recovery went off and looked at tip.Generation+1. On cell 12
+// those were generations 993 and 992, and 992 had already been retracted — so the
+// operator read "generation 993 was rejected" and the tool then reported success
+// having examined an empty row. Everything recovery needs about that record now
+// comes from here, so the two cannot come apart again.
 //
-// The same test is the only thing keeping chain.RecoverStaleRejection away from
-// cells 34, 51, 64 and 91: every rejection in a cascade after the first spends
-// the previous rejected transaction's output rather than the tip, so every one of
-// them would satisfy that check on its own. Adjacency is what distinguishes one
-// refused transition from 170 stacked ones.
-func noteRejection(p *CellPosition, tip uint64, r history.Tip) {
-	if r.Generation != tip+1 {
+// `above` is how many failures sit above the tip in total, and it is the cascade
+// guard: past maxWreckage, Rejected is left unset and no repair is dispatched for
+// the cell at all. The halt still names the record and the count, because an
+// operator who came to look at one specific cell must find it in the output
+// however it was decided.
+//
+// This is the ONLY place that line is drawn on the engine side, so it holds for
+// every rejection path at once — the tip fix, the not-broadcast sentinel, the
+// superseded parent and the opt-in retry all reach chain through
+// CellPosition.Rejected.
+func noteRejection(p *CellPosition, tip uint64, r history.Tip, above int) {
+	p.Halted = true
+	if above > maxWreckage {
+		p.HaltReason = fmt.Sprintf(
+			"this cell's chain ends at generation %d with %d rejections stacked above it, the oldest "+
+				"at generation %d: %s. That is a cascade rather than one refused transition — every "+
+				"attempt after the first spent an output that never existed — so recovery will not "+
+				"touch it and a human decides",
+			tip, above, r.Generation, orUnknown(r.Err))
 		return
 	}
 	p.Rejected = true
+	p.RejectedAt = r.Generation
 	p.RejectionErr = r.Err
 	p.RejectionTxID = r.TxID
+
+	if above == 1 {
+		p.HaltReason = fmt.Sprintf(
+			"generation %d was rejected, so this cell's chain ends at generation %d: %s",
+			r.Generation, tip, orUnknown(r.Err))
+		return
+	}
+	p.HaltReason = fmt.Sprintf(
+		"generation %d was rejected, so this cell's chain ends at generation %d (%d rejections sit "+
+			"above the tip; this is the oldest and the only one that can be a verdict about the tip, "+
+			"so recovery examines it first): %s",
+		r.Generation, tip, above, orUnknown(r.Err))
 }
 
 // newestSettled returns the newest record that names a transaction the network

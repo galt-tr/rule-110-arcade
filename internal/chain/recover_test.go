@@ -875,25 +875,73 @@ func TestStaleRejectionHaltsOnEveryUncertainty(t *testing.T) {
 	})
 }
 
-// TestStaleRejectionRefusesANonAdjacentRejection pins the cascade guard inside
-// the decision itself, not only in the caller that selects candidates.
+// TestStaleRejectionDecidesFromTheBytesWhereverTheRecordSits is the relaxation,
+// and the limit of it.
 //
-// Cells 34, 51, 64 and 91 carry about 170 stacked rejections over tips near
-// generation 300, and every rejection in a cascade after the first spends the
-// PREVIOUS rejected transaction's output — so every one of them would pass the
-// "it spent something else" test and resume. Adjacency is the whole of what
-// distinguishes one refused transition from a pile of wreckage, so it is checked
-// here as well as in derivation: neither may be safe only by virtue of the other
-// being careful.
-func TestStaleRejectionRefusesANonAdjacentRejection(t *testing.T) {
+// The generation a rejection was recorded at used to have to be tip+1. That
+// stalled the repair: retracting a row moves the next rejection up to tip+2, so
+// cell 12 of the live deployment — tip 991, failures at 993 and 994 after 992 was
+// retracted — was examined at the empty generation 992 by every pass after the
+// first and reported as needing nothing.
+//
+// The verdict comes from the transaction. A record above tip+1 was built on the
+// output of the record below it, which has never existed, so it cannot spend the
+// tip and this resume applies to it almost by construction — but "almost by
+// construction" is an inference about a transaction nobody has read, so the bytes
+// are still fetched, still checked against the txid the record holds, and still
+// the only thing that resumes anything.
+func TestStaleRejectionDecidesFromTheBytesWhereverTheRecordSits(t *testing.T) {
 	compiled, l, tip, row2, phantomOut := aRepairedTip(t)
 
-	// A transaction that WOULD resume if it were offered at tip+1.
+	// Built on the phantom, offered well above the tip: the shape a pass that has
+	// already retracted the row below leaves behind.
 	doomed := stepTx(t, compiled, 0, row2, tip.Satoshis, phantomOut)
 	txid := doomed.TxID().String()
 	l.raw[txid] = doomed.Bytes()
 
-	for _, gen := range []uint64{tip.Generation, tip.Generation + 2, tip.Generation + 170} {
+	for _, gen := range []uint64{tip.Generation + 2, tip.Generation + 170} {
+		rec, err := RecoverStaleRejection(context.Background(), l, tip, gen, txid, aRefusal)
+		if err != nil {
+			t.Fatalf("RecoverStaleRejection: %v", err)
+		}
+		if rec.Verdict != VerdictResume {
+			t.Fatalf("verdict = %s for a rejection at generation %d over a tip at %d that spends a "+
+				"phantom, want resume: %s", rec.Verdict, gen, tip.Generation, rec.Reason)
+		}
+		if rec.Tip != tip {
+			t.Errorf("resume moved the tip to %+v; nothing here justifies moving it from %+v", rec.Tip, tip)
+		}
+		// The cell re-creates the generation above its TIP, not the generation the
+		// retracted row happened to sit at.
+		if !strings.Contains(rec.Reason, fmt.Sprintf("re-creates generation %d", tip.Generation+1)) {
+			t.Errorf("the reason should say the cell re-creates generation %d, got: %s",
+				tip.Generation+1, rec.Reason)
+		}
+	}
+
+	// The check is still the check. A transaction that DOES spend the tip halts at
+	// tip+2 exactly as it halts at tip+1: the resume is reached by reading inputs,
+	// never by concluding "it is not adjacent, so it must have been built on a
+	// phantom".
+	refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
+	l.raw[refused.TxID().String()] = refused.Bytes()
+	rec, err := RecoverStaleRejection(context.Background(), l, tip, tip.Generation+2,
+		refused.TxID().String(), aRefusal)
+	if err != nil {
+		t.Fatalf("RecoverStaleRejection: %v", err)
+	}
+	if rec.Verdict != VerdictHalt {
+		t.Fatalf("verdict = %s for a non-adjacent rejection that spends the tip, want halt: %s",
+			rec.Verdict, rec.Reason)
+	}
+	if !strings.Contains(rec.Reason, "spends this cell's tip") {
+		t.Errorf("the reason should say it spent the tip, got: %s", rec.Reason)
+	}
+
+	// A record at or below the tip is a different thing from a record further up,
+	// and it is still refused: the tip is a transaction the network ACCEPTED at
+	// that generation, so a rejection there is the record contradicting itself.
+	for _, gen := range []uint64{0, tip.Generation} {
 		rec, err := RecoverStaleRejection(context.Background(), l, tip, gen, txid, aRefusal)
 		if err != nil {
 			t.Fatalf("RecoverStaleRejection: %v", err)
@@ -902,8 +950,8 @@ func TestStaleRejectionRefusesANonAdjacentRejection(t *testing.T) {
 			t.Fatalf("verdict = %s for a rejection at generation %d over a tip at %d, want halt: %s",
 				rec.Verdict, gen, tip.Generation, rec.Reason)
 		}
-		if !strings.Contains(rec.Reason, "cascade") {
-			t.Errorf("the reason should say why non-adjacency matters, got: %s", rec.Reason)
+		if !strings.Contains(rec.Reason, "superseded") {
+			t.Errorf("the reason should say the tip superseded it, got: %s", rec.Reason)
 		}
 	}
 }
@@ -996,8 +1044,11 @@ func TestNotBroadcastResumesOnBothFactsAndNothingLess(t *testing.T) {
 		}
 	})
 
-	t.Run("a failure above the tip's own successor is a cascade", func(t *testing.T) {
-		for _, at := range []uint64{tip.Generation, gen + 1, gen + 170} {
+	t.Run("a failure at or below the tip contradicts the record", func(t *testing.T) {
+		// The tip is a transaction the network ACCEPTED at that generation, so a
+		// `failed` row there is the record disagreeing with itself, and there is no
+		// transition below the tip left to rebuild.
+		for _, at := range []uint64{0, tip.Generation} {
 			rec, err := RecoverNotBroadcast(tip, at, "", aLocalFailure)
 			if err != nil {
 				t.Fatalf("RecoverNotBroadcast: %v", err)
@@ -1006,8 +1057,40 @@ func TestNotBroadcastResumesOnBothFactsAndNothingLess(t *testing.T) {
 				t.Fatalf("verdict = %s for a failure at generation %d over a tip at %d, want halt: %s",
 					rec.Verdict, at, tip.Generation, rec.Reason)
 			}
-			if !strings.Contains(rec.Reason, "cascade") {
-				t.Errorf("the reason should say why non-adjacency matters, got: %s", rec.Reason)
+			if !strings.Contains(rec.Reason, "superseded") {
+				t.Errorf("the reason should say the tip superseded it, got: %s", rec.Reason)
+			}
+		}
+	})
+
+	t.Run("a failure further above the tip resumes just the same", func(t *testing.T) {
+		// This used to be refused as a cascade, and refusing it is what stalled the
+		// repair: retracting one such row moves the next to tip+2, so a cell with
+		// two of them was cleared by one pass and abandoned by every pass after it.
+		//
+		// Nothing about the evidence changes with the generation. The sentinel is
+		// wrapped in immediately before SignAction and the row names no
+		// transaction, which are statements about our own code path at the moment
+		// that row was written: nothing was signed, so there is nothing to double
+		// spend, wherever the row sits. A cascade is refused by the CALLER counting
+		// the pile above the tip; see engine.maxWreckage.
+		for _, at := range []uint64{gen + 1, gen + 170} {
+			rec, err := RecoverNotBroadcast(tip, at, "", aLocalFailure)
+			if err != nil {
+				t.Fatalf("RecoverNotBroadcast: %v", err)
+			}
+			if rec.Verdict != VerdictResume {
+				t.Fatalf("verdict = %s for a never-broadcast failure at generation %d over a tip at %d, "+
+					"want resume: %s", rec.Verdict, at, tip.Generation, rec.Reason)
+			}
+			if rec.Tip != tip {
+				t.Errorf("resume moved the tip to %+v; the cell rebuilds from %+v", rec.Tip, tip)
+			}
+			// What it says it will rebuild is the generation above the TIP, not the
+			// generation the retracted row happened to sit at.
+			if !strings.Contains(rec.Reason, fmt.Sprintf("re-creates generation %d", tip.Generation+1)) {
+				t.Errorf("the reason should say the cell re-creates generation %d, got: %s",
+					tip.Generation+1, rec.Reason)
 			}
 		}
 	})
@@ -1149,10 +1232,13 @@ func TestRetryRefusalHaltsOnEveryOtherShape(t *testing.T) {
 	})
 
 	t.Run("the refusal is not adjacent to the tip", func(t *testing.T) {
-		// Cells 34, 51, 64 and 91 carry about 170 stacked refusals each. Every one
-		// of them is a transaction that spends the previous refused one, not the
-		// tip — but the adjacency test is checked here as well as in derivation,
-		// because neither may be safe only by virtue of the other being careful.
+		// This is the one decision that stays bound to tip+1, and the reason is
+		// specific to it rather than a cascade guard: a retry rebuilds the
+		// transition ABOVE the tip, so it is justified only by the refusal of a
+		// transaction that SPENT the tip — and a record anywhere else was built on
+		// an output this cell no longer has. The transaction offered here really
+		// does spend the tip, so nothing but the generation distinguishes the halts
+		// below from the resume this function exists for.
 		compiled, l, tip, row2, _ := aRepairedTip(t)
 		refused := stepTx(t, compiled, 0, row2, tip.Satoshis, outpointOf(tip))
 		txid := refused.TxID().String()
@@ -1167,8 +1253,14 @@ func TestRetryRefusalHaltsOnEveryOtherShape(t *testing.T) {
 				t.Fatalf("verdict = %s for a refusal at generation %d over a tip at %d, want halt: %s",
 					rec.Verdict, at, tip.Generation, rec.Reason)
 			}
-			if !strings.Contains(rec.Reason, "cascade") {
-				t.Errorf("the reason should say why non-adjacency matters, got: %s", rec.Reason)
+			// And it says why THIS check is here, now that the other two decisions
+			// have dropped theirs: an operator pointing -retry-refused at such a cell
+			// must be sent to the repair that does have evidence, not told about a
+			// cascade this is no longer the place to detect.
+			for _, want := range []string{"spent the tip", "needs no retry flag"} {
+				if !strings.Contains(rec.Reason, want) {
+					t.Errorf("the reason should say %q, got: %s", want, rec.Reason)
+				}
 			}
 		}
 	})

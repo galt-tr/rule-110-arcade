@@ -172,24 +172,87 @@ func cmdRecover(args []string) error {
 	}
 	if len(decisions) == 0 {
 		fmt.Println("no cell has an unresolved transition, a tip spent out from under it, or a " +
-			"failure directly above its tip; nothing to recover")
-		return nil
+			"failure recovery can decide about; nothing to recover")
+	} else {
+		if !*apply {
+			fmt.Println("DRY RUN — nothing has been written. Re-run with -apply to act on this.")
+		}
+		if *retryRefused {
+			fmt.Println("-retry-refused is ON: cells refused for an unexplained reason will rebuild that " +
+				"generation. That is safe (a refused transaction spends nothing) but it is not a diagnosis.")
+		}
+		fmt.Println()
+		for _, dec := range decisions {
+			fmt.Println(engine.FormatRecovery(dec))
+		}
+		fmt.Println()
+		fmt.Printf("%d cell(s) examined\n", len(decisions))
 	}
 
-	if !*apply {
-		fmt.Println("DRY RUN — nothing has been written. Re-run with -apply to act on this.")
+	// What the deployment is actually left in. On -apply this is DERIVED AGAIN
+	// from the store rather than taken from what Recover returned, because the two
+	// are not the same claim: Recover reports the decision it made, and a decision
+	// can be right about a transaction and still change nothing — a resume marks
+	// the cell released in memory whether or not the row it retracted was there to
+	// retract. Re-reading is the only way to answer "can this cell advance now",
+	// and it is the question an operator was reaching for when they ran this.
+	//
+	// Not re-derived on a dry run: nothing was written, so the answer is the
+	// position already in hand.
+	after := positions
+	if *apply {
+		after, err = engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store)
+		if err != nil {
+			return err
+		}
 	}
-	if *retryRefused {
-		fmt.Println("-retry-refused is ON: cells refused for an unexplained reason will rebuild that " +
-			"generation. That is safe (a refused transaction spends nothing) but it is not a diagnosis.")
-	}
-	fmt.Println()
-	for _, dec := range decisions {
-		fmt.Println(engine.FormatRecovery(dec))
-	}
-	fmt.Println()
-	fmt.Printf("%d cell(s) examined\n", len(decisions))
+	reportHalted(after, decisions, *apply)
 	return nil
+}
+
+// reportHalted says which cells still cannot advance, and which of those recovery
+// had nothing to say about.
+//
+// It exists because silence was misread as success. `rule110 recover -apply`
+// printed "nothing to recover" pass after pass — and, in other passes, a page of
+// resumes — while 23 cells stayed dead, so a repair that had converged on a no-op
+// read as a healthy deployment. A decision is not an outcome. What an operator
+// needs is the state afterwards, with the reason derivation halted each cell for,
+// which now names the record recovery looked at and, for a cascade, how deep the
+// pile above the tip is.
+func reportHalted(after []engine.CellPosition, decisions []engine.CellRecovery, applied bool) {
+	examined := make(map[int]bool, len(decisions))
+	for _, d := range decisions {
+		examined[d.Cell] = true
+	}
+	var stuck []int
+	for cell, p := range after {
+		if p.Halted {
+			stuck = append(stuck, cell)
+		}
+	}
+	if len(stuck) == 0 {
+		if applied {
+			fmt.Println("\nno cell is halted; every one of them can advance")
+		}
+		return
+	}
+
+	when := "would still be halted after this"
+	if applied {
+		when = "are STILL halted"
+	}
+	fmt.Printf("\n%d cell(s) %s; a human decides about these:\n", len(stuck), when)
+	for _, cell := range stuck {
+		// Whether recovery looked at the cell is the difference between "nothing
+		// here is recoverable" and "something was tried and did not release it",
+		// and an operator reading a stalled repair needs to tell them apart.
+		seen := "not examined"
+		if examined[cell] {
+			seen = "examined, not released"
+		}
+		fmt.Printf("cell %3d  halted (%s)  %s\n", cell, seen, after[cell].HaltReason)
+	}
 }
 
 // cmdImportTips backfills the history store from the per-cell tips a previous

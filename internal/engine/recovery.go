@@ -55,22 +55,22 @@ type RecoverOptions struct {
 // been broadcast without being recorded, and the wallet's own actions say what.
 // chain.RecoverCell decides those.
 //
-// A cell whose failure at tip+1 carries the "nothing was signed" sentinel and
+// A cell whose halting failure carries the "nothing was signed" sentinel and
 // names no transaction never reached the network at all — a local error, most of
 // them a saturated database inside CreateAction. chain.RecoverNotBroadcast
 // decides those, on the two facts in the record itself.
 //
-// A cell halted by a UTXO_SPENT rejection directly above its tip is the case
-// where not even the write-ahead record survived, so there is nothing in our
-// database to reason from at all — but arcade's refusal NAMES the transaction
-// that spent the tip, and that name is enough to verify one specific candidate
-// from its own bytes. chain.RecoverSpentTip decides those.
+// A cell halted by a UTXO_SPENT rejection is the case where not even the
+// write-ahead record survived, so there is nothing in our database to reason from
+// at all — but arcade's refusal NAMES the transaction that spent the tip, and
+// that name is enough to verify one specific candidate from its own bytes.
+// chain.RecoverSpentTip decides those.
 //
-// A cell halted by ANY rejection directly above its tip may be held down by a
-// verdict about a parent it no longer has: the rejected transaction was built on
-// an output that never existed, so its refusal was never about this tip. Reading
-// the rejected transaction's own bytes settles it. chain.RecoverStaleRejection
-// decides those, and only ever on positive proof that it spent something else.
+// A cell halted by ANY rejection may be held down by a verdict about a parent it
+// no longer has: the rejected transaction was built on an output that never
+// existed, so its refusal was never about this tip. Reading the rejected
+// transaction's own bytes settles it. chain.RecoverStaleRejection decides those,
+// and only ever on positive proof that it spent something else.
 //
 // A cell halted by a refusal of a transaction that really did spend its tip, for
 // a reason nobody has explained, may rebuild that generation — because a refused
@@ -78,11 +78,19 @@ type RecoverOptions struct {
 // opt-in and does the least: it proves the retry SAFE, not warranted. See
 // chain.RetryRefusal and RecoverOptions.RetryRefused.
 //
-// A rejection further up than the tip's own successor is still never recovered,
-// exactly as before: that is a cascade, its newest message describes wreckage
-// rather than the break, and a human decides. Derivation is where that line is
-// drawn — CellPosition.Rejected is set only for a rejection at tip+1 — so it
-// holds for every rejection path at once. See noteRejection.
+// # Which row each of them is about
+//
+// The record derivation halted on, wherever it sits — p.RejectedAt, p.RejectionErr
+// and p.RejectionTxID are all read off that one row. It is usually tip+1 and used
+// to be assumed to be, which is what stalled the repair: a pass that retracts a
+// row leaves the next failure two or more generations above the tip, and every
+// later pass then examined a generation nothing was recorded at.
+//
+// A CASCADE is still never recovered. That line is drawn once, in derivation, on
+// how many rejections are stacked above the tip rather than on where the newest
+// of them sits — see maxWreckage and noteRejection — so it holds for every
+// rejection path here at once, and it holds after a repair has retracted the
+// bottom row of the pile, which an adjacency test did not.
 //
 // The caller must hold the writer lease. Recovery reads the wallet's actions and
 // writes tips; another writer doing the same thing concurrently would have both
@@ -125,12 +133,18 @@ func Recover(ctx context.Context, l chain.Ledger, oracle chain.TxStatus, compile
 // isSpentTip selects the cells whose halt might be a lost transition rather
 // than a dead chain.
 //
-// A cell qualifies on the SHAPE of its halt alone — a rejection one generation
-// above the tip whose reason is arcade's already-spent verdict. Nothing about
-// the candidate is judged here; chain.RecoverSpentTip does all of that, so a
-// cell that qualifies and then fails verification is REPORTED as a halt with a
-// reason rather than quietly dropped. An operator who came to look at one
-// specific cell must find it in the output either way.
+// A cell qualifies on the SHAPE of its halt alone — a rejection above the tip
+// whose reason is arcade's already-spent verdict. Nothing about the candidate is
+// judged here; chain.RecoverSpentTip does all of that, so a cell that qualifies
+// and then fails verification is REPORTED as a halt with a reason rather than
+// quietly dropped. An operator who came to look at one specific cell must find it
+// in the output either way.
+//
+// Note that this repair is the one that does not care where the record sits.
+// What it adopts is a transaction that spends THIS tip and carries the covenant
+// for the row above it, so it is about generation tip+1 whichever row carried the
+// message — and if it adopts, the next pass sees the remaining rejection one
+// generation closer and decides about that.
 func isSpentTip(p CellPosition) bool {
 	return p.Rejected && chain.IsUTXOSpent(p.RejectionErr)
 }
@@ -148,8 +162,9 @@ func isNeverBroadcast(p CellPosition) bool {
 	return p.Rejected && chain.IsNotBroadcast(p.RejectionErr)
 }
 
-// recoverRejected decides one cell whose halt is a failure sitting directly
-// above its tip.
+// recoverRejected decides one cell whose halt is a failure sitting above its
+// tip — the oldest such failure, which derivation identified and this does not
+// go looking for again.
 //
 // Four repairs can apply to the same row and they are not interchangeable, so
 // the order is argued rather than convenient.
@@ -196,8 +211,8 @@ func isNeverBroadcast(p CellPosition) bool {
 // even though the live deployment's cell 2 needs both. The rejection that would
 // matter then is the one above the NEW tip, and that is not the row derivation
 // looked at: deciding about it here would mean deciding from a tip this pass has
-// not written yet, against a row nothing has verified, with the adjacency test
-// applied to a generation number rather than to what the store holds.
+// not written yet, against a row nothing has verified, with the size of the pile
+// above it counted from a window that no longer describes the cell.
 //
 // So recovery CONVERGES instead. The next derivation reads the corrected tip out
 // of the store and offers the next row up, once, with the same evidence and the
@@ -219,12 +234,19 @@ func recoverRejected(ctx context.Context, l chain.Ledger, oracle chain.TxStatus,
 	opts RecoverOptions,
 ) (chain.Recovery, error) {
 
-	// Every one of these is about the row at tip+1, by construction: derivation
-	// flags a failure only when it sits directly above the tip (see
-	// noteRejection), and each of the chain-side decisions refuses to decide
-	// anything else — which is what keeps all of this away from the cascaded
-	// cells.
-	gen := p.Tip.Generation + 1
+	// Every one of these is about the record derivation halted on, which is where
+	// its generation, its txid and its message all come from together. Computing
+	// tip+1 here instead is the bug this replaced: a pass that retracts a row
+	// leaves the next failure two or more generations up, and cell 12 — tip 991,
+	// failures at 993 and 994, nothing at 992 — then had every subsequent pass
+	// examine an empty generation, decide there was nothing to do, and report
+	// success while the cell stayed dead.
+	//
+	// What keeps this away from cells 34, 51, 64 and 91 is no longer this
+	// arithmetic but the SIZE of the pile above their tips, counted in derivation:
+	// p.Rejected is not set at all for a cascade, so those cells never reach here.
+	// See engine.maxWreckage.
+	gen := p.RejectedAt
 
 	if isNeverBroadcast(p) {
 		// Final either way; see above.
@@ -343,6 +365,12 @@ func applyRecovery(ctx context.Context, store *history.Store, cell int,
 		// mirrors Recover's own switch exactly — an unresolved attempt outranks a
 		// rejection — so the row that is retracted is always the one the decision
 		// was made about.
+		//
+		// Every generation below is one derivation READ OFF A ROW, never one
+		// computed from the tip. A retraction is how a cell is released, so a
+		// delete aimed at a generation nothing was verified at is either a no-op
+		// that leaves the cell dead (which is what tip+1 became for cell 12) or, if
+		// something were recorded there later, a row nobody decided about.
 		switch {
 		case p.Unknown:
 			// Nothing was ever signed, so the write-ahead record is a false alarm.
@@ -356,7 +384,7 @@ func applyRecovery(ctx context.Context, store *history.Store, cell int,
 			// with no transaction to read. So this branch cannot retract a row some
 			// other repair reasoned about, and the store refuses to widen it: the
 			// delete matches on `failed` AND on the txid being empty.
-			if err := store.DeleteUnsignedRejection(ctx, p.Tip.Generation+1, cell); err != nil {
+			if err := store.DeleteUnsignedRejection(ctx, p.RejectedAt, cell); err != nil {
 				return p, err
 			}
 		case p.Rejected:
@@ -364,9 +392,9 @@ func applyRecovery(ctx context.Context, store *history.Store, cell int,
 			// longer has, so its refusal was a verdict about that parent — or it was
 			// refused for a reason nobody has explained, and a refused transaction
 			// spends nothing. Both leave the tip where it is and both need the row
-			// gone, keyed on the exact transaction that was examined. tip+1 is where
-			// derivation found it; see noteRejection.
-			if err := store.DeleteRejection(ctx, p.Tip.Generation+1, cell, p.RejectionTxID); err != nil {
+			// gone, keyed on the exact transaction that was examined AND at the
+			// generation derivation found it at; see noteRejection.
+			if err := store.DeleteRejection(ctx, p.RejectedAt, cell, p.RejectionTxID); err != nil {
 				return p, err
 			}
 		}
