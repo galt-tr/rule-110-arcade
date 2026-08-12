@@ -164,8 +164,14 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "how many cells advance at once")
 	fs.BoolVar(&cfg.Chronicle, "chronicle", cfg.Chronicle,
 		"verify with Chronicle-era script rules (required for Rúnar covenants)")
+	// The old help text said the 100 sat/kB floor is applied to the
+	// extended-format size. Config.FeeSatPerKB retracts that in as many words —
+	// the validator treats the inline prevouts as spent-coin data and does not
+	// bill them. The margin is headroom for a fee committed from a size estimate
+	// made before the ~2.6 kB unlocking scripts exist, which is a different
+	// hazard, and the help text should not keep asserting the withdrawn one.
 	fs.Int64Var(&cfg.FeeSatPerKB, "fee-sat-per-kb", cfg.FeeSatPerKB,
-		"fee rate; must exceed arcade's 100 sat/kB floor, which it applies to the extended-format size")
+		"fee rate, above arcade's 100 sat/kB floor; the margin is headroom for the pre-signing size estimate")
 	fs.BoolVar(&cfg.Throughput, "throughput", cfg.Throughput,
 		"fund from a denominated fuel pool instead of contending for change")
 	fs.Uint64Var(&cfg.FuelDenomination, "fuel-sats", cfg.FuelDenomination,
