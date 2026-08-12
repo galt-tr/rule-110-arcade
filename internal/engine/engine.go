@@ -82,12 +82,25 @@ type Snapshot struct {
 	// Reserve is what remains to mint more spendable coin from, and PoolCoins
 	// how many claimable coins back the balance. PoolCoins is the one that
 	// predicts starvation: one coin funds one transition.
-	Balance     uint64 `json:"balance"`
-	Reserve     uint64 `json:"reserve"`
-	PoolCoins   int    `json:"poolCoins"`
-	TotalTx     int    `json:"totalTx"`
-	FailedCells int    `json:"failedCells"`
-	Consensus   bool   `json:"consensus"`
+	Balance   uint64 `json:"balance"`
+	Reserve   uint64 `json:"reserve"`
+	PoolCoins int    `json:"poolCoins"`
+	TotalTx   int    `json:"totalTx"`
+
+	// ProvedCells and FailedCells describe the NEWEST generation only: how many
+	// of its cells have a transition the network has accepted, and how many were
+	// rejected. The remainder are still in flight.
+	//
+	// Neither says the cells AGREE. Nothing in Script compares one cell's row to
+	// another's — each cell verifies only its own bit of the next row, which
+	// cellscript.TestOtherCellsBitsAreNotChecked asserts deliberately — so
+	// cross-cell agreement is an auditable invariant, not a proved one. This
+	// used to be a single Consensus bool set to `failed == 0` and rendered as
+	// "128/128 agree", which named the one property the covenant does not
+	// establish.
+	ProvedCells int `json:"provedCells"`
+	FailedCells int `json:"failedCells"`
+
 	ArcadeURL   string `json:"arcadeUrl"`
 	GenesisTxID string `json:"genesisTxid"`
 	LastError   string `json:"lastError,omitempty"`
@@ -389,11 +402,17 @@ func (e *Engine) Snapshot() Snapshot {
 		history[i] = g
 	}
 
-	failed := 0
+	// Count the newest row only. "Proved" means a node accepted the transition,
+	// which is where script validation happens; TxBroadcast is arcade's receipt,
+	// not the network's verdict, so it does not count yet.
+	failed, proved := 0, 0
 	if n := len(history); n > 0 {
 		for _, c := range history[n-1].Cells {
-			if c.State == TxFailed {
+			switch c.State {
+			case TxFailed:
 				failed++
+			case TxSeen, TxMined:
+				proved++
 			}
 		}
 	}
@@ -410,8 +429,8 @@ func (e *Engine) Snapshot() Snapshot {
 		Reserve:     e.funds.Reserve,
 		PoolCoins:   e.funds.PoolCoins,
 		TotalTx:     e.totalTx,
+		ProvedCells: proved,
 		FailedCells: failed,
-		Consensus:   failed == 0,
 		ArcadeURL:   e.chain.Config.ArcadeURL,
 		GenesisTxID: e.state.GenesisTxID,
 		LastError:   e.lastError,

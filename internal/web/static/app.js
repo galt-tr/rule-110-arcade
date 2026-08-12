@@ -113,7 +113,12 @@ function renderStats(s) {
     // misleading number — see chain.Funds.
     ['spendable', sat + ' sat'],
     ['fuel', s.poolCoins.toLocaleString() + ' coins'],
-    ['chains', s.consensus ? `${s.cells}/${s.cells} agree` : `${s.failedCells} unproved`],
+    // "proved", never "agree". Each cell's script checks only its own bit of
+    // the next row, so this counts transitions the network accepted in the
+    // newest generation — it says nothing about the cells agreeing with each
+    // other, which no script enforces. See Snapshot.ProvedCells.
+    ['latest row', `${s.provedCells}/${s.cells} proved` +
+      (s.failedCells ? ` · ${s.failedCells} failed` : '')],
   ];
   document.getElementById('stats').innerHTML = rows
     .map(([k, v]) => `<span class="stat"><span>${k}</span> <b>${v}</b></span>`)
