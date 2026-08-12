@@ -45,8 +45,10 @@ type Automaton interface {
 	SnapshotTail() engine.Snapshot
 	// Stats is the scalars with no history, for metrics and readiness.
 	Stats() engine.Snapshot
-	// PublishedTail is the tail already marshalled, shared by every subscriber.
-	PublishedTail() ([]byte, bool)
+	// PublishedTail is the tail already marshalled, shared by every subscriber. The
+	// pointer is the identity of a publish: unchanged means the subscriber has
+	// already sent this exact frame.
+	PublishedTail() (*[]byte, bool)
 	// Changed is closed the next time the snapshot changes.
 	Changed() <-chan struct{}
 
@@ -126,15 +128,33 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// process, on the publisher's goroutine, rather than once per client here.
 	// The client merges the tail into the full history it fetched from
 	// /api/state.
+	//
+	// `sent` is what stops this sending the SAME tail over and over. The engine
+	// coalesces the CONTENT of a publish — PublishTails throttles rebuilding to
+	// PublishInterval — but it does not coalesce the notifications, and
+	// notify() fires on every recorded cell, every status batch and every clock
+	// tick. So between two publishes this loop wakes many times per second and,
+	// without the check below, wrote a byte-identical frame every time. At 256
+	// cells that frame is hundreds of kilobytes and the duplicates were the
+	// dominant cost of a connected browser.
+	//
+	// The comparison is on the slice header, not the bytes: PublishTail stores a
+	// new pointer for each rebuild and never mutates a published slice, so
+	// pointer identity is exactly "this is the tail I already sent".
+	var sent *[]byte
 	send := func() error {
 		data, ok := s.engine.PublishedTail()
 		if !ok {
 			return nil // nothing published yet; the next change will bring one
 		}
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		if data == sent {
+			return nil
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", *data); err != nil {
 			return err
 		}
 		flusher.Flush()
+		sent = data
 		return nil
 	}
 
@@ -178,6 +198,15 @@ type controlRequest struct {
 }
 
 func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
+	// Refuse before reading the body, before touching the engine, and for every
+	// action alike. This endpoint has no authentication, so on a public
+	// deployment it is one HTTP request from anyone; hiding the buttons in the
+	// browser is presentation, not a lock. The engine's own setters refuse too —
+	// see engine.Options.LockControls — and neither layer relies on the other.
+	if s.engine.Stats().Locked {
+		http.Error(w, "the clock is fixed for this deployment", http.StatusForbidden)
+		return
+	}
 	var req controlRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)

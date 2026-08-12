@@ -529,7 +529,16 @@ func cmdRun(args []string) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	eng, err := engine.New(ctx, c, compiled, d, store, engine.Options{AutoRecover: *autoRecover}, logger)
+	// The clock's starting state is configuration, not a command: -lock-controls
+	// turns SetRate and SetMode into no-ops, so setting the rate by calling the
+	// mutator the lock disables would leave a locked deployment stuck at the
+	// default, paused, with no way to start it.
+	eng, err := engine.New(ctx, c, compiled, d, store, engine.Options{
+		AutoRecover:  *autoRecover,
+		LockControls: cfg.LockControls,
+		Rate:         *rate,
+		Start:        *start,
+	}, logger)
 	if err != nil {
 		return err
 	}
@@ -537,10 +546,6 @@ func cmdRun(args []string) error {
 	if st, err := store.Stats(ctx); err == nil {
 		fmt.Printf("history: %d generations, %d transactions recorded (%d still settling)\n",
 			st.Generations, st.Txs, st.Unsettled)
-	}
-	eng.SetRate(*rate)
-	if *start {
-		eng.SetMode(engine.ModeRunning)
 	}
 	// Wait for the engine to drain on the way out. Run returns once every cell
 	// worker has stopped at its loop top and the tips have been checkpointed;

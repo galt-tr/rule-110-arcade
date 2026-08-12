@@ -101,12 +101,12 @@ func TestPublishTailIsMarshalledOnce(t *testing.T) {
 		t.Fatal("nothing published after PublishTail")
 	}
 	second, _ := e.PublishedTail()
-	if &first[0] != &second[0] {
+	if first != second {
 		t.Error("each reader got its own copy; the marshal is supposed to be shared")
 	}
 
 	var snap Snapshot
-	if err := json.Unmarshal(first, &snap); err != nil {
+	if err := json.Unmarshal(*first, &snap); err != nil {
 		t.Fatalf("published bytes are not a snapshot: %v", err)
 	}
 	if len(snap.History) != 4 {
@@ -147,7 +147,7 @@ func TestPublishTailsPublishesIsolatedChangesImmediately(t *testing.T) {
 			return false
 		}
 		var snap Snapshot
-		if json.Unmarshal(data, &snap) != nil || len(snap.History) == 0 {
+		if json.Unmarshal(*data, &snap) != nil || len(snap.History) == 0 {
 			return false
 		}
 		return snap.History[0].Cells[2].TxID == "isolated"
@@ -180,14 +180,14 @@ func TestPublishTailsCoalescesBursts(t *testing.T) {
 	watcherDone := make(chan struct{})
 	go func() {
 		defer close(watcherDone)
-		var prev []byte
+		var prev *[]byte
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			if data, ok := e.PublishedTail(); ok && (prev == nil || &data[0] != &prev[0]) {
+			if data, ok := e.PublishedTail(); ok && data != prev {
 				publishes.Add(1)
 				prev = data
 			}
