@@ -1,0 +1,220 @@
+# Rule 110 on BSV — state of the project
+
+Last updated 2026-08-12, at `v2.0` plus two commits.
+
+## What this is
+
+A Rule 110 cellular automaton whose every cell is proved on chain. The ring is
+128 independent UTXO chains; a cell's transition at generation N spends its own
+output from N-1, and a covenant script enforces that the cell's new bit is the
+correct Rule 110 output of the neighbourhood it claims to have read.
+
+**The caveat is the interesting part, and it is load-bearing: each cell's script
+verifies only its OWN bit.** Nothing in Script compares cell 5's asserted
+neighbourhood against what cells 4 and 6 actually did — there is no opcode that
+can look at another cell's output, which is exactly what lets a generation fan
+out across 128 chains instead of serialising. Cross-cell agreement is therefore
+an *auditable* property, not a proved one. `rule110 audit` is what audits it.
+
+## Current deployment
+
+Reset from a fresh genesis on 2026-08-12, after the test network's chain was
+reset out from under the previous run.
+
+| | |
+|---|---|
+| Genesis | `06072381e042aa657bd88313f47b6a02aa19dbff258f22ec46d5a857be766cc6` |
+| Ring | 128 cells, rule 110, seed `01000000…` (single 1 bit) |
+| Funding address | `mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U` |
+| Reserve | ~29.8 BSV |
+| Fuel pool | ~13k coins of 1000 sat, keeper maintaining 20k |
+| Halted cells | 0 |
+| Storage | PostgreSQL, container `rule110-db` on `:5434` |
+| UI | http://localhost:8110 (boots **paused**) |
+
+Both the wallet and the automaton's history live in that one PostgreSQL
+database. `./data` holds only `keys.json` and `state.json`. This matters more
+than it sounds — see *Traps* below.
+
+### Running it
+
+```bash
+export RULE110_POSTGRES_DSN="postgres://postgres:postgres@127.0.0.1:5434/rule110?sslmode=disable"
+export RULE110_ARCADE_URL="https://arcade-v2.dev-ovh-1.ubsv.dev"
+./rule110 run
+```
+
+Without those two variables the app silently uses SQLite and does not see this
+wallet at all. `scripts/reset.sh` writes `data/env` for exactly this reason.
+
+## What v2.0 fixed
+
+v1.0 destroyed its own cells under load. Every item below was measured on a live
+128-cell deployment, not reasoned about.
+
+**The ways it destroyed itself.** The write-ahead record now gates the
+broadcast: `persist` halted a cell when its row could not be stored, but halting
+stops the *next* turn, not the one already running, so a cell whose intent could
+not be recorded broadcast anyway — spending its tip with nothing durable saying
+it had tried. An exhausted connection pool halted 70 of 128 cells in three
+minutes and every one had broadcast regardless.
+
+A halted laggard no longer freezes the clock. `frontier` is the minimum over
+*non-halted* cells, so halting the slowest cell makes the frontier jump past the
+target, and `target - frontier` on `uint64` underflowed to ~2^64 — never less
+than `maxLag`, so the clock stopped raising the target for ever. Silent, because
+`Snapshot.Lag` saturates: the UI read a calm `lag 0` while the clock was dead.
+One refused cell could stop all 128.
+
+A local failure no longer halts a cell permanently — a database hiccup before
+signing costs a retry, not a cell. A rejected legacy tip is no longer treated as
+a migration floor, and that question now goes to the network rather than to our
+own mutable record. The history store's connection pool is bounded.
+
+**Recovery.** Five damage classes, dry run by default behind `-apply`:
+unresolved write-ahead attempts; a `UTXO_SPENT` rejection naming our own
+unrecorded accepted transition; a rejection built against a superseded parent; a
+failure that never reached the network; and an opt-in bounded retry of an
+unexplained refusal. Recovery examines the record derivation *actually halted
+on*, not the one at `tip+1` — which is what let repair converge instead of
+reporting success over dead cells. On the previous deployment: halted cells
+124 → 11.
+
+**The audit.** `rule110 audit` performs nine checks, including decoding the
+neighbourhood the covenant actually read out of the spent output's locking
+script and cross-checking it against the BIP-143 preimage. Against real history,
+generations 1000–1020: **2,174 cell transactions, 17,411 checks, 0 failures,
+cross-cell agreement 2,174/2,174.**
+
+**Throughput and operability.** BEEF accumulation removed (315 MB → 1.05 MB
+state; 1,194 kB → 8.1 kB per transaction), per-generation barrier removed, fuel
+pool ends coin contention (4 → 267 tx/s), single-writer lease, graceful funding
+starvation with unattended resume, bounded reconciler, wallet-DB pruner,
+Dockerfile, Kubernetes manifests, CI, README.
+
+## Measured, not assumed
+
+- **No mempool ancestor limit on this network.** 600 transactions, ≥250 deep,
+  zero rejections.
+- **`PROCESSING (4)` is intermittent, not deterministic.** A refused generation
+  was retracted, rebuilt and *accepted*, then ran 58 further generations before
+  hitting a fresh one. Roughly 2 refusals per 16,000 transactions. This is the
+  single most important finding for the open work: it means a halted cell is
+  almost always recoverable by simply trying again, and that a reset does not
+  help, because a fresh ring erodes at the same rate for the same reason.
+- **The fuel keeper bootstraps a cold pool by itself.** From one 30 BSV coin it
+  built 20,048 fuel coins with no manual step.
+
+## Open work
+
+### 1. Retry an intermittent refusal instead of halting for ever — *highest value*
+
+Today one refusal kills a cell until an operator runs `rule110 recover`. Since
+refusals are intermittent, that is monotonic erosion: the ring loses cells one
+at a time, and — before the clock fix — a single loss could stop the whole
+automaton.
+
+Treat a network refusal as retryable: retract the record and let the cell
+rebuild that generation, bounded, halting only after N consecutive refusals of
+the *same* generation. The safety argument is already proven — a refused
+transaction spends nothing, so the tip is unspent and rebuilding cannot double
+spend; and if the tip *has* been spent, arcade answers `UTXO_SPENT` and
+`RecoverSpentTip` adopts the real spender. This is the automatic form of what
+`recover -retry-refused` already does by hand.
+
+Guard against reintroducing the bug 9a cascade: the retry must rebuild from the
+cell's real derived tip, never from the rejected transaction's output.
+
+### 2. Pause coasts up to 32 generations
+
+Pressing pause at generation 20 left it running to 52 before settling — exactly
+`maxLag`, about 100 seconds, with `lag` draining 25 → 22 → 15 → 10 → 0.
+`SetMode` freezes `e.target` where the clock left it rather than pulling it
+back, so every already-commissioned generation still gets built.
+
+The current behaviour is deliberate (don't strand a half-finished generation)
+but that argument covers the *current* generation, not 32 of them. Fix: on
+pause, set `e.target = frontierLocked()`. Verify `TestPausedStillFinishesAStep`
+still passes rather than assuming it.
+
+### 3. `rule110 fuel` and `genesis` cannot bootstrap in throughput mode
+
+Both fail with `not enough funds` on a fresh wallet holding 30 BSV, after a
+4-minute retry, with an error that misleads on both counts it raises (the
+funding transaction *is* mined; the monitor is *not* the problem). In throughput
+mode the funder claims by exact denomination from the fuel pool, which is empty
+on a fresh wallet — so the command meant to create the pool cannot fund itself
+from it.
+
+Workaround, and how this deployment was bootstrapped: `-throughput=false`
+(`fuel` additionally needs an explicit `-sats 1000`). Note the keeper inside
+`rule110 run` does *not* have this problem, so the manual `fuel` step in the
+documented sequence may simply be unnecessary — worth deciding before changing
+the funder.
+
+### 4. Replay the cascade cells (previous deployment only)
+
+Four or five cells on the *old* deployment carried ~170 stacked rejections each
+over tips near generation 300, needing ~1,380 replayed transitions apiece to
+rejoin the ring. Recovery deliberately refuses them (`maxWreckage = 3`). Not
+applicable to the current fresh ring; keep the design note in case it recurs.
+
+### 5. Fuel keeper soak
+
+The keeper looked healthy on the previous deployment — the pool gained while
+running at 4 gen/s, where it had earlier drained toward starvation. That
+improvement was never soaked long enough to close honestly, and the earlier
+flapping was entangled with connection exhaustion and a saturated co-tenant
+database. Re-measure on this clean deployment before declaring it fixed.
+
+### 6. Append-only history log — deferred by choice
+
+Would replace `cell_txs` as the system of record, touching the engine, the store
+and the web layer. Deliberately not in v2.0: shipping a system-of-record rewrite
+with no soak time into a release whose whole point is stability is how records
+get lost.
+
+### 7. Unexplained rejection class
+
+`PROCESSING (4): failed to validate transaction` still has no root cause. Ruled
+out by direct comparison of a mined and a rejected transaction from the same
+cell: identical fee (410 sat), identical size class, identical unlocking-script
+push structure. Arcade's `extraInfo` is generic and our txids do not appear in
+teranode's propagation logs, so the node-side reason is unreachable from either
+end. Teranode logs show `tx meta maybe too big for txmeta cache` with parent
+hash counts up to 9,953 in the same window — plausible, unproven.
+
+## Traps
+
+Things that cost real time here, recorded so they cost less next time.
+
+**The wallet is in PostgreSQL, not `./data`.** `outputs`, `utxos`,
+`transactions`, `known_txs` and `output_baskets` sit alongside `cell_txs` and
+`generations`. Dropping the database container destroys the coin as surely as
+deleting the keys, and spending needs *both* halves — there is no chain rescan.
+`scripts/reset.sh` defaults to resetting the automaton only, and requires typing
+the satoshi balance to confirm `--wipe-wallet`.
+
+**`data/postgres.dsn` is not configuration.** Nothing reads it. The DSN comes
+from `-postgres-dsn` or `RULE110_POSTGRES_DSN` and defaults to SQLite. A
+bootstrap without it *appears* to work — `fund` reports the balance, `fuel`
+starts minting — and you discover the problem at 128-cell fan-out, after the
+coin is in the wrong store.
+
+**Arcade's `/tx/` returning `transaction not found` does not mean the
+transaction is absent from the chain.** Arcade only knows transactions it
+processed. Ask the node's `getrawtransaction` before concluding anything.
+
+**`UTXO_SPENT` naming a mined transaction absent from `cell_txs` is our own lost
+transition**, not a foreign double spend — that is the signature recovery keys
+on.
+
+**The engine boots paused.** Drive it with
+`POST /api/control {"action":"play"}` and `{"action":"rate","rate":N}`. The
+endpoints are `/api/state`, `/api/events`, `/api/control`, `/healthz`,
+`/readyz`, `/metrics` — there is no `/api/status`.
+
+## Verification
+
+`gofmt`, `go vet` and `go test ./... -race` are clean across all seven packages.
+Every fix listed above has a test verified to fail against the previous code.
