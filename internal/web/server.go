@@ -6,7 +6,9 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +34,60 @@ var staticRoot = func() fs.FS {
 	}
 	return sub
 }()
+
+// staticETags maps each embedded asset's URL path to a hash of its contents,
+// computed once at startup.
+//
+// Embedded files carry a zero modification time, so net/http omits
+// Last-Modified — and http.FileServer never sets an ETag. With no validator and
+// no Cache-Control, a browser is left to its own heuristics about when to ask
+// again, and can go on running app.js from an earlier build with nothing to
+// indicate it. That turns "is this deployed yet?" into guesswork during exactly
+// the kind of debugging where a wrong answer costs the most.
+var staticETags = func() map[string]string {
+	tags := map[string]string{}
+	err := fs.WalkDir(staticRoot, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		b, err := fs.ReadFile(staticRoot, p)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(b)
+		// Quoted, and strong: the bytes are fixed for the life of the binary.
+		tags["/"+p] = `"` + hex.EncodeToString(sum[:16]) + `"`
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	return tags
+}()
+
+// staticHandler serves the embedded assets with a validator.
+//
+// "no-cache" does not mean "do not store" — it means revalidate before reuse.
+// Paired with the ETag that makes a repeat visit a conditional request that
+// almost always answers 304 with no body, so the cost is one round trip rather
+// than the asset, and a deploy is picked up on the next load rather than
+// whenever the browser happens to lose interest.
+func staticHandler() http.Handler {
+	files := http.FileServer(http.FS(staticRoot))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/" {
+			p = "/index.html"
+		}
+		if tag, ok := staticETags[p]; ok {
+			w.Header().Set("ETag", tag)
+			w.Header().Set("Cache-Control", "no-cache")
+			// http.ServeContent reads the ETag already on the header and
+			// answers If-None-Match itself, so 304s need no code here.
+		}
+		files.ServeHTTP(w, r)
+	})
+}
 
 // Automaton is what the HTTP layer needs from the engine.
 //
@@ -114,7 +170,7 @@ func New(e Automaton, logger *slog.Logger, opts ...Option) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.Handle("GET /", http.FileServer(http.FS(staticRoot)))
+	mux.Handle("GET /", staticHandler())
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/control", s.handleControl)

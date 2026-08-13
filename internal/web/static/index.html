@@ -112,8 +112,16 @@
       <input id="jump" type="number" min="0" step="1" placeholder="generation">
       <button id="jumpBtn" type="button">go</button>
     </label>
+    <!-- Catch up to the newest generation and keep up with it. Following is off
+         by default, so this is how someone who scrolled back into history gets
+         home; it arms the checkbox beside it rather than drifting off the edge
+         a second later and needing pressing again. -->
+    <button id="toBottom" type="button">go to bottom and follow</button>
+    <!-- Unchecked by default: following means the view is pulled to the newest
+         row on every generation, which yanks the diagram out from under anyone
+         reading history. Opt in to it. -->
     <label class="follow">
-      <input id="follow" type="checkbox" checked>
+      <input id="follow" type="checkbox">
       <span>follow</span>
     </label>
     <label class="rate" id="rateLabel">

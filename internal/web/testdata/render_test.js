@@ -539,6 +539,7 @@ test('the bootstrap fuel phase also spins', () => {
 test('no spinner when nothing is being minted', () => {
   app.setFundTarget(FUND_TARGET);
   app.setAwaitingFuel(null);
+  app.setOpenAtLiveEdge(false);
   apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10 }));
   flushFrames();
   assert.strictEqual(byId('fundSpin').hidden, true, 'the spinner runs when nothing is happening');
@@ -699,6 +700,89 @@ test('a cell with no transaction opens nothing', () => {
   app.canvas.onclick(at(212));
 
   assert.strictEqual(opened, 0, 'a cell with no transaction opened a tab anyway');
+});
+
+// --- following, and getting back to the end ---------------------------------
+
+// Following being off must not change WHERE THE PAGE OPENS. Those were the same
+// thing by accident: with follow on, the initial view was pinned to the live
+// edge a moment after load. Turning the default off removed that and the page
+// opened at generation 0 of the whole run — caught in a browser, not here,
+// which is why it is pinned here now.
+test('the page opens at the live edge even though following is off', () => {
+  app.setExtent({ oldest: 0, newest: 5000, count: 5001, empty: false });
+  setArchive({ oldest: 0, newest: 5000 });
+  app.setFollow(false);
+  byId('follow').checked = false;
+
+  // As the page starts: the landing is owed, and nothing has been scrolled.
+  app.setOpenAtLiveEdge(true);
+  const wrap = byId('canvas-wrap');
+  wrap.scrollTop = 0;
+  wrap.scrollHeight = 5001 * 4;
+
+  apply(snapshot(tail(4993, 5000)));
+  flushFrames();
+
+  assert.ok(wrap.scrollTop > 0,
+    'the page opened at generation 0 of a 5,000-generation run');
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'the landing did not reach the newest generation');
+  assert.strictEqual(byId('follow').checked, false,
+    'landing at the live edge switched following on; it is a landing, not a leash');
+});
+
+test('the diagram is not dragged to the live edge unless following is on', () => {
+  atArchive(0, 1000, 400 * 4);   // parked in history, reading
+  app.setFollow(false);
+  byId('follow').checked = false;
+  const before = byId('canvas-wrap').scrollTop;
+
+  apply(snapshot(tail(1001, 1008)));   // the run advances underneath
+  flushFrames();
+
+  assert.strictEqual(byId('canvas-wrap').scrollTop, before,
+    'a new generation yanked the view away from the history being read');
+});
+
+test('go to bottom reaches the newest generation and starts following', () => {
+  atArchive(0, 1000, 400 * 4);
+  app.setFollow(false);
+  byId('follow').checked = false;
+
+  byId('toBottom').onclick();
+  flushFrames();
+
+  const wrap = byId('canvas-wrap');
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'go to bottom did not reach the newest generation');
+  assert.strictEqual(byId('follow').checked, true,
+    'the checkbox does not show that the view is now following');
+
+  // Arriving at the live edge only to drift off it would leave the button to be
+  // pressed again every generation.
+  apply(snapshot(tail(1001, 1008)));
+  flushFrames();
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'the view fell behind the live edge straight after being sent there');
+});
+
+test('following still chases the live edge when it is switched on', () => {
+  atArchive(0, 1000);            // opens at the live edge
+  byId('follow').checked = true;
+  app.setFollow(true);
+
+  // Nudge off the bottom, as a stray wheel event would, then let the run
+  // advance. The spacer's height is driven by reflow inside draw(), and
+  // atBottom() is read BEFORE that on purpose, so the stub must not pre-grow it.
+  const wrap = byId('canvas-wrap');
+  wrap.scrollTop = wrap.scrollHeight - wrap.clientHeight;
+
+  apply(snapshot(tail(1001, 1008)));
+  flushFrames();
+
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'following was on but the view did not keep up with the live edge');
 });
 
 // Async-aware: a click leads to a lookup, so the tests that follow it through

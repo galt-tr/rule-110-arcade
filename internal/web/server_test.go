@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -529,5 +531,96 @@ func TestEventsDoesNotResendAnUnchangedTail(t *testing.T) {
 	f.publish(`{"generation":2}`)
 	if got := nextFrame(t, frames, 5*time.Second, "the next publish was never sent"); got != `{"generation":2}` {
 		t.Errorf("frame after the second publish = %q, want it", got)
+	}
+}
+
+// A viewer must never be left running client code from an earlier deploy.
+//
+// Embedded files carry a zero modification time, so net/http omits
+// Last-Modified, and http.FileServer sets no ETag. With neither validator nor
+// Cache-Control a browser decides for itself when to ask again, and can serve a
+// previous build's app.js indefinitely with nothing to indicate it — which
+// turns "is this deployed yet?" into guesswork.
+func TestStaticAssetsCarryAValidator(t *testing.T) {
+	h := staticHandler()
+
+	get := func(path string, ifNoneMatch string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := get("/app.js", "")
+	if first.Code != http.StatusOK {
+		t.Fatalf("GET /app.js = %d, want 200", first.Code)
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag on app.js: a browser has nothing to revalidate against")
+	}
+	if got := first.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control = %q, want no-cache (revalidate before reuse)", got)
+	}
+
+	// The validator's payoff: a repeat visit costs a round trip, not the asset.
+	again := get("/app.js", etag)
+	if again.Code != http.StatusNotModified {
+		t.Fatalf("conditional GET = %d, want 304", again.Code)
+	}
+	if again.Body.Len() != 0 {
+		t.Fatalf("304 carried %d bytes of body", again.Body.Len())
+	}
+
+	// And the point of the whole change: a tag from a previous build is refused,
+	// so a deploy is picked up on the next load rather than whenever the browser
+	// happens to lose interest.
+	stale := get("/app.js", `"0000000000000000000000000000000000000000"`)
+	if stale.Code != http.StatusOK {
+		t.Fatalf("GET with a stale ETag = %d, want 200 with the new asset", stale.Code)
+	}
+	if stale.Body.Len() == 0 {
+		t.Fatal("a stale ETag got an empty body; the client would keep the old build")
+	}
+
+	// Distinct contents must not share a tag, or one asset's cache entry
+	// validates another's bytes.
+	if css := get("/style.css", "").Header().Get("ETag"); css == etag {
+		t.Fatalf("style.css and app.js share the ETag %s", css)
+	}
+
+	// "/" is index.html, and needs the validator just as much.
+	if root := get("/", "").Header().Get("ETag"); root == "" {
+		t.Fatal("the page itself carries no ETag")
+	}
+}
+
+// What a viewer actually gets, as opposed to what the renderer tests assume.
+//
+// Those drive a hand-written DOM whose checkbox stub defaults to checked, so
+// they cannot see the shipped default at all; only the file can say.
+func TestFollowShipsOffWithAWayBackToTheEnd(t *testing.T) {
+	b, err := fs.ReadFile(staticRoot, "index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	page := string(b)
+
+	tag := regexp.MustCompile(`<input[^>]*id="follow"[^>]*>`).FindString(page)
+	if tag == "" {
+		t.Fatal(`no <input id="follow"> in the page`)
+	}
+	if strings.Contains(tag, "checked") {
+		t.Errorf("follow ships checked (%s); the view would be dragged to the "+
+			"newest row while someone is reading history", tag)
+	}
+
+	// Following is off, so there has to be a deliberate way back to the end.
+	if !strings.Contains(page, `id="toBottom"`) {
+		t.Error("no go-to-bottom control: with follow off, someone who scrolls " +
+			"into history has no way back to the live edge but dragging")
 	}
 }
