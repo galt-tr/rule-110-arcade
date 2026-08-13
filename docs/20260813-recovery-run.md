@@ -88,12 +88,87 @@ observed live. The pool must carry the transactions in flight *plus* everything
 awaiting acknowledgement, and 20,000 coins is not enough for 256 cells at this
 rate.
 
+## The depth ladder
+
+Each rung measured over a clean window from the monotonic counters, at 1 gen/s
+requested, 256 cells.
+
+| `-max-unseen` | gen/s | tx/s | statuses/s | rejections | halted | stalled |
+|---|---|---|---|---|---|---|
+| 1 | 0.342 | 95.1 | 114.5 | **0** | 0 | 0 |
+| 8 | 0.613 | 161.9 | 178.7 | **0** | 0 | 0 |
+| 32 | 0.787 | 195.0 | 195.4 | **0** | 0 | 0 |
+| 0 (off) | *not measurable* | — | 241.1 | — | 0 | 0 |
+
+**Zero ordering rejections at every rung that ran.** Depth 1 cost 2.3× the
+throughput against depth 32 to prevent something that did not happen even with
+the gate 32 deep. On this network, at this rate, the shallow gate was not
+buying safety.
+
+**Returns diminish sharply.** 1 → 8 gave 1.8×; 8 → 32 gave 1.28×. Working the
+model backwards, `rate = depth ÷ ack-latency` implies ~2.9 s acknowledgement
+latency at rung 1 and ~13 s at rung 3 — so latency is not a constant, it grows
+with the number of transactions in flight. Depth lets more cells run ahead,
+which loads arcade, which slows acknowledgement, which eats most of the gain.
+The `ackLatency*` constants in engine.go are a starting estimate, not a law, and
+the comment there should not be read as one.
+
+**Rung 4 is not a result.** With the gate off entirely the automaton made zero
+transitions in 150 seconds — not because of the gate but because the fuel pool
+was exhausted (2,983 coins and falling at ~200 tx/s). The number to take from
+that row is the 241 statuses/s, which is the pipeline draining a mined backlog,
+not a throughput figure.
+
+Statuses tracked broadcasts one-for-one at every measurable rung: 114.5 vs 95.1,
+178.7 vs 161.9, 195.4 vs 195.0.
+
+## Restarting a running ring costs cells
+
+Found by doing it. A SIGTERM at 162 tx/s stranded **179 of 256 cells** with
+`tip is UNKNOWN: a transition may have been broadcast without being recorded` —
+the write-ahead record catching a stop that landed between the intent row and
+the broadcast row. `rule110 recover` resolved all 179: **141 adopt** (signed, so
+it reached the network — move the tip forward, re-spend nothing) and **38
+resume** (created but never signed, so nothing went out — roll back). That
+distinction is the entire reason the intent row exists.
+
+A later restart with `-auto-recover` healed 101 stranded cells by itself, with
+no operator action, which is the flag working as designed.
+
+But that is mitigation. **The defect is that shutdown does not drain**: the
+workers stop wherever they stand, so a stop reliably strands about a second's
+worth of cells. Stopping the clock, waiting for in-flight transitions to record,
+then exiting would make a restart cost nothing. That is a fourth halt path,
+distinct from the three this plan closed, and it is now the highest-value item
+left.
+
+## The burst classifier did not engage on the one burst that occurred
+
+After the depth-0 restart, 233 distinct transactions came back REJECTED in a
+flood — the closest thing this run produced to the 2026-08-13 shape. Throughout
+it: `stalled=0`, `burst_refusals=0`, `halted=0`.
+
+Nothing broke, but nothing engaged either. Those rejections are catch-up
+statuses for transactions the previous process broadcast, and they apply to
+generations that have already scrolled out of the live window, so they land as
+`failed` display rows without reaching `noteRefusalLocked` at all. The classifier
+was designed for refusals arriving against LIVE cells; a flood of stale
+rejections for departed generations is a different shape and it has nothing to
+say about them.
+
+That is a gap in the work, not a success: the counter that would demonstrate the
+classifier working stayed at zero through the event that most resembled what it
+was built for. Whether it needs to engage there is a real question — the cells
+those rejections name have already moved on, so charging them budget would be
+wrong — but the current behaviour is accidental rather than designed, and the
+tests do not cover it.
+
 ## Still owed
 
-- A clean rung-1 rate. Both windows so far were contaminated: the first by
-  startup, the second by fuel drain.
-- The depth ladder itself: 1 → 8 → 32 → 0, recording achieved gen/s and
-  rejections at each rung. Zero ordering rejections is the acceptance test for
-  whether depth 1 was ever buying anything.
-- A larger fuel pool before the next attempt, sized per the README rather than
-  the 20,000 that ran out here.
+- **Drain on shutdown** (above) — the real fix for restart-stranded cells.
+- **A fuel pool sized for the rate.** 20,000 coins ran dry at 95 tx/s and 200,000
+  was never reached because the keeper cannot mint faster than promote-on-SEEN
+  allows. Every rung after the first ended in starvation.
+- **Rung 4, measured properly**, once fuel is not the binding constraint.
+- **What actually caps this deployment near 200 tx/s**, now that depth
+  demonstrably is not it past rung 2.
