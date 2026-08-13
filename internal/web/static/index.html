@@ -51,11 +51,27 @@
      so "how do I give it money" is not an error path — it is a standing fact
      about the thing, and the page says so at all times. It sits above the
      diagram deliberately: the canvas is thousands of pixels tall, and anything
-     below it is invisible exactly when it matters most. -->
+     below it is invisible exactly when it matters most.
+
+     Present is not the same as large, though. At rest this is one line: the
+     standing offer and the button that takes it. The paragraph explaining fees
+     and the pay-by-hand fallback are behind the chevron, because somebody who
+     came to watch an automaton should not have to scroll past three lines of
+     payment copy to reach it. What escalates the panel is need, not the
+     viewer's attention — low and stopped open it themselves. -->
 <section id="fund" hidden>
   <div class="fund-bar">
-    <div class="fund-msg">
+    <!-- The whole message is the toggle, not just the chevron. A 44px chevron
+         would have to come out of the title beside it — at 390px there is no
+         slack in this row — and "Keep it runn…" is a worse answer than making
+         the thing the chevron refers to clickable. The button stays for the
+         keyboard and the screen reader; its click bubbles here, so there is one
+         handler and not two. -->
+    <div class="fund-msg" id="fundMsg">
       <b id="fundTitle">Keep it running</b>
+      <button id="fundToggle" type="button" aria-expanded="false"
+              aria-controls="fundWhy fundManual"
+              aria-label="Why this is here">⌄</button>
       <span id="fundSpin" class="spinner" hidden aria-hidden="true"></span>
       <span id="fundWhy" class="muted"></span>
     </div>
@@ -63,7 +79,11 @@
       <input id="fundAmount" type="number" min="0" step="1000" inputmode="numeric"
              aria-label="amount in satoshis">
       <span class="muted">sat</span>
-      <button id="fundBtn" type="button">Fund it</button>
+      <!-- "it" goes on a phone. The row has to hold the title, the amount, the
+           unit and this, and the title is the only part that cannot be shortened
+           without losing something — "Fund" beside a satoshi figure says the
+           same as "Fund it". Same idiom as the explainer cards' `read →`. -->
+      <button id="fundBtn" type="button">Fund<span class="fund-btn-tail">&nbsp;it</span></button>
     </div>
   </div>
 

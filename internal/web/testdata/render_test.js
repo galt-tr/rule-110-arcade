@@ -64,6 +64,16 @@ function newElement(tag) {
     setAttribute(k, v) { el.attrs[k] = v; },
     removeAttribute(k) { delete el.attrs[k]; },
     hasAttribute(k) { return Object.prototype.hasOwnProperty.call(el.attrs, k); },
+    // Backed by className rather than holding its own copy, because renderFund
+    // assigns className wholesale and the two would otherwise disagree about
+    // which state the funding panel is in.
+    classList: {
+      contains(c) { return String(el.className || '').split(/\s+/).includes(c); },
+      add(c) { if (!this.contains(c)) el.className = (el.className ? el.className + ' ' : '') + c; },
+      remove(c) {
+        el.className = String(el.className || '').split(/\s+/).filter((x) => x !== c).join(' ');
+      },
+    },
     contains() { return false; },
     addEventListener() {},
     getBoundingClientRect() { return { top: 0, left: 0 }; },
@@ -429,7 +439,7 @@ test('the funding panel is always offered, not only in trouble', () => {
 
   assert.strictEqual(byId('fund').hidden, false,
     'a healthy automaton hides the only way to keep it healthy');
-  assert.strictEqual(byId('fund').className, '',
+  assert.strictEqual(byId('fund').className, 'resting',
     'a healthy automaton is showing an alarm state');
   assert.strictEqual(byId('fundBtn').disabled, false, 'the fund button is disabled while healthy');
 });
@@ -539,7 +549,7 @@ test('the mint indicator clears when the pool actually grows', () => {
   flushFrames();
   assert.strictEqual(byId('fundSpin').hidden, true,
     'the spinner is still running after the pool filled');
-  assert.strictEqual(byId('fund').className, '',
+  assert.strictEqual(byId('fund').className, 'resting',
     'the panel is still in its working state after the automaton recovered');
 });
 
@@ -802,6 +812,101 @@ test('following still chases the live edge when it is switched on', () => {
     'following was on but the view did not keep up with the live edge');
 });
 
+/* --- the funding panel collapses when nothing is wrong ---------------------
+ *
+ * Permanent, but not permanently three lines tall. Only the resting state
+ * collapses; every state that means the automaton needs money says so with its
+ * own class, and those are shown whether or not anyone asked. */
+
+test('a healthy panel marks itself resting so it can collapse', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
+  flushFrames();
+
+  assert.strictEqual(byId('fund').className, 'resting',
+    'the quiet state has no class of its own, so the stylesheet cannot collapse it');
+});
+
+test('a panel that needs money never collapses, asked or not', () => {
+  app.setFundTarget(FUND_TARGET);
+
+  apply(snapshot(tail(0, 4), { starved: true, poolCoins: 0 }));
+  flushFrames();
+  assert.strictEqual(byId('fund').className, 'stopped',
+    'a starved automaton went quiet instead of interrupting');
+
+  apply(snapshot(tail(0, 4), { poolCoins: 1, waitingOnCoin: 0 }));
+  flushFrames();
+  assert.strictEqual(byId('fund').className, 'low',
+    'a nearly-empty pool went quiet instead of warning');
+});
+
+// The handler is on the message row, and the chevron inside it reaches this by
+// bubbling — which this stub has no event dispatch to model, so the browser half
+// of that is checked against a running instance instead.
+test('pressing the message expands the panel and says that it has', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
+  flushFrames();
+
+  const panel = byId('fund'), msg = byId('fundMsg'), toggle = byId('fundToggle');
+  assert.ok(!panel.hasAttribute('data-expanded'), 'the panel started expanded');
+
+  msg.onclick();
+  assert.ok(panel.hasAttribute('data-expanded'), 'pressing the message did not expand the panel');
+  assert.strictEqual(toggle.attrs['aria-expanded'], 'true',
+    'the panel expanded but still reports itself collapsed');
+
+  msg.onclick();
+  assert.ok(!panel.hasAttribute('data-expanded'), 'pressing it again did not collapse the panel');
+  assert.strictEqual(toggle.attrs['aria-expanded'], 'false',
+    'the panel collapsed but still reports itself expanded');
+});
+
+test('pressing the message does nothing in a state that is already open', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { starved: true, poolCoins: 0 }));
+  flushFrames();
+
+  byId('fundMsg').onclick();
+  assert.ok(!byId('fund').hasAttribute('data-expanded'),
+    'a stopped panel took an expand it had no use for, which collapse would then hide');
+});
+
+test('an expanded panel stays expanded across the pushes that follow', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
+  flushFrames();
+  byId('fundMsg').onclick();
+
+  // Pushes arrive several times a second. Re-collapsing on each one would shut
+  // the panel under someone in the middle of reading it.
+  apply(snapshot(tail(5, 9), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
+  flushFrames();
+
+  assert.ok(byId('fund').hasAttribute('data-expanded'),
+    'a render put the panel away while the viewer had it open');
+});
+
+test('a missing wallet opens the panel it is telling you to use', async () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
+  flushFrames();
+  byId('fundAmount').value = String(FUND_TARGET.minSatoshis || 1000);
+  assert.ok(!byId('fund').hasAttribute('data-expanded'),
+    'the panel was already expanded, so what follows would pass without the fix');
+
+  // Wallet.probe resolves null in this harness, which is the no-wallet path.
+  // Collapsed, the address and the txid box are behind a display:none, so
+  // without the expand this reports "pay by hand" and shows no way to.
+  await byId('fundBtn').onclick();
+
+  assert.ok(byId('fund').hasAttribute('data-expanded'),
+    'the pay-by-hand fallback was opened inside a collapsed panel');
+  assert.strictEqual(byId('fundManual').open, true,
+    'the manual payment block stayed shut');
+});
+
 /* --- fitting the ring to a narrow viewport --------------------------------
  *
  * The zoom used to be a constant 4px whatever the viewport, so a 256-cell ring
@@ -1009,6 +1114,11 @@ for (const [name, fn] of tests) {
   // The touch sheet stays up until it is dismissed, which is the behaviour the
   // page wants and a leak between tests here.
   byId('cellsheet').hidden = true;
+  // Same for the funding panel's expansion: it deliberately survives a render,
+  // so it also survives into the next test unless it is cleared. It has already
+  // made one test pass that should have failed.
+  byId('fund').removeAttribute('data-expanded');
+  byId('fundManual').open = false;
   // 4px: the shipped default, and the zoom the virtualization arithmetic in
   // these tests assumes. Setting it through oninput also marks the zoom as
   // viewer-chosen, so fitZoom stays out of the way of tests that are not about
