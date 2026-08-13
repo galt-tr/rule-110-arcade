@@ -39,19 +39,21 @@ func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64
 	t.Cleanup(func() { _ = store.Close() })
 
 	e := &Engine{
-		chain:      &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		deployment: &chain.Deployment{Cells: cells},
-		tips:       make([]chain.CellChain, cells),
-		store:      store,
-		mode:       ModePaused,
-		rate:       1,
-		changed:    make(chan struct{}),
-		txIndex:    map[string]txLoc{},
-		halted:     map[int]bool{},
-		haltReason: map[int]string{},
-		lastMined:  map[int]uint64{},
-		lastSeen:   map[int]uint64{},
+		chain:       &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		deployment:  &chain.Deployment{Cells: cells},
+		tips:        make([]chain.CellChain, cells),
+		store:       store,
+		mode:        ModePaused,
+		rate:        1,
+		changed:     make(chan struct{}),
+		txIndex:     map[string]txLoc{},
+		halted:      map[int]bool{},
+		haltReason:  map[int]string{},
+		lastMined:   map[int]uint64{},
+		lastSeen:    map[int]uint64{},
+		needsRepair: map[int]bool{},
+		retries:     map[int]retryState{},
 		// Persistence is asynchronous now, so the tests run the real writer
 		// rather than a stand-in — otherwise they would assert against a queue
 		// nothing ever drains. Assertions on the store go through
@@ -290,5 +292,126 @@ func TestLastSeenNeverRegresses(t *testing.T) {
 	e.mu.RUnlock()
 	if got != 20 {
 		t.Errorf("lastSeen[2] = %d after an out-of-order older frame, want 20", got)
+	}
+}
+
+// TestRetryableRejectionDoesNotCountAgainstTheHaltBudget covers the signal we
+// were throwing away.
+//
+// Arcade labels this class in as many words — "retryable — resubmit after the
+// ancestor is accepted" — and the engine counted it towards halting the cell
+// anyway. A refusal the network itself says will resolve is not evidence that
+// anything is wrong with the transition.
+func TestRetryableRejectionDoesNotCountAgainstTheHaltBudget(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+	const retryable = "parent rejected (ancestor 629f0309): retryable — resubmit after the ancestor is accepted"
+
+	e.mu.Lock()
+	for range maxRetries * 3 {
+		e.noteRefusalLocked(0, 7, "tx", "REJECTED", retryable)
+	}
+	halted := e.halted[0]
+	repair := e.needsRepair[0]
+	e.mu.Unlock()
+
+	if halted {
+		t.Error("a cell was halted over refusals arcade itself called retryable")
+	}
+	if !repair {
+		t.Error("a retryable refusal must still schedule a rebuild")
+	}
+}
+
+// The pinned message. Detection is on arcade's wording because there is no
+// structured field for it, so a reworded upstream message must fail here
+// loudly rather than silently re-arming the halt that cost the ring.
+func TestArcadeRetryableWordingIsStillRecognised(t *testing.T) {
+	real := "parent rejected (ancestor 59cb0014a0da2d297f1f36bbb2332a653b0ee56fb15f14f8d22b254831d824b0): " +
+		"retryable — resubmit after the ancestor is accepted"
+	if !isRetryableRejection(arcade.StatusRejected, real) {
+		t.Error("the message arcade actually sends is no longer recognised as retryable")
+	}
+	// The generic validation failure is NOT retryable-labelled and must still
+	// count, or a genuinely broken transition would never halt.
+	generic := "PROCESSING (4): [ProcessTransaction][abc] failed to validate transaction"
+	if isRetryableRejection(arcade.StatusRejected, generic) {
+		t.Error("an unlabelled rejection was treated as retryable")
+	}
+}
+
+// TestHaltNeedsTimeNotJustAttempts is the other half of what killed the ring.
+//
+// maxRetries counted attempts, and rebuilds are immediate, so all three burned
+// inside a four-second parent-acceptance lag. That is not three pieces of
+// evidence about a transition, it is one — sampled three times in the same
+// second.
+func TestHaltNeedsTimeNotJustAttempts(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+	const generic = "PROCESSING (4): [ProcessTransaction][abc] failed to validate transaction"
+
+	e.mu.Lock()
+	for range maxRetries + 2 {
+		e.noteRefusalLocked(0, 7, "tx", "REJECTED", generic)
+	}
+	halted := e.halted[0]
+	e.mu.Unlock()
+
+	if halted {
+		t.Error("a cell halted on refusals that all landed within the same instant; " +
+			"the budget has to span real time to be evidence of anything")
+	}
+}
+
+// ...but a fault that persists past the window is real, and the cell must
+// still halt rather than retrying for ever.
+func TestHaltStillHappensOnceTheWindowHasPassed(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+	const generic = "PROCESSING (4): [ProcessTransaction][abc] failed to validate transaction"
+
+	e.mu.Lock()
+	e.noteRefusalLocked(0, 7, "tx", "REJECTED", generic)
+	// Backdate the first refusal past the window, as a real outage would.
+	st := e.retries[0]
+	st.first = st.first.Add(-2 * minHaltWindow)
+	e.retries[0] = st
+	for range maxRetries {
+		e.noteRefusalLocked(0, 7, "tx", "REJECTED", generic)
+	}
+	halted := e.halted[0]
+	reason := e.haltReason[0]
+	e.mu.Unlock()
+
+	if !halted {
+		t.Fatal("a fault that persisted past the window never halted the cell")
+	}
+	if reason == "" {
+		t.Error("the cell halted with nothing to say about why")
+	}
+}
+
+// A cell must not rebuild flat out for the whole halt window. The budget now
+// spans a minute, so without a backoff a persistently refused generation would
+// hammer arcade for that minute — on every affected cell at once, which on a
+// 256-cell ring is how a transient network wobble becomes a self-inflicted one.
+func TestRebuildsBackOff(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+	const generic = "PROCESSING (4): [ProcessTransaction][abc] failed to validate transaction"
+
+	var pauses []time.Duration
+	e.mu.Lock()
+	for range 4 {
+		e.noteRefusalLocked(0, 7, "tx", "REJECTED", generic)
+		pauses = append(pauses, e.rebuildPauseLocked(0))
+	}
+	e.mu.Unlock()
+
+	for i := 1; i < len(pauses); i++ {
+		if pauses[i] <= pauses[i-1] {
+			t.Errorf("pause %d (%v) did not grow on the previous (%v); refusals are not backing off",
+				i, pauses[i], pauses[i-1])
+		}
+	}
+	if pauses[len(pauses)-1] > maxRebuildPause {
+		t.Errorf("pause %v exceeded the cap %v", pauses[len(pauses)-1], maxRebuildPause)
 	}
 }

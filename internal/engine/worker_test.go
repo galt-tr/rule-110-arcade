@@ -872,3 +872,68 @@ func TestSeenGateAndDepthGateAreIndependent(t *testing.T) {
 		t.Error("the depth gate stopped working when the seen gate was satisfied")
 	}
 }
+
+// TestChildIsNeverBuiltBeforeTheParentIsAccepted is the incident, reproduced.
+//
+// This is the whole outage in one property. Model the network as arcade
+// behaved: a transaction is refused if its parent has not yet been accepted at
+// the moment it arrives. Then drive a cell forward and assert it never
+// submits into that condition.
+//
+// Without the acceptance gate the cell walks straight into it — which is what
+// happened to all 256 cells of the public deployment inside two minutes, over
+// parents that were all perfectly valid and are all `seen` today.
+func TestChildIsNeverBuiltBeforeTheParentIsAccepted(t *testing.T) {
+	e := newTestEngine(t, 2)
+	e.chain.Config.MaxUnseenDepth = 1
+	atGeneration(e, 0)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 50
+	e.mu.Unlock()
+
+	// The network: a generation is accepted only once its parent has been.
+	accepted := uint64(0) // generation 0 is genesis, already on chain
+	submitted := []uint64{}
+
+	for range 200 {
+		if !e.turnReady(0) {
+			// Blocked. The only thing that can unblock it is the network
+			// accepting what we already sent — so let it.
+			e.mu.Lock()
+			tip := e.tips[0].Generation
+			e.mu.Unlock()
+			if tip > accepted {
+				accepted = tip
+				e.mu.Lock()
+				e.lastSeen[0] = accepted
+				e.mu.Unlock()
+			}
+			continue
+		}
+
+		e.mu.Lock()
+		next := e.tips[0].Generation + 1
+		parent := next - 1
+		e.mu.Unlock()
+
+		// THE ASSERTION. Submitting a child whose parent the network has not
+		// taken is the bug; arcade refuses it for an input that does not exist.
+		if parent > accepted {
+			t.Fatalf("submitted generation %d while its parent %d was still unaccepted "+
+				"(network has accepted up to %d) — this is the rejection cascade",
+				next, parent, accepted)
+		}
+		submitted = append(submitted, next)
+
+		e.mu.Lock()
+		e.tips[0].Generation = next
+		e.mu.Unlock()
+	}
+
+	if len(submitted) < 10 {
+		t.Fatalf("the gate deadlocked: only %d generations advanced, so this test would "+
+			"pass by never doing anything", len(submitted))
+	}
+}

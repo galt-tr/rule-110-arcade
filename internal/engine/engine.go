@@ -131,6 +131,12 @@ type Snapshot struct {
 	Lag   uint64 `json:"lag"`
 	Depth uint64 `json:"depth"`
 
+	// UnseenDepth is how far the furthest cell has run ahead of what the network
+	// has ACCEPTED. Non-zero means cells are waiting on the acceptance gate,
+	// which is correct behaviour and looks exactly like a stall from outside —
+	// hence the number. See Config.MaxUnseenDepth.
+	UnseenDepth uint64 `json:"unseenDepth"`
+
 	// WaitingOnCoin is how many cells are currently retrying a funding
 	// shortfall.
 	//
@@ -786,6 +792,7 @@ func (e *Engine) snapshot(limit int) Snapshot {
 		HaltedCells:    len(e.halted),
 		Lag:            e.target - min(e.target, frontier),
 		Depth:          e.deepestLocked(),
+		UnseenDepth:    e.deepestUnseenLocked(),
 		WaitingOnCoin:  len(e.waitingOnCoin),
 	}
 }

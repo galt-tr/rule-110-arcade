@@ -222,6 +222,19 @@ func (e *Engine) awaitTurn(ctx context.Context, cell int) bool {
 			// produced. Rebuild before advancing — here, not where the rejection
 			// arrived, because this is the only goroutine that can be sure no
 			// transition for this cell is in flight. See repairCell.
+			//
+			// Backing off first, because the halt budget now spans a minute and
+			// rebuilding flat out for that minute — on every affected cell at
+			// once — would be this ring doing to arcade what arcade's backlog
+			// did to it. See rebuildPauseLocked.
+			e.mu.RLock()
+			pause := e.rebuildPauseLocked(cell)
+			e.mu.RUnlock()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(pause):
+			}
 			e.repairCell(ctx, cell)
 			continue
 		}
@@ -402,8 +415,34 @@ func (e *Engine) deepestLocked() uint64 {
 		if e.halted[i] {
 			continue
 		}
-		if d := c.Generation - e.lastMined[i]; d > deepest {
-			deepest = d
+		if c.Generation > e.lastMined[i] {
+			if d := c.Generation - e.lastMined[i]; d > deepest {
+				deepest = d
+			}
+		}
+	}
+	return deepest
+}
+
+// deepestUnseenLocked is the largest gap between any live cell's tip and the
+// newest generation of it the NETWORK HAS ACCEPTED.
+//
+// This is what waiting on the acceptance gate looks like from outside, and it
+// needs to be visible: a cell blocked here is doing the right thing, but from
+// the diagram it is indistinguishable from a cell that has stopped. Callers
+// must hold the lock.
+func (e *Engine) deepestUnseenLocked() uint64 {
+	var deepest uint64
+	for i, c := range e.tips {
+		if e.halted[i] {
+			continue
+		}
+		// Guarded, not subtracted blind: repairCell pulls a tip behind lastSeen
+		// and the unsigned difference would wrap to an enormous number.
+		if c.Generation > e.lastSeen[i] {
+			if d := c.Generation - e.lastSeen[i]; d > deepest {
+				deepest = d
+			}
 		}
 	}
 	return deepest

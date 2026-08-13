@@ -171,8 +171,12 @@ Flags every subcommand accepts, beyond the five above:
   -throughput              fund from a denominated fuel pool instead of contending for change
   -fuel-sats uint          value of one fuel coin
   -fuel-pool uint          how many fuel coins the keeper maintains
-  -max-depth uint          how far a cell may run ahead of its newest mined transaction
+  -max-depth uint          how far a cell may run ahead of its newest MINED transaction
                            (0 = unbounded); measure it with depth-probe, do not assume it
+  -max-unseen uint         how far a cell may run ahead of its newest ACCEPTED transaction
+                           (0 = unbounded). 1, the default, means a cell waits for its
+                           parent to land before building on it — arcade's 202 is
+                           "accepted for processing", not "in a mempool"
   -max-lag uint            how far the clock may run ahead of the slowest cell
 
 Subcommand flags:
@@ -228,6 +232,8 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 		"how many fuel coins the keeper maintains")
 	fs.Uint64Var(&cfg.MaxUnconfirmedDepth, "max-depth", cfg.MaxUnconfirmedDepth,
 		"how far a cell may run ahead of its newest mined transaction (0 = unbounded)")
+	fs.Uint64Var(&cfg.MaxUnseenDepth, "max-unseen", cfg.MaxUnseenDepth,
+		"how far a cell may run ahead of its newest ACCEPTED transaction (0 = unbounded); 1 means a cell waits for its parent to land")
 	fs.Uint64Var(&cfg.MaxLag, "max-lag", cfg.MaxLag,
 		"how far the clock may run ahead of the slowest cell")
 	fs.IntVar(&cfg.ApplyConcurrency, "apply-concurrency", cfg.ApplyConcurrency,
