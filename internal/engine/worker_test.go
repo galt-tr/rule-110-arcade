@@ -23,6 +23,9 @@ func atGeneration(e *Engine, g uint64) {
 		e.tips[i].Cell = i
 		e.tips[i].Generation = g
 		e.lastMined[i] = g
+		// A cell that has REACHED g has had g accepted; otherwise every test
+		// would trip the acceptance gate rather than what it means to exercise.
+		e.lastSeen[i] = g
 	}
 	e.generation = g
 	e.target = g
@@ -761,4 +764,176 @@ func TestHaltingTheSlowestCellDoesNotFreezeTheClock(t *testing.T) {
 	e.mu.RUnlock()
 	t.Fatalf("the clock never raised the target past %d after the slowest cell halted and the "+
 		"frontier jumped to %d; the automaton is frozen and Lag reports 0", got, frontier)
+}
+
+// TestSeenGateBlocksUntilTheParentIsAccepted is the regression guard for the
+// outage that cost all 256 cells of the public deployment.
+//
+// Arcade's 202 means "accepted for processing", NOT "validated" and NOT "in a
+// mempool". The engine used to advance a cell the moment that 202 came back, so
+// generation N+1 was submitted while N was still in arcade's intake queue —
+// and the network rejected the child for spending an output it had not yet
+// heard of. Measured on the live deployment: children rejected 0.9 to 21.7
+// seconds BEFORE their parents were accepted, every one of those parents
+// perfectly valid and `seen` today.
+//
+// The toolbox already holds every wallet-managed coin at TierSending until
+// arcade reports SEEN, for exactly this reason. The cell's continuation output
+// is not a wallet-managed coin, so this is that same rule applied by hand.
+func TestSeenGateBlocksUntilTheParentIsAccepted(t *testing.T) {
+	e := newTestEngine(t, 2)
+	e.chain.Config.MaxUnseenDepth = 1
+	atGeneration(e, 0)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 1000
+	// Generation 1 was broadcast and arcade returned 202, so the tip advanced.
+	// Nothing has been seen beyond generation 0.
+	e.tips[0].Generation = 1
+	e.lastSeen[0] = 0
+	e.mu.Unlock()
+
+	if e.turnReady(0) {
+		t.Fatal("a cell built generation 2 while generation 1 was still unaccepted; " +
+			"that is the race that destroyed the ring")
+	}
+
+	// Arcade reports SEEN for generation 1.
+	e.mu.Lock()
+	e.lastSeen[0] = 1
+	e.mu.Unlock()
+
+	if !e.turnReady(0) {
+		t.Error("the gate must reopen the moment the parent is accepted")
+	}
+}
+
+// Zero disables the gate, the way MaxUnconfirmedDepth does. A deployment that
+// wants the old behaviour must be able to ask for it explicitly.
+func TestSeenGateDisabledByZero(t *testing.T) {
+	e := newTestEngine(t, 2)
+	e.chain.Config.MaxUnseenDepth = 0
+	atGeneration(e, 0)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 1000
+	e.tips[0].Generation = 40
+	e.lastSeen[0] = 0
+	e.mu.Unlock()
+
+	if !e.turnReady(0) {
+		t.Error("MaxUnseenDepth=0 must mean unbounded, not stopped — an unset field " +
+			"that silently freezes the automaton is the worst way to fail")
+	}
+}
+
+// A repair pulls a tip BACKWARD, so tip-lastSeen underflows on unsigned
+// integers and wraps to an enormous number. Without an explicit guard that
+// clamps the cell shut for ever, and the cause is invisible.
+func TestSeenGateSurvivesATipPulledBackwards(t *testing.T) {
+	e := newTestEngine(t, 2)
+	e.chain.Config.MaxUnseenDepth = 1
+	atGeneration(e, 0)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 1000
+	// repairCell re-derived the tip to 5 while the status pipeline had already
+	// recorded 7 as seen.
+	e.tips[0].Generation = 5
+	e.lastSeen[0] = 7
+	e.mu.Unlock()
+
+	if !e.turnReady(0) {
+		t.Error("a tip behind lastSeen wrapped the unsigned subtraction and clamped the cell shut")
+	}
+}
+
+// The two gates are different questions and must both be enforced: one asks
+// whether the network ACCEPTED the parent, the other whether it CONFIRMED it.
+func TestSeenGateAndDepthGateAreIndependent(t *testing.T) {
+	e := newTestEngine(t, 2)
+	e.chain.Config.MaxUnseenDepth = 1
+	e.chain.Config.MaxUnconfirmedDepth = 5
+	atGeneration(e, 0)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 1000
+	// Everything seen, but far past the confirmation depth limit.
+	e.tips[0].Generation = 10
+	e.lastSeen[0] = 10
+	e.lastMined[0] = 0
+	e.mu.Unlock()
+
+	if e.turnReady(0) {
+		t.Error("the depth gate stopped working when the seen gate was satisfied")
+	}
+}
+
+// TestChildIsNeverBuiltBeforeTheParentIsAccepted is the incident, reproduced.
+//
+// This is the whole outage in one property. Model the network as arcade
+// behaved: a transaction is refused if its parent has not yet been accepted at
+// the moment it arrives. Then drive a cell forward and assert it never
+// submits into that condition.
+//
+// Without the acceptance gate the cell walks straight into it — which is what
+// happened to all 256 cells of the public deployment inside two minutes, over
+// parents that were all perfectly valid and are all `seen` today.
+func TestChildIsNeverBuiltBeforeTheParentIsAccepted(t *testing.T) {
+	e := newTestEngine(t, 2)
+	e.chain.Config.MaxUnseenDepth = 1
+	atGeneration(e, 0)
+
+	e.mu.Lock()
+	e.mode = ModeRunning
+	e.target = 50
+	e.mu.Unlock()
+
+	// The network: a generation is accepted only once its parent has been.
+	accepted := uint64(0) // generation 0 is genesis, already on chain
+	submitted := []uint64{}
+
+	for range 200 {
+		if !e.turnReady(0) {
+			// Blocked. The only thing that can unblock it is the network
+			// accepting what we already sent — so let it.
+			e.mu.Lock()
+			tip := e.tips[0].Generation
+			e.mu.Unlock()
+			if tip > accepted {
+				accepted = tip
+				e.mu.Lock()
+				e.lastSeen[0] = accepted
+				e.mu.Unlock()
+			}
+			continue
+		}
+
+		e.mu.Lock()
+		next := e.tips[0].Generation + 1
+		parent := next - 1
+		e.mu.Unlock()
+
+		// THE ASSERTION. Submitting a child whose parent the network has not
+		// taken is the bug; arcade refuses it for an input that does not exist.
+		if parent > accepted {
+			t.Fatalf("submitted generation %d while its parent %d was still unaccepted "+
+				"(network has accepted up to %d) — this is the rejection cascade",
+				next, parent, accepted)
+		}
+		submitted = append(submitted, next)
+
+		e.mu.Lock()
+		e.tips[0].Generation = next
+		e.mu.Unlock()
+	}
+
+	if len(submitted) < 10 {
+		t.Fatalf("the gate deadlocked: only %d generations advanced, so this test would "+
+			"pass by never doing anything", len(submitted))
+	}
 }

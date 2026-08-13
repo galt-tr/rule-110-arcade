@@ -166,7 +166,25 @@ func TestRepairStopsAfterMaxRetries(t *testing.T) {
 		}
 	}
 
-	// One more refusal of the SAME generation is the one that halts.
+	// Attempts alone are no longer enough, and that is the point: rebuilds are
+	// immediate, so three of them fit inside one bad second and say nothing
+	// about the transition. The refusals must also have SPANNED minHaltWindow.
+	// Backdate them, as a genuine outage would.
+	refuse(t, f, e, cell, refused, aRefusal)
+	e.mu.RLock()
+	early := e.halted[cell]
+	e.mu.RUnlock()
+	if early {
+		t.Fatal("cell halted on refusals that all landed in the same instant")
+	}
+
+	e.mu.Lock()
+	st := e.retries[cell]
+	st.first = st.first.Add(-2 * minHaltWindow)
+	e.retries[cell] = st
+	e.mu.Unlock()
+
+	// Now a refusal of the SAME generation, past the window, is the one that halts.
 	refuse(t, f, e, cell, refused, aRefusal)
 
 	e.mu.RLock()

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -207,6 +208,32 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 			errMsg = rejectionMessage(w.rec.Status, w.rec.ExtraInfo)
 		}
 
+		// BOTH GATES ARE RELEASED HERE, BEFORE ANY RENDER-WINDOW CHECK.
+		//
+		// These are the engine's governors, not display state, and everything
+		// below this point is about whether a row is still on screen. Updating
+		// them after the trim check meant a status for a generation that had
+		// scrolled out of the in-memory window released nothing — which for the
+		// depth gate is a cell that never reopens, and for the acceptance gate
+		// is a cell that waits for ever on a transaction the network already
+		// took. Mined statuses in particular arrive hundreds of generations
+		// behind the frontier, which is exactly where the window ends.
+		//
+		// A mined transaction shortens that cell's unconfirmed chain, releasing
+		// the depth gate; acceptance releases the gate that stops a child being
+		// submitted before its parent lands (see Config.MaxUnseenDepth).
+		//
+		// TxMined counts for BOTH, and must: SSE delivery is unordered — rank
+		// exists for that reason — so a cell whose SEEN frame was dropped but
+		// whose MINED arrived would otherwise sit behind the acceptance gate on
+		// a transaction the network has demonstrably accepted.
+		if w.next == TxMined && loc.generation > e.lastMined[loc.cell] {
+			e.lastMined[loc.cell] = loc.generation
+		}
+		if (w.next == TxSeen || w.next == TxMined) && loc.generation > e.lastSeen[loc.cell] {
+			e.lastSeen[loc.cell] = loc.generation
+		}
+
 		genIdx := indexOfGeneration(e.history, loc.generation)
 		if genIdx < 0 || loc.cell >= len(e.history[genIdx].Cells) {
 			// Trimmed out of the in-memory window. The store still has it, so
@@ -224,14 +251,6 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 		}
 		cell.State = w.next
 		changed = true
-
-		// A mined transaction shortens that cell's unconfirmed chain, which is
-		// what releases its depth gate. Without this the governor would clamp
-		// every cell shut after MaxUnconfirmedDepth generations and never
-		// reopen. It stays on this path, synchronously, for that reason.
-		if w.next == TxMined && loc.generation > e.lastMined[loc.cell] {
-			e.lastMined[loc.cell] = loc.generation
-		}
 
 		writes = append(writes, history.StatusUpdate{TxID: w.rec.TxID, Status: st, Err: errMsg})
 		if st.IsTerminal() {
@@ -273,10 +292,69 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 // not work, and rebuilding it a fourth time is a loop, not a repair.
 const maxRetries = 3
 
-// retryState counts consecutive refusals of one generation.
+// minHaltWindow is how long a cell's refusals must SPAN before any number of
+// them is allowed to halt it.
+//
+// maxRetries alone counts attempts, and rebuilds are immediate, so three of them
+// fit comfortably inside one bad second. That is not three pieces of evidence
+// about a transition — it is one, sampled three times. The public deployment
+// lost all 256 cells to exactly that: children refused for arriving before their
+// parents were accepted, with the worst measured parent-acceptance lag at 21.7
+// seconds and the whole retry budget spent inside the first four.
+//
+// 60s is comfortably past that worst case. A cell whose refusals have persisted
+// for a minute has met something that is not going to resolve itself.
+const minHaltWindow = 60 * time.Second
+
+// retryState counts consecutive refusals of one generation, and when they began.
 type retryState struct {
 	generation uint64
 	attempts   int
+	// first is when this run of refusals started. See minHaltWindow.
+	first time.Time
+}
+
+// maxRebuildPause caps the wait between rebuilds of a refused generation.
+//
+// The halt budget now spans a minute, so without a backoff a persistently
+// refused generation would rebuild flat out for that minute — on every affected
+// cell at once. On a 256-cell ring that turns a transient network wobble into a
+// self-inflicted one, which is the failure mode this whole change exists to stop
+// rather than to reproduce from the other end.
+const maxRebuildPause = 8 * time.Second
+
+// rebuildPauseLocked is how long this cell should wait before re-attempting the
+// generation it is repairing: exponential in the number of refusals so far,
+// capped. Callers must hold the lock.
+//
+// Growing the wait is also what makes the attempts EVIDENCE. Three rebuilds in
+// the same second sample one instant of the network three times; spaced out,
+// they sample three.
+func (e *Engine) rebuildPauseLocked(cell int) time.Duration {
+	st, ok := e.retries[cell]
+	if !ok || st.attempts <= 0 {
+		return retryPause
+	}
+	pause := retryPause << min(st.attempts-1, 8)
+	return min(pause, maxRebuildPause)
+}
+
+// isRetryableRejection reports whether arcade has said this refusal resolves
+// itself.
+//
+// There is no structured field for it: arcade puts the verdict in the free-text
+// extraInfo, in its own words — "retryable — resubmit after the ancestor is
+// accepted" — so this matches the wording, and a test pins the real message so a
+// reworded upstream fails loudly rather than silently re-arming the halt.
+//
+// StatusPendingRetry is arcade saying the same thing structurally. It does not
+// currently reach this path (stateFor ignores it), and is handled anyway because
+// the cost of being wrong in the other direction is a dead cell.
+func isRetryableRejection(status arcade.Status, extra string) bool {
+	if status == arcade.StatusPendingRetry {
+		return true
+	}
+	return strings.Contains(strings.ToLower(extra), "retryable")
 }
 
 // noteRefusalLocked records a network refusal and decides whether the cell
@@ -292,14 +370,31 @@ type retryState struct {
 // which stalls the SSE reader for the whole process. The repair itself is left to
 // the cell's own worker; see repairCell.
 func (e *Engine) noteRefusalLocked(cell int, generation uint64, txid, status, reason string) {
+	// A refusal arcade itself calls retryable is not evidence about this
+	// transition, so it schedules a rebuild without spending any budget. The
+	// engine used to count these, and they are precisely the class that a
+	// too-fast child produces against a parent the network has not yet taken.
+	if isRetryableRejection(arcade.Status(status), reason) {
+		e.needsRepair[cell] = true
+		e.logger.Warn("cell refused retryably, scheduling a rebuild",
+			"cell", cell, "generation", generation, "txid", txid, "status", status)
+		return
+	}
+
 	st := e.retries[cell]
 	if st.generation != generation {
-		st = retryState{generation: generation}
+		st = retryState{generation: generation, first: time.Now()}
+	}
+	if st.first.IsZero() {
+		st.first = time.Now()
 	}
 	st.attempts++
 	e.retries[cell] = st
 
-	if st.attempts > maxRetries {
+	// BOTH bounds, not either. Attempts alone halted a cell on three rebuilds
+	// inside one bad second; time alone would halt a cell that refused once an
+	// hour ago and has been fine since.
+	if st.attempts > maxRetries && time.Since(st.first) >= minHaltWindow {
 		// Halt. Its successor UTXO does not exist, so every later generation
 		// would try to spend a phantom output and fail with "utxo already
 		// spent" — noise that hides the original rejection.

@@ -327,6 +327,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		{"rule110_failed_cells", "Failures in the newest generation.", "gauge", float64(snap.FailedCells)},
 		{"rule110_lag_generations", "How far the clock has run ahead of the slowest cell.", "gauge", float64(snap.Lag)},
 		{"rule110_unconfirmed_depth", "Deepest unconfirmed chain, against the mempool ancestor limit.", "gauge", float64(snap.Depth)},
+		{"rule110_unseen_depth", "Deepest run ahead of what the network has accepted. Non-zero means cells are waiting on the acceptance gate, which is backpressure working rather than a stall.", "gauge", float64(snap.UnseenDepth)},
 		{"rule110_waiting_on_coin", "Cells retrying a funding shortfall.", "gauge", float64(snap.WaitingOnCoin)},
 		{"rule110_spendable_satoshis", "Satoshis the funder can actually claim right now.", "gauge", float64(snap.Balance)},
 		{"rule110_reserve_satoshis", "Satoshis left to mint more spendable coin from.", "gauge", float64(snap.Reserve)},

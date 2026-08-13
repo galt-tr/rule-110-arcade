@@ -131,6 +131,12 @@ type Snapshot struct {
 	Lag   uint64 `json:"lag"`
 	Depth uint64 `json:"depth"`
 
+	// UnseenDepth is how far the furthest cell has run ahead of what the network
+	// has ACCEPTED. Non-zero means cells are waiting on the acceptance gate,
+	// which is correct behaviour and looks exactly like a stall from outside —
+	// hence the number. See Config.MaxUnseenDepth.
+	UnseenDepth uint64 `json:"unseenDepth"`
+
 	// WaitingOnCoin is how many cells are currently retrying a funding
 	// shortfall.
 	//
@@ -336,6 +342,13 @@ type Engine struct {
 	// the rejection cascades to every descendant.
 	lastMined map[int]uint64
 
+	// lastSeen[cell] is the newest generation of that cell the NETWORK HAS
+	// ACCEPTED — seen, or mined, which implies seen. tip − lastSeen is how far
+	// the cell has run ahead of what arcade will admit exists, which is the
+	// gate that stops a child being submitted before its parent lands. See
+	// Config.MaxUnseenDepth.
+	lastSeen map[int]uint64
+
 	// starvedSince is when funding ran out, or the zero time. lastProbe paces
 	// the single retry that resumes the automaton once coin arrives.
 	starvedSince time.Time
@@ -510,6 +523,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		mode:          startMode(opts),
 		rate:          startRate(opts),
 		lastMined:     make(map[int]uint64, d.Cells),
+		lastSeen:      make(map[int]uint64, d.Cells),
 		changed:       make(chan struct{}),
 		txIndex:       make(map[string]txLoc),
 		halted:        make(map[int]bool),
@@ -600,6 +614,10 @@ func (e *Engine) applyPositions(positions []CellPosition) {
 		// at the derived generation means the depth gate opens rather than
 		// clamping every cell shut on a fresh start.
 		e.lastMined[cell] = p.Tip.Generation
+		// A DERIVED tip is a transaction that exists on chain, so it is at least
+		// seen. Seeding this is what stops every cell stalling on the seen gate
+		// at startup, waiting for a status the stream will never resend.
+		e.lastSeen[cell] = p.Tip.Generation
 	}
 
 	e.generation = e.frontierLocked()
@@ -774,6 +792,7 @@ func (e *Engine) snapshot(limit int) Snapshot {
 		HaltedCells:    len(e.halted),
 		Lag:            e.target - min(e.target, frontier),
 		Depth:          e.deepestLocked(),
+		UnseenDepth:    e.deepestUnseenLocked(),
 		WaitingOnCoin:  len(e.waitingOnCoin),
 	}
 }
