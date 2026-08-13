@@ -120,7 +120,24 @@ func Open(ctx context.Context, dsn, dataDir string, conns int) (*Store, error) {
 	if conns <= 0 {
 		conns = maxOpenConns
 	}
-	driver, target, postgres := "sqlite", filepath.Join(dataDir, "history.db"), false
+	// _busy_timeout is not a nicety on SQLite, it is the difference between a
+	// contended write and a LOST one.
+	//
+	// Without it SQLite returns SQLITE_BUSY the instant a writer meets another
+	// connection's lock, and this store has several goroutines writing: the
+	// status writer, the durable-write committer, the reconciler. writeStatuses
+	// logs its error to a logger the tests discard and moves on — it does not
+	// retry — so a busy database silently drops the status and the row keeps
+	// whatever it had. That is exactly the reported "cells show broadcast when
+	// the network has mined them", reproduced locally by
+	// TestStatusWriterBatchesAndCollapses, which was ~50% flaky on main and
+	// deterministic once this branch's timing shifted.
+	//
+	// Five seconds matches internal/chain/prune.go, which met the same thing.
+	// PostgreSQL needs none of this: it does not lock a whole database to write
+	// one row.
+	driver, target, postgres := "sqlite",
+		filepath.Join(dataDir, "history.db")+"?_busy_timeout=5000&_journal_mode=WAL", false
 	if dsn != "" {
 		driver, target, postgres = "pgx", dsn, true
 	}
