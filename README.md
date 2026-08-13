@@ -344,7 +344,9 @@ Flags accepted by every subcommand, beyond those five:
 | `-max-db-conns` | `72` | Wallet storage pool size — **one** pool, shared by the metastore and the utxostore. Pair with worker count. |
 | `-history-db-conns` | `0` (16) | History store pool size, which is a *separate* pool against the same server. Budget it and `-max-db-conns` together against `max_connections`: exceeding that does not slow the automaton down, it halts cells, because a cell whose write-ahead record cannot be written must not advance. |
 | `-apply-concurrency` | `32` | Monitor workers applying arcade status batches. The toolbox default of 8 is documented as too low: when appliers cannot drain the hand-off queue, the SSE reader blocks and arcade drops events, and transactions end up with no status at all. |
-| `-full-status` | `true` | Subscribe to every status transition rather than terminal ones. ~4× the events; turn off above ~3 gen/s. |
+| `-full-status` | `true` | Subscribe to every status transition rather than the milestones. 2× the events, and it buys the **diagram** nothing — `stateFor` collapses `ACCEPTED_BY_NETWORK`, `SEEN_ON_NETWORK` and `SEEN_MULTIPLE_NODES` onto one displayed state. It buys the *acceptance gate*: see [`-max-unseen`](#the-acceptance-gate) below. |
+| `-max-unseen` | `1` | How far a cell may run ahead of its newest ACCEPTED transaction; 0 is unbounded. See [the acceptance gate](#the-acceptance-gate). |
+| `-unseen-timeout` | `10m` | How long `-max-unseen` may hold one cell before it advances anyway; 0 waits for ever. Without it, a status that is never delivered stops that cell permanently. |
 | `-chronicle` | `true` | Chronicle-era script rules for local pre-broadcast verification. Required — the covenant contains `OP_2MUL`. |
 | `-fee-sat-per-kb` | `125` | Above arcade's 100 sat/kB floor. The margin is headroom for a fee committed from a size *estimate* made before the ~2.6 kB unlocking scripts exist, not a correction for the floor being applied to a larger size. See `Config.FeeSatPerKB`. |
 | `-throughput` | `true` | Fund from the denominated fuel pool instead of contending for change. |
@@ -371,6 +373,36 @@ against the real bytes rather than the plan, and it is the check that catches a
 fee committed against a bad size estimate. Set it to the floor the receiving
 arcade enforces if you need to change it — it is the network's policy, not a
 target rate.
+
+### The acceptance gate
+
+`-max-unseen` bounds how far a cell may run ahead of its newest **accepted**
+transaction. It exists because arcade's `202` means "accepted for processing",
+not "validated" and not "in a mempool": building on the `202` submits a child
+that spends an output the network has not heard of, and that is how all 256 cells
+were lost in under two minutes.
+
+Three things about it are worth knowing before changing it.
+
+**It caps the rate, arithmetically.** A cell advances `-max-unseen` generations
+per acknowledgement, so `sustainable gen/s ≈ depth ÷ acknowledgement latency` no
+matter how fast the code is. `SetRate` warns when the configured rate exceeds it.
+
+**`-full-status` is part of the same decision.** `ACCEPTED_BY_NETWORK` is only
+sent with full updates on, and it is the *first* status that releases the gate.
+Measured: `create → ACCEPTED` p50 **154 ms**, `ACCEPTED → SEEN_ON_NETWORK` a
+further p50 **8,513 ms**. At depth 1 that difference is the generation period
+itself — about 6 gen/s against about 0.12. Turning `-full-status` off to halve the
+event volume is therefore safe only once the depth is large enough to absorb an
+8.5-second acknowledgement: roughly **32** for 1 gen/s.
+
+**A gate with no deadline is a wedge.** `-unseen-timeout` bounds how long it may
+hold one cell, because a status that never arrives is routine rather than exotic —
+arcade drops what its fan-out cannot keep up with and its catch-up truncates
+rather than replaying, and a backlogged transaction skips the seen statuses
+altogether on its way to `MINED`. `rule110_unseen_gate_timeouts_total` counts the
+releases, and is the number that says statuses are being *lost* rather than
+merely delayed. See [`docs/arcade-sse-findings.md`](docs/arcade-sse-findings.md).
 
 ---
 
