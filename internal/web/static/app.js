@@ -85,6 +85,9 @@ const ctx = canvas.getContext('2d');
 const tip = document.getElementById('tip');
 const wrap = document.getElementById('canvas-wrap');
 const surface = document.getElementById('surface');
+// pinnedBox, not `pinned`: draw() already has a local `pinned` boolean for
+// "the viewer is watching the live edge", and the shadowing was silent.
+const pinnedBox = document.getElementById('pinned');
 
 // 4px, not 8. Width is cells x cellPx and the ring is 256: at 8px the diagram
 // opens 2048px wide, which is wider than most viewports, so the live edge starts
@@ -224,12 +227,23 @@ function trimCache() {
  * empty spacer instead — so the number of generations stops being a rendering
  * problem at all. */
 function windowRows(cells) {
-  const visible = Math.ceil((wrap.clientHeight || 600) / cellPx);
-  const want = visible + 2 * OVERSCAN;
+  // EXACTLY the scrollport, plus one row for a partial at each edge — and NOT a
+  // row more.
+  //
+  // The canvas rides in a position:sticky box, and sticky cannot pin a box
+  // taller than the scrollport: past that the browser just lets it scroll away,
+  // which is precisely what it did. The first version added OVERSCAN rows to
+  // the canvas itself, making it 2,300px in a 700px viewport, and the diagram
+  // drifted off screen leaving a sliver behind.
+  //
+  // Overscan still exists — it is what ensureRows PREFETCHES — but prefetching
+  // is about which rows are in memory, and this is about how big a bitmap the
+  // browser has to keep pinned. Conflating the two was the bug.
+  const visible = Math.ceil((wrap.clientHeight || 600) / cellPx) + 2;
   const byHeight = Math.floor(MAX_CANVAS_PX / cellPx);
   const width = Math.max(1, (cells || 1) * cellPx);
   const byArea = Math.floor(MAX_CANVAS_AREA / (width * cellPx));
-  return Math.max(1, Math.min(want, byHeight, byArea));
+  return Math.max(1, Math.min(visible, byHeight, byArea));
 }
 
 /** The window the viewer most recently landed on, and the timer that asks for
@@ -412,7 +426,7 @@ function draw() {
   // generation 40,000 of 100,000. It is now wherever the scrollbar is.
   const rows = windowRows(cells);
   const firstVisible = Math.floor(wrap.scrollTop / cellPx);
-  let base = state.extent.oldest + firstVisible - OVERSCAN;
+  let base = state.extent.oldest + firstVisible;
   base = Math.max(state.extent.oldest, base);
   if (base + rows > state.extent.newest + 1) {
     base = Math.max(state.extent.oldest, state.extent.newest + 1 - rows);
@@ -440,9 +454,15 @@ function draw() {
     paint.sig.set(number, sig);
   }
 
-  // Ask for what the window wants once the scroll settles. After painting, so
-  // what is already cached shows immediately rather than waiting on a request.
-  wanted = { base, rows };
+  // Rows are whole generations but scrolling is per pixel, so shift the pinned
+  // box up by the remainder. Without this every row is drawn up to cellPx-1
+  // pixels away from where the scrollbar says it is, and the diagram shivers as
+  // you drag.
+  pinnedBox.style.transform = `translateY(${-(wrap.scrollTop % cellPx)}px)`;
+
+  // Ask for what the window wants once the scroll settles, with overscan either
+  // side — prefetching is where overscan belongs, not in the canvas size.
+  wanted = { base: Math.max(state.extent.oldest, base - OVERSCAN), rows: rows + 2 * OVERSCAN };
   scheduleFetch();
 
   // Only chase the leading edge when the viewer is already there. Scrolling
@@ -959,6 +979,7 @@ if (typeof module !== 'undefined' && module.exports) {
     setFundTarget(t) { fundTarget = t; },
     setExtent(e) { state.extent = e; },
     setFollow(f) { follow = f; },
+    wanted: () => wanted,
     view: () => view,
     canvas,
   };

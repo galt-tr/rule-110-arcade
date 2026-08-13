@@ -196,7 +196,11 @@ function test(name, fn) { tests.push([name, fn]); }
 function atArchive(oldest, newest, scrollTop = 0) {
   setArchive({ oldest, newest });
   app.setExtent({ oldest, newest, count: newest - oldest + 1, empty: false });
-  byId('canvas-wrap').scrollTop = scrollTop;
+  byId('canvas-wrap').scrollHeight = (newest - oldest + 1) * 4;
+  // Default to the live edge, which is where the streamed tail lives and where
+  // the page itself opens.
+  byId('canvas-wrap').scrollTop =
+    scrollTop || Math.max(0, (newest - oldest + 1) * 4 - byId('canvas-wrap').clientHeight);
   apply(snapshot(tail(newest - 7, newest)));
   flushFrames();
 }
@@ -257,24 +261,55 @@ test('scrolling shows the generations at that offset, not the newest', () => {
   atArchive(0, 100000, 0);
   scrollTo(40000 * 4); // 4px rows
 
+  // The base is now EXACTLY the scroll position: the canvas is the scrollport,
+  // so what you see is what the scrollbar points at, with no overscan offset
+  // between them. Overscan moved to prefetching, where it belongs.
   const v = app.view();
-  assert.ok(Math.abs(v.base - (40000 - app.OVERSCAN)) <= 1,
-    `window base ${v.base}, expected about ${40000 - app.OVERSCAN} for that scroll offset`);
-  assert.ok(v.base < 99000, 'the window is still anchored to the newest generations');
+  assert.strictEqual(v.base, 40000,
+    `window base ${v.base}, want exactly the scrolled-to generation`);
 });
 
-// The property that makes the archive size irrelevant to rendering. A canvas
-// tall enough for 100,000 rows is not something a browser will allocate.
-test('the canvas stays viewport-sized however long the run is', () => {
+// THE CANVAS MUST NEVER BE TALLER THAN THE SCROLLPORT.
+//
+// This is the invariant the first version broke, and it broke the page on the
+// live deployment: the canvas rides in a position:sticky box, and sticky cannot
+// pin a box taller than the scrollport — past that the browser lets it scroll
+// away. Adding OVERSCAN rows to the canvas made it 2,300px in a 700px viewport,
+// so the diagram drifted off screen and left a sliver behind.
+//
+// Overscan belongs in what ensureRows PREFETCHES, not in how big a bitmap the
+// browser has to keep pinned. Conflating the two is the mistake this guards.
+test('the canvas never exceeds the scrollport, however long the run is', () => {
   atArchive(0, 100000, 0);
+  const port = byId('canvas-wrap').clientHeight;
   const rows = app.windowRows(CELLS);
-  const visible = Math.ceil(600 / 4);
-  assert.ok(rows <= visible + 2 * app.OVERSCAN,
-    `canvas carries ${rows} rows, want at most a viewport plus overscan`);
+
+  assert.ok(rows * 4 <= port + 4 * 4,
+    `canvas is ${rows * 4}px tall against a ${port}px scrollport; sticky cannot pin that`);
+  assert.ok(rows > 0, 'the canvas carries no rows at all');
   assert.ok(grid.height <= app.MAX_CANVAS_PX,
     `canvas is ${grid.height}px tall, over the browser dimension limit`);
   assert.ok(grid.width * grid.height <= app.MAX_CANVAS_AREA,
     `canvas is ${grid.width * grid.height}px in area, over the allocation cap`);
+});
+
+// The spacer is what produces the scrollbar, and it has to be as tall as the
+// WHOLE run — that is the other half of the trick. A spacer sized to the canvas
+// gives no scrollbar at all, which is what a viewer reported seeing.
+test('the spacer is as tall as the whole archive', () => {
+  atArchive(0, 100000, 0);
+  const want = 100001 * 4;
+  assert.strictEqual(byId('surface').style.height, want + 'px',
+    `spacer is ${byId('surface').style.height}, want ${want}px so the scrollbar covers the run`);
+});
+
+// Prefetching still reaches beyond the viewport, or every scroll would fetch.
+test('prefetch still covers overscan even though the canvas does not', () => {
+  atArchive(0, 100000, 0);
+  seedRows(0, 3000);
+  scrollTo(1000 * 4);
+  assert.ok(app.wanted().rows >= app.OVERSCAN,
+    `prefetch window is ${app.wanted().rows} rows; overscan was lost with the canvas change`);
 });
 
 // A drag across the archive jumps further than the window is wide, so there is
@@ -306,7 +341,7 @@ test('hit-testing resolves the right generation at a scrolled offset', () => {
   atArchive(0, 100000, 0);
   scrollTo(30000 * 4);
   const v = app.view();
-  assert.ok(v.base > 29000 && v.base < 30001,
+  assert.strictEqual(v.base, 30000,
     `window base ${v.base} is not where the scrollbar points`);
 });
 
