@@ -43,6 +43,18 @@ const COLOR = {
  * makes holding thousands of them affordable at all. */
 const MAX_CACHED = 8192;
 
+/** How long to trust the archive's extent before re-reading it. */
+const EXTENT_RECHECK_MS = 5000;
+
+/** How far behind the frontier an empty archive window has to be before it
+ *  means the archive moved rather than simply not having been written yet.
+ *
+ * The extent's `newest` tracks the LIVE generation, which always runs ahead of
+ * what has been persisted, so a miss near the frontier is ordinary write lag and
+ * must not be mistaken for a stale extent — treating it as one would re-read the
+ * extent on every frame at the live edge. */
+const ARCHIVE_LAG_SLACK = 512;
+
 /** How long the scroll must be still before the archive is asked for anything.
  *
  * Dragging the scrollbar across the run redraws every frame, and every frame
@@ -196,13 +208,39 @@ function ingest(s) {
     }
     state.rows.set(g.number, { number: g.number, row: g.row, s: chars });
   }
-  // The stream is the authority on how far the run has got.
-  if (typeof s.generation === 'number' && s.generation > state.extent.newest) {
-    state.extent.newest = s.generation;
-    state.extent.count = state.extent.newest - state.extent.oldest + 1;
-    state.extent.empty = false;
+  // The stream is the authority on how far the run has got — and, crucially, on
+  // whether it is still the same run. Ratcheting `newest` upward is right while
+  // a run grows and wrong the moment one restarts: see forgetRun.
+  if (typeof s.generation === 'number') {
+    if (s.generation > state.extent.newest) {
+      state.extent.newest = s.generation;
+      state.extent.count = state.extent.newest - state.extent.oldest + 1;
+      state.extent.empty = false;
+    } else if (s.generation < state.extent.newest - RESTART_DROP) {
+      forgetRun();
+    }
   }
   trimCache();
+}
+
+/** How far the run has to appear to go BACKWARDS before that means a restart
+ *  rather than jitter at the frontier. */
+const RESTART_DROP = 2;
+
+/** The run went backwards, so it is not the run we have been drawing.
+ *
+ * Generation numbers are reused from zero by the next run, so every cached row
+ * now describes a different automaton that happens to share numbering — keeping
+ * them would draw one run's history under another's. The archive is re-read
+ * rather than adjusted by guesswork, because believing an unchecked number is
+ * what broke the page in the first place. */
+function forgetRun() {
+  state.rows.clear();
+  state.inflight.clear();
+  paint.drawn.clear();
+  paint.sig.clear();
+  paint.base = null;
+  refreshExtent(true);
 }
 
 /** Bound the cache. Evicts whatever is furthest from the current window, since
@@ -288,6 +326,13 @@ async function ensureRows(from, count) {
       const res = await fetch(`/api/history?from=${a}&count=${b - a + 1}`);
       if (!res.ok) continue;
       const body = await res.json();
+      // We asked for a range the extent says exists, well behind the frontier,
+      // and the archive had nothing. The extent is wrong — the archive moved
+      // under us (a restart, or pruning) — so re-read it rather than leaving the
+      // viewer parked on a region that will never fill in.
+      if (!(body.generations || []).length && b < state.extent.newest - ARCHIVE_LAG_SLACK) {
+        refreshExtent(false);
+      }
       for (const g of body.generations || []) {
         // Never overwrite a live row: the stream is fresher at the frontier.
         if (!state.rows.has(g.n)) state.rows.set(g.n, { number: g.n, row: g.row, s: g.s });
@@ -970,15 +1015,46 @@ window.addEventListener('resize', scheduleRender);
 const events = new EventSource('/api/events');
 events.onmessage = (ev) => apply(JSON.parse(ev.data));
 
-/** Learn how much history exists, so the spacer — and therefore the scrollbar —
- *  can be as tall as the whole run. */
-async function loadExtent() {
-  const res = await fetch('/api/extent');
-  if (!res.ok) return;
-  const e = await res.json();
-  if (e.empty) return;
-  state.extent = { oldest: e.oldest, newest: e.newest, count: e.count, empty: false };
-  scheduleRender();
+/** When the extent was last re-read, and whether a read is outstanding. */
+let extentAt = 0;
+let extentBusy = false;
+
+/** Read how much history exists, so the spacer — and therefore the scrollbar —
+ *  can be as tall as the whole run.
+ *
+ * Re-readable, not read-once. `extent` sizes the spacer and the spacer IS the
+ * scrollbar, so a stale extent is not a cosmetic error: `follow` pins the
+ * viewport to the bottom of it, and if that is past the end of the archive then
+ * every row is blank and no cell can be clicked, because there is nothing there
+ * to draw or to hit-test. A page left open across a restart looked exactly like
+ * a dead deployment for precisely this reason.
+ *
+ * Debounced, since the callers can fire on every frame; `force` is for the
+ * restart case, where the current numbers are known to be wrong. */
+async function refreshExtent(force) {
+  if (extentBusy) return;
+  const now = Date.now();
+  if (!force && now - extentAt < EXTENT_RECHECK_MS) return;
+  extentBusy = true;
+  extentAt = now;
+  try {
+    const res = await fetch('/api/extent');
+    if (!res.ok) return;
+    const e = await res.json();
+    state.extent = e.empty
+      ? { oldest: 0, newest: 0, count: 0, empty: true }
+      : { oldest: e.oldest, newest: e.newest, count: e.count, empty: false };
+    // Anything below the archive's start has been pruned away; drawing it would
+    // show history the server can no longer stand behind.
+    for (const n of [...state.rows.keys()]) {
+      if (n < state.extent.oldest) state.rows.delete(n);
+    }
+    scheduleRender();
+  } catch {
+    /* keep what we have; the next scroll asks again */
+  } finally {
+    extentBusy = false;
+  }
 }
 
 /** Put generation n at the top of the viewport. */
@@ -1006,7 +1082,7 @@ if (jumpBtn) {
   jumpInput.onkeydown = (ev) => { if (ev.key === 'Enter') go(); };
 }
 
-loadExtent()
+refreshExtent(true)
   .then(() => {
     const m = /(?:^|#|&)gen=(\d+)/.exec(location.hash);
     if (m) {
