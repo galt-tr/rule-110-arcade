@@ -217,6 +217,25 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("history: migrate: %w", err)
 		}
 	}
+	return s.addColumn(ctx, "cell_txs", "last_polled_at", "TIMESTAMP")
+}
+
+// addColumn adds a column to an existing table, tolerating its already being
+// there.
+//
+// PostgreSQL has ADD COLUMN IF NOT EXISTS; SQLite does not, and errors instead.
+// Rather than branch on the engine — which would leave the SQLite path untested
+// until someone ran it — both are handled by attempting the ALTER and treating
+// "it is already there" as success.
+func (s *Store) addColumn(ctx context.Context, table, column, typ string) error {
+	q := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, typ)
+	if _, err := s.db.ExecContext(ctx, q); err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists") {
+			return nil
+		}
+		return fmt.Errorf("history: migrate: add %s.%s: %w", table, column, err)
+	}
 	return nil
 }
 
@@ -496,10 +515,21 @@ func (s *Store) Stale(ctx context.Context, age time.Duration, limit int) ([]Cell
 	// status permanent: a cell may not build on a parent the network has not
 	// acknowledged, so a dropped SEEN event stops that cell for ever unless
 	// something re-polls it. This is that something.
+	//
+	// Both timestamps are consulted, and they answer different questions.
+	// updated_at is when the row last CHANGED, so `updated_at < cutoff` is "this
+	// has been in flight a while and the stream has not resolved it". COALESCE
+	// on last_polled_at is "and we have not already asked about it recently" —
+	// without which a transaction arcade cannot answer for is re-selected at the
+	// head of every pass and hides the whole backlog behind it.
 	q := `SELECT generation, cell, txid, status, err FROM cell_txs
-	      WHERE status NOT IN ('mined', 'failed') AND txid <> '' AND updated_at < ?
-	      ORDER BY CASE WHEN status = 'broadcast' THEN 0 ELSE 1 END, updated_at LIMIT ?`
-	rows, err := s.db.QueryContext(ctx, s.rebind(q), time.Now().UTC().Add(-age), limit)
+	      WHERE status NOT IN ('mined', 'failed') AND txid <> ''
+	        AND updated_at < ?
+	        AND COALESCE(last_polled_at, updated_at) < ?
+	      ORDER BY CASE WHEN status = 'broadcast' THEN 0 ELSE 1 END,
+	               COALESCE(last_polled_at, updated_at) LIMIT ?`
+	cutoff := time.Now().UTC().Add(-age)
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), cutoff, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("history: query stale: %w", err)
 	}
@@ -517,16 +547,23 @@ func (s *Store) Stale(ctx context.Context, age time.Duration, limit int) ([]Cell
 // A handful of those hide the entire backlog behind them while the counters say
 // the reconciler is working.
 //
-// Bumping updated_at moves a polled row to the back of the queue and, because
-// Stale also filters on it, gives each row a natural re-poll interval of the
-// caller's age bound rather than re-asking every tick. Call it BEFORE polling:
-// a pass that is cut short must still have advanced.
+// Stamping last_polled_at moves a polled row to the back of the queue and,
+// because Stale also filters on it, gives each row a natural re-poll interval of
+// the caller's age bound rather than re-asking every tick. Call it BEFORE
+// polling: a pass that is cut short must still have advanced.
+//
+// It is a SEPARATE column from updated_at deliberately. Reusing updated_at works
+// — the reconciler still cycles — but it destroys the one number that says how
+// long a transaction has genuinely been unacknowledged, because every poll makes
+// every row look freshly written. Measured on the live deployment: rows that had
+// been unresolved for minutes all reported an age under 90 seconds, and the
+// backlog became invisible in exactly the query used to look for it.
 func (s *Store) MarkPolled(ctx context.Context, txids []string) error {
 	if len(txids) == 0 {
 		return nil
 	}
 	var b strings.Builder
-	b.WriteString(`UPDATE cell_txs SET updated_at = ? WHERE status NOT IN ('mined', 'failed') AND txid IN (`)
+	b.WriteString(`UPDATE cell_txs SET last_polled_at = ? WHERE status NOT IN ('mined', 'failed') AND txid IN (`)
 	args := make([]any, 0, len(txids)+1)
 	args = append(args, time.Now().UTC())
 	for i, id := range txids {

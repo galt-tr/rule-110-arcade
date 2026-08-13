@@ -104,6 +104,46 @@ func TestMarkPolledLeavesTerminalRowsAlone(t *testing.T) {
 	}
 }
 
+// Polling must not destroy the record of how long a row has been unresolved.
+//
+// The first version of MarkPolled reused updated_at, which works — the
+// reconciler still cycles — but makes every polled row look freshly written. On
+// the live deployment that turned a visible backlog into an invisible one: rows
+// unresolved for minutes all reported an age under 90 seconds, in exactly the
+// query used to look for them. updated_at means "last CHANGED"; when we last
+// asked about it is a separate fact and needs a separate column.
+func TestMarkPolledPreservesHowLongARowHasBeenUnresolved(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.RecordGeneration(t.Context(), 1, "aa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordTx(t.Context(), CellTx{
+		Generation: 1, Cell: 0, TxID: "tx", Status: StatusBroadcast,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	read := func() time.Time {
+		t.Helper()
+		var at time.Time
+		q := s.rebind(`SELECT updated_at FROM cell_txs WHERE txid = ?`)
+		if err := s.db.QueryRowContext(t.Context(), q, "tx").Scan(&at); err != nil {
+			t.Fatalf("read updated_at: %v", err)
+		}
+		return at
+	}
+
+	before := read()
+	if err := s.MarkPolled(t.Context(), []string{"tx"}); err != nil {
+		t.Fatal(err)
+	}
+	if after := read(); !after.Equal(before) {
+		t.Errorf("updated_at moved from %v to %v when the row was merely POLLED. Its "+
+			"age is the only number that says how long a transaction has gone "+
+			"unacknowledged, and polling now hides it", before, after)
+	}
+}
+
 func TestMarkPolledOfNothingIsNotAnError(t *testing.T) {
 	if err := openTestStore(t).MarkPolled(t.Context(), nil); err != nil {
 		t.Errorf("empty: %v", err)
