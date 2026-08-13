@@ -207,6 +207,32 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 			errMsg = rejectionMessage(w.rec.Status, w.rec.ExtraInfo)
 		}
 
+		// BOTH GATES ARE RELEASED HERE, BEFORE ANY RENDER-WINDOW CHECK.
+		//
+		// These are the engine's governors, not display state, and everything
+		// below this point is about whether a row is still on screen. Updating
+		// them after the trim check meant a status for a generation that had
+		// scrolled out of the in-memory window released nothing — which for the
+		// depth gate is a cell that never reopens, and for the acceptance gate
+		// is a cell that waits for ever on a transaction the network already
+		// took. Mined statuses in particular arrive hundreds of generations
+		// behind the frontier, which is exactly where the window ends.
+		//
+		// A mined transaction shortens that cell's unconfirmed chain, releasing
+		// the depth gate; acceptance releases the gate that stops a child being
+		// submitted before its parent lands (see Config.MaxUnseenDepth).
+		//
+		// TxMined counts for BOTH, and must: SSE delivery is unordered — rank
+		// exists for that reason — so a cell whose SEEN frame was dropped but
+		// whose MINED arrived would otherwise sit behind the acceptance gate on
+		// a transaction the network has demonstrably accepted.
+		if w.next == TxMined && loc.generation > e.lastMined[loc.cell] {
+			e.lastMined[loc.cell] = loc.generation
+		}
+		if (w.next == TxSeen || w.next == TxMined) && loc.generation > e.lastSeen[loc.cell] {
+			e.lastSeen[loc.cell] = loc.generation
+		}
+
 		genIdx := indexOfGeneration(e.history, loc.generation)
 		if genIdx < 0 || loc.cell >= len(e.history[genIdx].Cells) {
 			// Trimmed out of the in-memory window. The store still has it, so
@@ -224,14 +250,6 @@ func (e *Engine) applyStatusBatch(recs []arcade.TxRecord) {
 		}
 		cell.State = w.next
 		changed = true
-
-		// A mined transaction shortens that cell's unconfirmed chain, which is
-		// what releases its depth gate. Without this the governor would clamp
-		// every cell shut after MaxUnconfirmedDepth generations and never
-		// reopen. It stays on this path, synchronously, for that reason.
-		if w.next == TxMined && loc.generation > e.lastMined[loc.cell] {
-			e.lastMined[loc.cell] = loc.generation
-		}
 
 		writes = append(writes, history.StatusUpdate{TxID: w.rec.TxID, Status: st, Err: errMsg})
 		if st.IsTerminal() {

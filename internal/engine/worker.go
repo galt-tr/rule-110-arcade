@@ -141,13 +141,15 @@ func (e *Engine) runCell(ctx context.Context, cell int) {
 func (e *Engine) turnReady(cell int) bool {
 	e.mu.RLock()
 	var (
-		mode     = e.mode
-		target   = e.target
-		tip      = e.tips[cell].Generation
-		mined    = e.lastMined[cell]
-		maxDeep  = e.chain.Config.MaxUnconfirmedDepth
-		leader   = e.leader
-		rederive = e.needsRederive
+		mode      = e.mode
+		target    = e.target
+		tip       = e.tips[cell].Generation
+		mined     = e.lastMined[cell]
+		seen      = e.lastSeen[cell]
+		maxDeep   = e.chain.Config.MaxUnconfirmedDepth
+		maxUnseen = e.chain.Config.MaxUnseenDepth
+		leader    = e.leader
+		rederive  = e.needsRederive
 	)
 	e.mu.RUnlock()
 
@@ -183,6 +185,20 @@ func (e *Engine) turnReady(cell int) bool {
 	// an unset field into an automaton that silently never advances, which is
 	// the worst possible failure for a config mistake.
 	if maxDeep > 0 && tip-mined >= maxDeep {
+		return false
+	}
+
+	// The acceptance gate, and the one that matters most at rate. Arcade's 202
+	// is "accepted for processing", not "validated" and not "in a mempool", so
+	// building on it submits a child that spends an output the network has not
+	// yet heard of — refused for a missing input, purely for arriving first.
+	// That is how all 256 cells were lost in under two minutes. See
+	// Config.MaxUnseenDepth.
+	//
+	// `tip > seen` is not redundant. repairCell pulls a tip BACKWARD, and on
+	// unsigned integers tip-seen would then wrap to an enormous number and clamp
+	// the cell shut for ever, with nothing anywhere saying why.
+	if maxUnseen > 0 && tip > seen && tip-seen >= maxUnseen {
 		return false
 	}
 	return tip < target

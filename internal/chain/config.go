@@ -100,6 +100,36 @@ type Config struct {
 	// bound only for a network you have measured and found one on.
 	MaxUnconfirmedDepth uint64
 
+	// MaxUnseenDepth bounds how far a cell may run ahead of its newest
+	// transaction the network has ACCEPTED. It defaults to 1, which means a cell
+	// may not build generation N+1 until generation N is seen. 0 disables it.
+	//
+	// This is a different question from MaxUnconfirmedDepth, and confusing the
+	// two is what cost a whole ring. That one asks whether a transaction has been
+	// CONFIRMED — mined into a block — and is a margin against a mempool ancestor
+	// limit teranode does not enforce. This one asks whether the network has so
+	// much as HEARD of it.
+	//
+	// The distinction is that arcade's 202 means "accepted for processing", not
+	// "validated" and not "in a mempool". Advancing on the 202 submits a child
+	// that spends an output the network has not yet learned about, and it is
+	// refused for an input that does not exist — not because anything is wrong
+	// with it, but because it arrived first. Measured on the live deployment:
+	// children rejected 0.9 to 21.7 seconds BEFORE their parents were accepted,
+	// every one of those parents valid and seen today. All 256 cells were lost
+	// that way in under two minutes.
+	//
+	// The toolbox already enforces exactly this rule for every coin it manages —
+	// change is held at TierSending until arcade reports SEEN, see storage's
+	// process.go — and the cell's continuation output is the one output in this
+	// system that is not a wallet-managed coin, so it needs the rule applied by
+	// hand.
+	//
+	// The cost is that the configured rate becomes advisory: when the network is
+	// slow to accept, cells wait and the reported lag climbs. That is the
+	// backpressure whose absence was the whole problem.
+	MaxUnseenDepth uint64
+
 	// MaxLag bounds how far the clock may run ahead of the slowest cell before
 	// it stops asking for new generations. Without it, a rate the chain cannot
 	// serve would queue without limit and the reported rate would be fiction.
@@ -222,6 +252,8 @@ func DefaultConfig() Config {
 		// limit, and a finite value here silently caps the generation rate at
 		// depth ÷ block interval.
 		MaxUnconfirmedDepth: 0,
+		// A cell waits for its own parent to be accepted before building on it.
+		MaxUnseenDepth:      1,
 		MaxLag:              32,
 		FeeSatPerKB:         125,
 		MinBroadcastFeeRate: 100,

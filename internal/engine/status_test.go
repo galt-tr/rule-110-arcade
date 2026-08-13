@@ -51,6 +51,7 @@ func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64
 		halted:     map[int]bool{},
 		haltReason: map[int]string{},
 		lastMined:  map[int]uint64{},
+		lastSeen:   map[int]uint64{},
 		// Persistence is asynchronous now, so the tests run the real writer
 		// rather than a stand-in — otherwise they would assert against a queue
 		// nothing ever drains. Assertions on the store go through
@@ -231,4 +232,63 @@ func TestSnapshotDoesNotShareCellArrays(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestLastSeenTracksAcceptance is the other half of the acceptance gate: the
+// gate is only as good as the signal feeding it, and a lastSeen that never
+// advances would stall every cell for ever.
+func TestLastSeenTracksAcceptance(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+	e.mu.Lock()
+	e.indexTx("t-seen", 5, 0)
+	e.mu.Unlock()
+
+	e.applyStatus("t-seen", arcade.StatusSeenOnNetwork, "")
+
+	e.mu.RLock()
+	got := e.lastSeen[0]
+	e.mu.RUnlock()
+	if got != 5 {
+		t.Errorf("lastSeen[0] = %d after SEEN of generation 5, want 5", got)
+	}
+}
+
+// MINED implies SEEN, and it has to be handled explicitly: SSE delivery is not
+// ordered — rank() exists precisely because SEEN can arrive after MINED — so a
+// cell whose SEEN frame was dropped but whose MINED arrived must not sit behind
+// the acceptance gate for ever.
+func TestLastSeenAdvancesOnMinedToo(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+	e.mu.Lock()
+	e.indexTx("t-mined", 9, 1)
+	e.mu.Unlock()
+
+	e.applyStatus("t-mined", arcade.StatusMined, "")
+
+	e.mu.RLock()
+	got := e.lastSeen[1]
+	e.mu.RUnlock()
+	if got != 9 {
+		t.Errorf("lastSeen[1] = %d after MINED of generation 9, want 9 — mined implies seen", got)
+	}
+}
+
+// A late, weaker frame must not drag the gate backwards and re-block a cell
+// that has already moved on.
+func TestLastSeenNeverRegresses(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+	e.mu.Lock()
+	e.indexTx("t-new", 20, 2)
+	e.indexTx("t-old", 3, 2)
+	e.mu.Unlock()
+
+	e.applyStatus("t-new", arcade.StatusSeenOnNetwork, "")
+	e.applyStatus("t-old", arcade.StatusSeenOnNetwork, "")
+
+	e.mu.RLock()
+	got := e.lastSeen[2]
+	e.mu.RUnlock()
+	if got != 20 {
+		t.Errorf("lastSeen[2] = %d after an out-of-order older frame, want 20", got)
+	}
 }
