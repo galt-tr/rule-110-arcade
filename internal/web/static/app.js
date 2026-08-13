@@ -100,11 +100,16 @@ const surface = document.getElementById('surface');
 // pinnedBox, not `pinned`: draw() already has a local `pinned` boolean for
 // "the viewer is watching the live edge", and the shadowing was silent.
 const pinnedBox = document.getElementById('pinned');
+const gutter = document.getElementById('gutter');
 
 // 4px, not 8. Width is cells x cellPx and the ring is 256: at 8px the diagram
 // opens 2048px wide, which is wider than most viewports, so the live edge starts
 // off-screen behind a horizontal scrollbar. Zooming in is a deliberate act;
 // having to zoom out to see anything is not.
+//
+// It is also the width this STARTS at, not the width it is stuck at: on a
+// viewport too narrow to hold the ring even at 4px, fitZoom() takes it down to
+// whatever does fit. See fitCellPx.
 let cellPx = 4;       // driven by the zoom control, not the viewport
 // Off by default, and the page still OPENS at the live edge — the two are
 // different things. Landing on the newest generation is what someone arriving
@@ -295,6 +300,49 @@ function windowRows(cells) {
   return Math.max(1, Math.min(visible, byHeight, byArea));
 }
 
+/** Whether the layout is in its phone form. Matches the 640px breakpoint in
+ *  style.css; kept as a width read rather than matchMedia so it costs nothing at
+ *  load time and works under the renderer test's DOM stub. */
+function isNarrow() {
+  return (window.innerWidth || 0) > 0 && window.innerWidth <= 640;
+}
+
+/** True once the viewer has moved the zoom slider themselves. */
+let zoomChosen = false;
+
+/** The largest cell size that fits the whole ring, or null to leave zoom alone.
+ *
+ * Only ever SHRINKS, and that asymmetry is the point. On a desktop the 4px
+ * default already fits a 256-cell ring inside 1024px, so this returns null and
+ * a zoom nobody complained about does not move. On a phone the same default
+ * opens the canvas 1024px wide against 390px of viewport: you land in the middle
+ * of the ring, seeing a third of it, with nothing to say the rest is there.
+ *
+ * Growing to fit would be the mirror image and is deliberately not done — it
+ * would change the default zoom on every wide monitor to chase a bug that only
+ * exists on narrow ones. */
+function fitCellPx(cells) {
+  const avail = (wrap.clientWidth || 0) - (gutter.offsetWidth || 0);
+  if (!cells || avail <= 0) return null;
+  if (cells * cellPx <= avail) return null;
+  return Math.max(1, Math.min(8, Math.floor(avail / cells)));
+}
+
+/** Apply fitCellPx, unless the viewer has taken the zoom into their own hands.
+ *
+ * Runs on every draw rather than once at startup because `cells` is not known
+ * until the first snapshot lands, and because a rotation changes the answer.
+ * Guarded on zoomChosen so it can never argue with a slider somebody moved. */
+function fitZoom(cells) {
+  if (zoomChosen) return false;
+  const fit = fitCellPx(cells);
+  if (fit === null || fit === cellPx) return false;
+  cellPx = fit;
+  if (zoom) zoom.value = String(cellPx);
+  if (zoomOut) zoomOut.textContent = cellPx + 'px';
+  return true;
+}
+
 /** The window the viewer most recently landed on, and the timer that asks for
  *  it. See FETCH_SETTLE_MS. */
 let wanted = null;
@@ -450,32 +498,46 @@ function paintRow(gen, row, cells) {
  *  out. Rebuilt only when the window or the zoom moves — the labels do not
  *  depend on transaction state, so a push that only changes colours leaves them
  *  alone. */
-const gutterState = { base: null, rows: null, cellPx: null };
+const gutterState = { base: null, rows: null, cellPx: null, narrow: null };
 function drawGutter(base, rows) {
+  // On a phone this column was costing about 37px of a 390px viewport to print
+  // numbers at 6px, which is to say it was spending a tenth of the diagram's
+  // width on something nobody could read. Narrow, it pads to the width the
+  // numbers actually need and sets a floor of 9px on the type.
+  const narrow = isNarrow();
   if (gutterState.base === base && gutterState.rows === rows &&
-      gutterState.cellPx === cellPx) {
+      gutterState.cellPx === cellPx && gutterState.narrow === narrow) {
     return;
   }
-  const g = document.getElementById('gutter');
+  const g = gutter;
   const every = Math.max(1, Math.ceil(14 / cellPx));
   // padStart(8), not 6: six digits stops aligning at a million generations,
-  // which at half a generation per second is under a month away.
+  // which at half a generation per second is under a month away. Narrow, the
+  // alignment comes from the widest number actually on screen instead.
+  const width = narrow ? String(base + rows).length : 8;
   const lines = [];
   for (let i = 0; i < rows; i++) {
-    lines.push(i % every === 0 ? String(base + i).padStart(8) : '');
+    lines.push(i % every === 0 ? String(base + i).padStart(width) : '');
   }
   g.style.lineHeight = cellPx + 'px';
-  g.style.fontSize = Math.min(10, Math.max(6, cellPx)) + 'px';
+  g.style.fontSize = (narrow ? Math.min(10, Math.max(9, cellPx))
+                             : Math.min(10, Math.max(6, cellPx))) + 'px';
   g.textContent = lines.join('\n');
   gutterState.base = base;
   gutterState.rows = rows;
   gutterState.cellPx = cellPx;
+  gutterState.narrow = narrow;
 }
 
 function draw() {
   const s = state.snap;
   if (!s) return;
   const cells = s.cells || 0;
+
+  // Before anything is measured in cells: the cell size itself may still be too
+  // big for the viewport. Nothing below this line is right if the ring does not
+  // fit, because rows and scroll offsets are both denominated in cellPx.
+  if (fitZoom(cells)) invalidate();
 
   // Where the viewer is, in generations. This is the whole inversion: the
   // window used to be "the newest N we hold", so there was no way to look at
@@ -534,12 +596,23 @@ function draw() {
   // Only chase the leading edge when the viewer is already there. Scrolling
   // them back down while they are reading history is worse than losing the
   // live edge, which the follow toggle restores in one click.
-  if (pinned) wrap.scrollTop = wrap.scrollHeight;
+  //
+  // Not while a finger is down, though: this assignment lands mid-frame, and a
+  // touch fling is a scroll the browser is already animating. Writing scrollTop
+  // underneath it makes the diagram stutter and can cancel the gesture
+  // outright. The next frame after the finger lifts catches up.
+  if (pinned && !pointerDown) wrap.scrollTop = wrap.scrollHeight;
 }
 
-/** Within a row of the bottom — treated as "watching the live edge". */
+/** Within a row or so of the bottom — treated as "watching the live edge".
+ *
+ * The floor of 8px is for touch. The tolerance used to be cellPx * 2, which at
+ * the 1px cells a phone now opens at is two pixels — and iOS reports a
+ * fractional scrollTop and rubber-bands past the end, so "at the bottom" was
+ * never true and follow released itself the moment it was armed. */
 function atBottom() {
-  return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= cellPx * 2;
+  const slack = Math.max(8, cellPx * 2);
+  return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= slack;
 }
 
 /** The stat row, built once and updated in place. Replacing innerHTML ten times
@@ -660,6 +733,10 @@ const zoomOut = document.getElementById('zoomOut');
 zoom.value = String(cellPx);
 zoomOut.textContent = cellPx + 'px';
 zoom.oninput = () => {
+  // From here on the zoom is the viewer's, and fitZoom stops touching it — a
+  // fit that reasserted itself on the next resize would be a control that
+  // undoes what you just did with it.
+  zoomChosen = true;
   cellPx = +zoom.value;
   zoomOut.textContent = cellPx + 'px';
   // A zoom changes every row's height and position, so nothing on the bitmap
@@ -667,6 +744,40 @@ zoom.oninput = () => {
   // fires far faster than the display refreshes.
   invalidate();
 };
+
+/* The footer's overflow sheet.
+ *
+ * Only ever raised on a phone, because .more-toggle is display:none above the
+ * breakpoint and .more is display:contents there — so the attribute this sets
+ * has nothing to act on and the desktop footer is untouched by all of it.
+ *
+ * Not a <dialog>, which is what the explainers use and what would otherwise be
+ * the house idiom: showModal() brings a focus trap and an inert page, and this
+ * is a strip of controls sitting directly above the button that raised it, not
+ * something to be shut out of the rest of the page for. */
+const moreBtn = document.getElementById('moreBtn');
+const moreBox = document.getElementById('more');
+function setMore(open) {
+  if (!moreBox || !moreBtn) return;
+  if (open) moreBox.setAttribute('data-open', '');
+  else moreBox.removeAttribute('data-open');
+  moreBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+if (moreBtn) {
+  moreBtn.onclick = (ev) => {
+    // Or the document listener below sees this same click and closes it again.
+    ev.stopPropagation();
+    setMore(!moreBox.hasAttribute('data-open'));
+  };
+  document.addEventListener('click', (ev) => {
+    if (!moreBox.hasAttribute('data-open')) return;
+    if (moreBox.contains(ev.target)) return;
+    setMore(false);
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && moreBox.hasAttribute('data-open')) setMore(false);
+  });
+}
 
 const followBox = document.getElementById('follow');
 // The checkbox is the authority at startup, not the initial value of `follow`:
@@ -1020,7 +1131,121 @@ function arcadeTxURL(txid) {
   return base.replace(/\/+$/, '') + '/tx/' + txid;
 }
 
+/** What a cell is, as markup. Shared by the hover tooltip and the touch sheet so
+ *  the two cannot drift into describing the same cell differently. */
+function cellSummary(hit) {
+  const bits = bitsOf(hit.gen, state.snap.cells);
+  const cellState = STATE_OF[hit.stateChar] || 'pending';
+  return `<b>cell ${hit.index}</b> · generation ${hit.number}<br>` +
+    `state: ${bits[hit.index] ? 'alive' : 'dead'} · tx: ${cellState}<br>`;
+}
+
+/** Open a transaction in the arcade explorer. */
+function openTx(txid) {
+  window.open(arcadeTxURL(txid), '_blank', 'noopener');
+}
+
+/* --- The touch sheet ------------------------------------------------------ */
+
+const cellsheet = document.getElementById('cellsheet');
+const cellsheetBody = document.getElementById('cellsheetBody');
+const cellsheetOpen = document.getElementById('cellsheetOpen');
+const cellsheetClose = document.getElementById('cellsheetClose');
+/** Guards against a slow lookup filling in a sheet that has moved on. */
+let sheetToken = 0;
+
+function hideSheet() {
+  sheetToken++;
+  if (cellsheet) cellsheet.hidden = true;
+  if (cellsheetOpen) cellsheetOpen.hidden = true;
+}
+
+function showSheet(hit) {
+  if (!cellsheet) return;
+  const head = cellSummary(hit);
+  cellsheetBody.innerHTML = head;
+  cellsheet.hidden = false;
+  cellsheetOpen.hidden = true;
+
+  if (hit.stateChar === '-') return;
+  const token = ++sheetToken;
+  detailFor(hit.number, hit.index).then((d) => {
+    if (token !== sheetToken || !d) return;
+    // The head is markup this file wrote out of two numbers and a value from a
+    // fixed table. The id and the refusal reason are strings that arrived over
+    // the wire, so they go in as text and not as markup.
+    cellsheetBody.innerHTML = head;
+    if (d.txid) cellsheetBody.append(d.txid);
+    if (d.err) {
+      const why = document.createElement('div');
+      why.className = 'err';
+      why.textContent = d.err;
+      cellsheetBody.append(why);
+    }
+    if (d.txid) {
+      cellsheetOpen.hidden = false;
+      // Assigned per cell rather than read from a variable at click time: the
+      // handler then closes over the id it was shown with, and a sheet that has
+      // since been replaced cannot navigate to the wrong transaction.
+      cellsheetOpen.onclick = () => openTx(d.txid);
+    }
+  });
+}
+
+if (cellsheetClose) cellsheetClose.onclick = hideSheet;
+
+/* --- Pointers ------------------------------------------------------------- */
+
+/** The gesture in progress, if it might still turn out to be a tap. */
+let tapStart = null;
+let pointerDown = false;
+/** Which kind of device produced the last gesture. See canvas.onclick. */
+let lastPointerType = 'mouse';
+
+/** How far a finger may travel and how long it may rest and still be a tap.
+ *
+ * #canvas-wrap scrolls in both axes, so on a touchscreen every drag over the
+ * canvas begins exactly like a tap: the only thing separating "look at this
+ * cell" from "pan the diagram" is what happens next. */
+const TAP_SLOP_PX = 10;
+const TAP_MS = 500;
+
+canvas.onpointerdown = (ev) => {
+  lastPointerType = ev.pointerType || 'mouse';
+  pointerDown = true;
+  tapStart = { x: ev.clientX, y: ev.clientY, t: Date.now() };
+};
+
+canvas.onpointerup = (ev) => {
+  pointerDown = false;
+  const start = tapStart;
+  tapStart = null;
+  // A mouse keeps the behaviour it has always had, which onclick implements.
+  if (!start || (ev.pointerType || 'mouse') === 'mouse') return;
+  if (Math.abs(ev.clientX - start.x) > TAP_SLOP_PX ||
+      Math.abs(ev.clientY - start.y) > TAP_SLOP_PX ||
+      Date.now() - start.t > TAP_MS) {
+    return;                       // a pan, or a long press: not a tap
+  }
+
+  const hit = cellAt(ev);
+  // A tap on empty space is how the sheet is dismissed, so this is not a
+  // no-op — it is the other half of the gesture.
+  if (!hit) { hideSheet(); return; }
+  showSheet(hit);
+};
+
+// A touch that becomes a scroll never delivers pointerup at all; the browser
+// takes the gesture and cancels the pointer. Without this the abandoned start
+// would be matched against whatever pointerup came next.
+canvas.onpointercancel = () => { pointerDown = false; tapStart = null; };
+
 canvas.onclick = (ev) => {
+  // Touch has already been served by onpointerup, and a browser synthesises a
+  // click after a tap regardless — so without this a tap would open the sheet
+  // and navigate away from it in the same gesture.
+  if (lastPointerType !== 'mouse') return;
+
   const hit = cellAt(ev);
   if (!hit || hit.stateChar === '-') return;
 
@@ -1031,15 +1256,15 @@ canvas.onclick = (ev) => {
   // click lands, and then the open is straightforwardly synchronous.
   const cached = txCache.get(hit.number + ':' + hit.index);
   if (cached !== undefined) {
-    if (cached && cached.txid) window.open(arcadeTxURL(cached.txid), '_blank', 'noopener');
+    if (cached && cached.txid) openTx(cached.txid);
     return;
   }
 
-  // Nothing cached — a touch device, where there is no hover, or a click faster
-  // than the lookup. Claim the tab now while the gesture still counts and point
-  // it at the transaction when the id arrives. Opened without 'noopener'
-  // because that form returns null, leaving nothing to navigate; the opener is
-  // severed by hand instead, which is the same protection.
+  // Nothing cached — a click faster than the lookup. Claim the tab now while
+  // the gesture still counts and point it at the transaction when the id
+  // arrives. Opened without 'noopener' because that form returns null, leaving
+  // nothing to navigate; the opener is severed by hand instead, which is the
+  // same protection.
   const tab = window.open('', '_blank');
   if (tab) tab.opener = null;
   detailFor(hit.number, hit.index).then((d) => {
@@ -1052,14 +1277,10 @@ canvas.onclick = (ev) => {
 canvas.onmousemove = (ev) => {
   const hit = cellAt(ev);
   if (!hit) { tip.hidden = true; return; }
-  const { gen, number, index: c } = hit;
+  const { number, index: c } = hit;
   canvas.style.cursor = hit.stateChar === '-' ? 'default' : 'pointer';
 
-  const bits = bitsOf(gen, state.snap.cells);
-  const cellState = STATE_OF[hit.stateChar] || 'pending';
-  const head =
-    `<b>cell ${c}</b> · generation ${number}<br>` +
-    `state: ${bits[c] ? 'alive' : 'dead'} · tx: ${cellState}<br>`;
+  const head = cellSummary(hit);
 
   // The id and the refusal reason are not in the bulk payload any more — that
   // is the trade that made the archive viewable — so they are fetched for the
@@ -1068,8 +1289,7 @@ canvas.onmousemove = (ev) => {
   // flickers.
   tip.innerHTML = head;
   tip.hidden = false;
-  tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 440) + 'px';
-  tip.style.top = (ev.clientY + 14) + 'px';
+  placeTip(ev);
 
   if (hit.stateChar === '-') return;
   const token = ++hoverToken;
@@ -1081,6 +1301,22 @@ canvas.onmousemove = (ev) => {
       (d.err ? `<br><span style="color:var(--failed)">${d.err}</span>` : '');
   });
 };
+
+/** Put the tooltip beside the pointer, and inside the window.
+ *
+ * The clamp used to be `window.innerWidth - 440`, which assumes a viewport
+ * wider than the tooltip: on anything under 440px it is a negative left, so the
+ * box rendered off the left edge entirely. There was no bottom clamp at all, so
+ * a pointer low on the screen pushed it below the fold. */
+function placeTip(ev) {
+  const vw = window.innerWidth || 1024;
+  const vh = window.innerHeight || 768;
+  const tw = tip.offsetWidth || 320;
+  const th = tip.offsetHeight || 80;
+  tip.style.left = Math.max(8, Math.min(ev.clientX + 14, vw - tw - 8)) + 'px';
+  tip.style.top = Math.max(8, Math.min(ev.clientY + 14, vh - th - 8)) + 'px';
+}
+
 canvas.onmouseleave = () => { tip.hidden = true; };
 window.addEventListener('resize', scheduleRender);
 
@@ -1189,7 +1425,10 @@ loadFundTarget().catch(() => {});
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     apply, state, paint, MAX_CACHED, MAX_CANVAS_PX, MAX_CANVAS_AREA, OVERSCAN,
-    draw, jumpTo, windowRows,
+    draw, jumpTo, windowRows, fitCellPx, isNarrow,
+    TAP_SLOP_PX, TAP_MS,
+    cellPx: () => cellPx,
+    setZoomChosen(v) { zoomChosen = v; },
     // The panel is driven by GET /api/funding, which the harness has no network
     // for. Exposing the setter is cheaper than stubbing fetch well enough to
     // deliver a body, and it is the same field loadFundTarget assigns.
