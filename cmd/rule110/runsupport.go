@@ -13,20 +13,25 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
-// seedFor builds generation 0's row: a single live cell at the right-hand edge.
+// seedFor builds generation 0's row for the cold start: a single live cell at
+// cell 0, the right-hand edge of the diagram.
 //
-// The same seed `genesis` uses by default, and it has to be the same one, since
-// the cold start now creates genesis itself. One live cell is what makes the
-// familiar triangle: Rule 110 from a single seed is the interesting case, and a
-// random row is the uninteresting one.
-func seedFor(cells int) (ca.Row, error) {
-	row, err := ca.NewRow(cells)
-	if err != nil {
-		return ca.Row{}, err
-	}
-	row.Set(cells-1, true)
-	return row, nil
-}
+// It DELEGATES rather than building the row itself, and that is the whole
+// point. This function used to set cell cells-1 while `genesis` seeded cell 0,
+// so the two doors into a deployment — `genesis` for a laptop, the cold start
+// for a container with an empty volume — fixed different generation-0 rows from
+// the same defaults, and whichever opened first fixed it forever.
+//
+// Not a harmless rotation to look at, either. Rule 110 grows toward higher
+// indices and a row is drawn highest-index-leftmost, so seeding cell 0 puts the
+// apex at the right-hand edge and grows the familiar triangle left across the
+// whole diagram. Seeding the top cell put a live cell hard against the LEFT
+// edge, where growth wrapped straight to cell 0: a stuck column at one edge and
+// an unrelated triangle at the other, until the two met ~255 generations later.
+//
+// One live cell is what makes the triangle at all: Rule 110 from a single seed
+// is the interesting case, and a random row is the uninteresting one.
+func seedFor(cells int) (ca.Row, error) { return ca.SeedSingle(cells) }
 
 // leaseHolder returns a predicate reporting whether this process holds the
 // single-writer lease, keeping the claim renewed in the background.

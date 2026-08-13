@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/dymurray/rule-110-arcade/internal/ca"
 	"github.com/dymurray/rule-110-arcade/internal/chain"
 )
 
@@ -154,6 +155,54 @@ func TestAuditRange(t *testing.T) {
 		}
 		if from != c.wantFrom || to != c.wantTo {
 			t.Errorf("%s: got %d..%d, want %d..%d", c.name, from, to, c.wantFrom, c.wantTo)
+		}
+	}
+}
+
+// TestColdStartSeedsTheSameRowAsGenesis is the test that catches `run` and
+// `genesis` building different automata from the same defaults.
+//
+// They are two doors into one deployment — `genesis` for a laptop, the cold
+// start inside `run` for a container with an empty volume — and whichever one
+// opens first fixes generation 0 forever. `seedFor` shipped setting cell
+// cells-1 while `genesis` has always seeded cell 0, so a deployment brought up
+// by `run` started life a full ring-rotation away from the one the same
+// operator would have got by typing `genesis`.
+//
+// It is not merely a rotation to look at. Rule 110 grows toward higher
+// indices and the row is drawn highest-index-leftmost, so seeding cell 0 puts
+// the apex at the right-hand edge and grows the triangle left across the whole
+// diagram. Seeding cell 255 puts a live cell hard against the LEFT edge, where
+// growth wraps immediately to cell 0 — the diagram reads as a stuck column at
+// one edge and an unrelated triangle at the other, for the ~255 generations it
+// takes the two to meet.
+func TestColdStartSeedsTheSameRowAsGenesis(t *testing.T) {
+	for _, cells := range []int{8, 128, 256} {
+		got, err := seedFor(cells)
+		if err != nil {
+			t.Fatalf("%d cells: %v", cells, err)
+		}
+
+		// The seed `genesis` uses when -seed is empty. Compared against the
+		// function itself rather than a hex literal, so the two cannot drift
+		// apart again without this failing.
+		want, err := ca.SeedSingle(cells)
+		if err != nil {
+			t.Fatalf("%d cells: %v", cells, err)
+		}
+		if !got.Equal(want) {
+			t.Errorf("%d cells: cold start seeds %s, genesis seeds %s", cells, got, want)
+		}
+
+		// Stated separately from the comparison above, because the two could
+		// agree on the wrong cell and this says which cell is the right one.
+		if !got.Get(0) {
+			t.Errorf("%d cells: cell 0 is not alive in the cold-start seed", cells)
+		}
+		for i := 1; i < cells; i++ {
+			if got.Get(i) {
+				t.Errorf("%d cells: cell %d is alive in the cold-start seed; only cell 0 should be", cells, i)
+			}
 		}
 	}
 }
