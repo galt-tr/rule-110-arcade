@@ -319,3 +319,282 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   opacity: 0.5;
   cursor: default;
 }
+
+/* --- The two explainers -------------------------------------------------- */
+
+/* The trigger strip. Same panel treatment as #fund so the top of the page
+   reads as one stack of bars rather than three unrelated widgets, but with no
+   left border: #fund uses that edge to signal urgency, and a second element
+   wearing the same stripe would dilute a signal that has to be noticed. */
+#explain {
+  display: flex;
+  gap: 12px;
+  padding: 10px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+/* Cards, not buttons: an invitation to read, sized so the pair fills the bar
+   evenly at any width. Overriding the shared button rule wholesale because
+   almost nothing about a 6px-by-12px control transfers. */
+.explain-card {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 9px 12px;
+  background: #161d2c;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+}
+.explain-card:hover { border-color: var(--accent); background: #1a2234; }
+.explain-card b { color: var(--accent); font-weight: 600; }
+.explain-card .muted { line-height: 1.4; }
+.explain-go { color: var(--muted); font-size: 11px; align-self: flex-end; margin-top: 2px; }
+.explain-card:hover .explain-go { color: var(--accent); }
+
+/* Below this the cards would each be two words wide, so they stack — and the
+   hook line goes, because on a phone the strip is competing with the diagram
+   for a viewport that is mostly diagram. */
+@media (max-width: 640px) {
+  #explain { gap: 8px; padding: 8px 12px; }
+  .explain-card { padding: 7px 10px; }
+  .explain-card .muted { display: none; }
+  .explain-go { display: none; }
+}
+
+/* The dialogs themselves. Native <dialog>, so the focus trap, Esc and the
+   backdrop are the browser's job and not ours. */
+.explainer {
+  /* In pixels, not ch. `ch` here would be measured in the monospace font this
+     element inherits from body, while the prose inside is set in a sans — so
+     the measure would be decided by a font the reader never sees. 880 puts the
+     prose at a bit under 80 characters and is just wide enough that the opcode
+     listing does not need its scrollbar. */
+  width: min(880px, calc(100vw - 32px));
+  max-height: 86vh;
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 24px 64px rgba(0,0,0,.6);
+  overflow: hidden;
+}
+.explainer::backdrop { background: rgba(6, 9, 15, .78); }
+
+/* The article scrolls, not the dialog, so the close button can stay put. */
+.explainer article {
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 26px 34px 34px;
+
+  /* The only place in this application that is not monospace, deliberately.
+     Everything else here is data — addresses, hex, counters — where a fixed
+     advance is doing real work. This is three thousand words of prose, and
+     prose set in a terminal font is prose people give up on. Code inside it
+     goes back to monospace below. */
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px;
+  line-height: 1.62;
+}
+
+.explain-close { position: sticky; top: 0; height: 0; z-index: 2; text-align: right; }
+.explain-close button {
+  position: relative;
+  top: 10px;
+  right: 10px;
+  padding: 2px 9px;
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.explain-close button:hover { color: var(--text); border-color: var(--accent); }
+
+.explainer h2 {
+  margin: 0 0 4px;
+  font-size: 22px;
+  letter-spacing: .01em;
+}
+.explainer h3 {
+  margin: 30px 0 8px;
+  font-size: 15px;
+  color: var(--accent);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.explainer p { margin: 0 0 14px; }
+.explainer ol, .explainer ul { margin: 0 0 14px; padding-left: 22px; }
+.explainer li { margin-bottom: 6px; }
+.explainer b { color: #f2f5fb; }
+
+/* The opening line carries the whole explanation for anyone who reads exactly
+   one sentence, which is most people. */
+.lede {
+  font-size: 17px;
+  line-height: 1.5;
+  color: var(--mined);
+  margin: 0 0 22px !important;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.explainer code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: var(--seen);
+  word-break: break-word;
+}
+.explainer pre.code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--broadcast);
+  border-radius: 4px;
+  padding: 10px 14px;
+  margin: 0 0 16px;
+  /* Wide listings scroll inside their own box. The page must never gain a
+     horizontal scrollbar because of one long opcode line. */
+  overflow-x: auto;
+}
+.explainer pre.asm { font-size: 12px; line-height: 1.45; }
+/* Annotations beside the opcodes. Dim enough that the opcode column reads as
+   the content and the commentary as the margin. */
+.explainer .cm { color: var(--muted); font-style: italic; }
+
+/* Disclosure blocks: the same idiom as #fundManual, which is already how this
+   application says "there is more here if you want it". Everything genuinely
+   technical lives in one of these, so the main thread stays readable. */
+.explainer details {
+  margin: 0 0 16px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 14px;
+}
+.explainer details[open] { padding-bottom: 4px; }
+.explainer summary {
+  cursor: pointer;
+  padding: 9px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.explainer summary:hover { color: var(--accent); }
+.explainer details p:last-child { margin-bottom: 12px; }
+
+/* A button that reads as a link, for the cross-reference at the foot of each
+   dialog. */
+.explain-next { margin-top: 26px !important; padding-top: 16px; border-top: 1px solid var(--line); }
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.linkish:hover { color: var(--mined); }
+
+/* --- The demos ----------------------------------------------------------- */
+
+.demo {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px;
+  margin: 0 0 16px;
+}
+.demo-note { margin: 10px 0 0 !important; font-size: 13px; }
+.demo-note input[type="number"] {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 6px;
+  width: 7ch;
+  font: inherit;
+}
+
+/* The eight neighbourhoods. Each is three cells over one answer cell; the
+   answer is the only part that is clickable, because the whole point is that
+   the rule IS those eight bits and nothing else. */
+.rule-table {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.rule-case {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+.rule-nbhd { display: flex; gap: 2px; }
+.rule-bit {
+  width: 15px;
+  height: 15px;
+  border: 1px solid var(--line);
+  background: var(--dead);
+}
+.rule-bit.on { background: var(--mined); border-color: var(--mined); }
+.rule-arrow { color: var(--muted); font-size: 10px; line-height: 1; }
+/* The answer cell is a button so it is reachable by keyboard: the demo is the
+   explanation here, not decoration around it. */
+.rule-out {
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--dead);
+  cursor: pointer;
+}
+.rule-out.on { background: var(--mined); border-color: var(--mined); }
+.rule-out:hover { border-color: var(--accent); }
+.rule-out:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.rule-readout {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 14px 0 12px !important;
+}
+.rule-readout b { color: var(--accent); font-size: 16px; }
+.rule-readout button { padding: 3px 10px; font-size: 12px; }
+
+.demo-canvas {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--dead);
+  image-rendering: pixelated;
+}
+
+/* The bit-extraction readout. A grid of label/value pairs, because the thing
+   being explained is which number came from where. */
+.bit-out {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+.bit-out .bit-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.bit-out .bit-k { color: var(--muted); min-width: 17ch; }
+.bit-out .bit-v { color: var(--seen); }
+.bit-out .bit-hi { color: var(--mined); font-weight: 600; }
+.bit-out hr { border: none; border-top: 1px solid var(--line); margin: 9px 0; }
