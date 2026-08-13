@@ -47,6 +47,20 @@ const (
 
 	// defaultWindow is what an unparameterised request gets.
 	defaultWindow = 256
+
+	// settledMargin is how far behind the frontier a generation must be before
+	// its window is treated as immutable and allowed to be cached forever.
+	//
+	// A cell's status still moves for a long time after it is broadcast: seen
+	// arrives in seconds, but MINED lands roughly rate x block-interval
+	// generations behind, which on this network measured about 378. 2,000 is
+	// comfortably past that, so a window below it will not change again.
+	//
+	// This is what makes many viewers free rather than merely survivable. There
+	// is a CDN in front of this deployment, so an immutable window is served
+	// from the edge to everyone after the first request and never reaches
+	// PostgreSQL at all.
+	settledMargin = 2000
 )
 
 // archiveResponse is the wire shape. `from` echoes the resolved start so a
@@ -95,6 +109,18 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	if gens == nil {
 		gens = []CompactGeneration{}
+	}
+
+	// Settled history is immutable, and saying so is the difference between a
+	// popular page costing one database read per viewer and one read in total.
+	// The frontier is the only thing that makes a window mutable.
+	frontier := s.engine.Stats().Generation
+	if last := from + uint64(count) - 1; frontier > settledMargin && last < frontier-settledMargin {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		// Near the frontier statuses are still moving; a stale window here would
+		// show a settled row as pending for a year.
+		w.Header().Set("Cache-Control", "no-cache")
 	}
 	s.writeJSONGzip(w, r, archiveResponse{From: from, Generations: gens})
 }

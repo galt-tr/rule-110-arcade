@@ -29,6 +29,9 @@ type fakeAutomaton struct {
 	// driven records every mutator the HTTP layer actually reached.
 	driven []string
 
+	// generation is what Stats reports as the frontier.
+	generation uint64
+
 	snapshotCalls, tailCalls, statsCalls int
 
 	// calls records the order of Changed/PublishedTail, which is the whole
@@ -105,7 +108,7 @@ func (f *fakeAutomaton) Stats() engine.Snapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statsCalls++
-	return engine.Snapshot{Cells: 128, Locked: f.locked}
+	return engine.Snapshot{Cells: 128, Locked: f.locked, Generation: f.generation}
 }
 
 func (f *fakeAutomaton) counts() (snapshot, tail, stats int) {

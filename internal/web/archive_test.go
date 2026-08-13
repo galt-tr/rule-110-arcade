@@ -280,3 +280,38 @@ func TestArchiveIsCompressed(t *testing.T) {
 			"from the repeated state characters", len(plain), len(packed), ratio)
 	}
 }
+
+// TestSettledWindowsAreCacheable is what makes many viewers cheap rather than
+// merely survivable.
+//
+// A generation well behind the frontier will never change again, and there is a
+// CDN in front of this deployment: an immutable window is served from the edge
+// to every viewer after the first and never reaches PostgreSQL. Near the
+// frontier the opposite must hold — a window cached there would show a settled
+// row as pending for a year.
+func TestSettledWindowsAreCacheable(t *testing.T) {
+	f := newFakeAutomaton()
+	f.generation = 50_000
+	srv := httptest.NewServer(
+		New(f, slog.New(slog.NewTextHandler(io.Discard, nil)),
+			WithArchive(&fakeArchive{newest: 50_000})).Handler())
+	defer srv.Close()
+
+	deep, err := http.Get(srv.URL + "/api/history?from=1000&count=256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = deep.Body.Close()
+	if cc := deep.Header.Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+		t.Errorf("deep history Cache-Control = %q, want it immutable", cc)
+	}
+
+	edge, err := http.Get(srv.URL + "/api/history?from=49900&count=256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = edge.Body.Close()
+	if cc := edge.Header.Get("Cache-Control"); strings.Contains(cc, "immutable") {
+		t.Errorf("a window at the frontier was marked immutable (%q); statuses are still moving there", cc)
+	}
+}

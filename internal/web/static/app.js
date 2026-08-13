@@ -43,6 +43,17 @@ const COLOR = {
  * makes holding thousands of them affordable at all. */
 const MAX_CACHED = 8192;
 
+/** How long the scroll must be still before the archive is asked for anything.
+ *
+ * Dragging the scrollbar across the run redraws every frame, and every frame
+ * lands on a window nobody has cached. Fetching per frame measured at 59
+ * requests and ~8.3 million cell_txs rows scanned for ONE second of one user
+ * flinging the bar — far more load than ten people reading. Waiting for the
+ * motion to stop turns that into a single request for the window they actually
+ * landed on. Painting is NOT deferred: whatever is already cached draws
+ * immediately, so the diagram still moves under the cursor. */
+const FETCH_SETTLE_MS = 120;
+
 /** How many rows to render beyond the viewport, above and below.
  *
  * Scrolling within the overscan repaints nothing. It is the difference between
@@ -219,6 +230,18 @@ function windowRows(cells) {
   const width = Math.max(1, (cells || 1) * cellPx);
   const byArea = Math.floor(MAX_CANVAS_AREA / (width * cellPx));
   return Math.max(1, Math.min(want, byHeight, byArea));
+}
+
+/** The window the viewer most recently landed on, and the timer that asks for
+ *  it. See FETCH_SETTLE_MS. */
+let wanted = null;
+let fetchTimer = null;
+function scheduleFetch() {
+  if (fetchTimer) clearTimeout(fetchTimer);
+  fetchTimer = setTimeout(() => {
+    fetchTimer = null;
+    if (wanted) ensureRows(wanted.base, wanted.rows);
+  }, FETCH_SETTLE_MS);
 }
 
 /** Ask the archive for any generation in [from, from+count) we do not hold.
@@ -417,9 +440,10 @@ function draw() {
     paint.sig.set(number, sig);
   }
 
-  // Fetch what the window wants and does not have. After painting, so a scroll
-  // shows what is already cached immediately rather than waiting on a request.
-  ensureRows(base, rows);
+  // Ask for what the window wants once the scroll settles. After painting, so
+  // what is already cached shows immediately rather than waiting on a request.
+  wanted = { base, rows };
+  scheduleFetch();
 
   // Only chase the leading edge when the viewer is already there. Scrolling
   // them back down while they are reading history is worse than losing the
