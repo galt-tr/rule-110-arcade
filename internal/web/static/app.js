@@ -968,11 +968,45 @@ async function detailFor(number, cell) {
   }
 }
 
-canvas.onclick = async (ev) => {
+/** Arcade's status page for a transaction.
+ *
+ * This function was lost in the move to virtualized history while its call site
+ * survived, so every click threw a ReferenceError. Inside an async handler that
+ * surfaces as an unhandled rejection — nothing in the page, nothing in the way
+ * of feedback, just a cell that advertises itself as clickable and then does
+ * nothing at all. */
+function arcadeTxURL(txid) {
+  const base = (state.snap && state.snap.arcadeUrl) || '';
+  return base.replace(/\/+$/, '') + '/tx/' + txid;
+}
+
+canvas.onclick = (ev) => {
   const hit = cellAt(ev);
   if (!hit || hit.stateChar === '-') return;
-  const d = await detailFor(hit.number, hit.index);
-  if (d && d.txid) window.open(arcadeTxURL(d.txid), '_blank', 'noopener');
+
+  // The tab has to be opened INSIDE the click. A browser honours window.open
+  // only while the user gesture is still live, and awaiting a lookup outlives
+  // it — so this handler is deliberately not async. Hovering populates the
+  // cache, which on a pointer device has almost always happened by the time the
+  // click lands, and then the open is straightforwardly synchronous.
+  const cached = txCache.get(hit.number + ':' + hit.index);
+  if (cached !== undefined) {
+    if (cached && cached.txid) window.open(arcadeTxURL(cached.txid), '_blank', 'noopener');
+    return;
+  }
+
+  // Nothing cached — a touch device, where there is no hover, or a click faster
+  // than the lookup. Claim the tab now while the gesture still counts and point
+  // it at the transaction when the id arrives. Opened without 'noopener'
+  // because that form returns null, leaving nothing to navigate; the opener is
+  // severed by hand instead, which is the same protection.
+  const tab = window.open('', '_blank');
+  if (tab) tab.opener = null;
+  detailFor(hit.number, hit.index).then((d) => {
+    if (!tab) return;
+    if (d && d.txid) tab.location = arcadeTxURL(d.txid);
+    else tab.close();
+  });
 };
 
 canvas.onmousemove = (ev) => {
