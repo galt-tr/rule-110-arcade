@@ -238,6 +238,29 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   border-left-color: var(--fund-good);
 }
 
+/* The spinner, for the gap between a payment being credited and the fuel it
+   buys becoming spendable. That takes about a minute -- the keeper has to mint
+   the pool from the deposit -- and without a sign of life a paid-for automaton
+   that has not started yet is indistinguishable from one that ate the money. */
+.spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-left: 8px;
+  vertical-align: -1px;
+  border: 2px solid var(--line);
+  border-top-color: var(--fund-good);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Someone who has asked the system not to animate things has asked for a
+   reason. Keep the affordance, drop the motion. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; border-top-color: var(--fund-good); opacity: 0.7; }
+}
+
 .fund-bar {
   display: flex;
   gap: 16px;
