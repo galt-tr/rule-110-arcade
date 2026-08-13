@@ -631,6 +631,26 @@ rate.onchange = () => control('rate', { rate: +rate.value });
  *  does not take public funding (the endpoint 404s). */
 let fundTarget = null;
 
+/** Set when a payment is credited, cleared when the fuel it bought appears.
+ *
+ * There is about a minute between the two: the payment lands in the wallet as
+ * ordinary coin, and the fuel keeper then has to mint it into the denominated
+ * pool the cells actually spend from. Nothing observable happens in between, so
+ * without this a payer sees "thank you" and then an automaton that is still
+ * stopped — which looks exactly like a deployment that took the money and did
+ * nothing.
+ *
+ * `poolAt` is the coin count at the moment of payment, because the honest
+ * signal that the money became fuel is that the pool GREW, not that time
+ * passed. */
+let awaitingFuel = null;
+
+/** How long to keep saying "minting" before admitting it is taking too long.
+ *
+ * A spinner that never stops is worse than no spinner: it asserts progress it
+ * cannot see. The keeper normally fills the pool in about a minute. */
+const MINTING_PATIENCE_MS = 3 * 60 * 1000;
+
 /** The funding panel, which is ALWAYS shown once we know funding is possible.
  *
  * It used to appear only when the automaton was starved or bootstrapping, and
@@ -666,8 +686,16 @@ function renderFund(s) {
   const title = document.getElementById('fundTitle');
   const why = document.getElementById('fundWhy');
   const btn = document.getElementById('fundBtn');
+  const spin = document.getElementById('fundSpin');
   const boot = s.bootstrap;
   const phase = boot?.phase;
+
+  // The pool growing is what clears the wait. Time alone does not: a keeper
+  // that is stuck would otherwise be reported as finished.
+  if (awaitingFuel && (s.poolCoins || 0) > awaitingFuel.poolAt) awaitingFuel = null;
+
+  const working = (phase && phase !== 'funding' && phase !== 'waiting') || awaitingFuel;
+  if (spin) spin.hidden = !working;
 
   // Mid-bootstrap and already paid: money has arrived and is being spent.
   // Keep the panel up so the sequence is visible, but stop asking.
@@ -678,6 +706,23 @@ function renderFund(s) {
     btn.disabled = true;
     return;
   }
+
+  // Paid, on a deployment that was already running or starved. The coin is in
+  // the wallet; the keeper is turning it into the denominated coins the cells
+  // spend. About a minute, and nothing else on the page would show it.
+  if (awaitingFuel) {
+    const waited = Date.now() - awaitingFuel.at;
+    panel.className = 'working';
+    title.textContent = 'Payment accepted — minting fuel…';
+    why.textContent = waited > MINTING_PATIENCE_MS
+      ? `${awaitingFuel.satoshis.toLocaleString()} sat credited, but the pool has not grown yet. ` +
+        `The keeper mints it in the background; this can lag when the network is slow.`
+      : `${awaitingFuel.satoshis.toLocaleString()} sat credited. It has to be minted into the ` +
+        `coins cells spend, which takes about a minute — ${s.poolCoins.toLocaleString()} so far.`;
+    btn.disabled = false;
+    return;
+  }
+
   btn.disabled = false;
 
   if (boot) {
@@ -793,6 +838,13 @@ document.getElementById('fundBtn').onclick = async () => {
 
     const out = await res.json();
     fundSay(`Thank you — ${out.satoshis.toLocaleString()} satoshis credited.`, 'good');
+    // Start showing the mint, from the coin count as it stands right now.
+    awaitingFuel = {
+      at: Date.now(),
+      satoshis: out.satoshis,
+      poolAt: (state.snap && state.snap.poolCoins) || 0,
+    };
+    scheduleRender();
     // Best effort: let the wallet mark its own noSend action as sent.
     Wallet.settle(txid || out.txid);
   } catch (err) {
@@ -826,6 +878,12 @@ document.getElementById('fundTxidBtn').onclick = async () => {
   }
   const out = await res.json();
   fundSay(`Thank you — ${out.satoshis.toLocaleString()} satoshis credited.`, 'good');
+  awaitingFuel = {
+    at: Date.now(),
+    satoshis: out.satoshis,
+    poolAt: (state.snap && state.snap.poolCoins) || 0,
+  };
+  scheduleRender();
 };
 
 /** Which cell is under the pointer, or null. */
@@ -979,6 +1037,7 @@ if (typeof module !== 'undefined' && module.exports) {
     setFundTarget(t) { fundTarget = t; },
     setExtent(e) { state.extent = e; },
     setFollow(f) { follow = f; },
+    setAwaitingFuel(a) { awaitingFuel = a; },
     wanted: () => wanted,
     view: () => view,
     canvas,

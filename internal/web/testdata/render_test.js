@@ -483,12 +483,67 @@ test('a funded bootstrap reports progress instead of asking again', () => {
 });
 
 let failed = 0;
+// A payment is credited in seconds; the fuel it buys takes about a minute to
+// mint. Nothing else on the page moves in between, so a payer sees "thank you"
+// and an automaton that is still stopped — indistinguishable from a deployment
+// that took the money and did nothing.
+test('a credited payment shows the mint in progress', () => {
+  app.setFundTarget(FUND_TARGET);
+  app.setAwaitingFuel({ at: Date.now(), satoshis: 500000, poolAt: 0 });
+  apply(snapshot(tail(0, 4), { starved: true, poolCoins: 0 }));
+  flushFrames();
+
+  assert.strictEqual(byId('fund').className, 'working',
+    'a paid-for automaton is still shown as stopped while its fuel is minted');
+  assert.strictEqual(byId('fundSpin').hidden, false, 'no spinner while minting');
+  assert.match(byId('fundTitle').textContent, /accepted/i,
+    'the payer is not told their payment landed');
+});
+
+// The pool GROWING is what ends the wait. Time alone must not, or a stuck
+// keeper would be reported as finished.
+test('the mint indicator clears when the pool actually grows', () => {
+  app.setFundTarget(FUND_TARGET);
+  app.setAwaitingFuel({ at: Date.now(), satoshis: 500000, poolAt: 10 });
+
+  apply(snapshot(tail(0, 4), { starved: true, poolCoins: 10 }));
+  flushFrames();
+  assert.strictEqual(byId('fundSpin').hidden, false,
+    'the wait ended before any fuel appeared');
+
+  apply(snapshot(tail(0, 4), { starved: false, poolCoins: 4000 }));
+  flushFrames();
+  assert.strictEqual(byId('fundSpin').hidden, true,
+    'the spinner is still running after the pool filled');
+  assert.strictEqual(byId('fund').className, '',
+    'the panel is still in its working state after the automaton recovered');
+});
+
+// The cold start mints fuel too, and shows the same thing.
+test('the bootstrap fuel phase also spins', () => {
+  app.setFundTarget(FUND_TARGET);
+  apply(snapshot([], { bootstrap: { phase: 'fuel', minSatoshis: 1, have: 9 } }));
+  flushFrames();
+  assert.strictEqual(byId('fundSpin').hidden, false, 'no spinner during the bootstrap mint');
+});
+
+// No payment in flight, healthy automaton: no spinner. An indicator that is
+// always on indicates nothing.
+test('no spinner when nothing is being minted', () => {
+  app.setFundTarget(FUND_TARGET);
+  app.setAwaitingFuel(null);
+  apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10 }));
+  flushFrames();
+  assert.strictEqual(byId('fundSpin').hidden, true, 'the spinner runs when nothing is happening');
+});
+
 for (const [name, fn] of tests) {
   // Each test starts from a clean surface; the module is a singleton.
   state.rows.clear();
   state.inflight.clear();
   state.extent = { oldest: 0, newest: 0, count: 0, empty: true };
   state.snap = null;
+  app.setAwaitingFuel(null);
   byId('canvas-wrap').scrollTop = 0;
   paint.base = null;
   paint.rows = 0;
