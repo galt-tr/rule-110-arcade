@@ -15,6 +15,29 @@
   <div class="stats" id="stats"></div>
 </header>
 
+<!-- The two explainers, above the funding bar and above the diagram.
+     Somebody arriving here cold sees a scrolling field of blue squares and a
+     request for money, and nothing on the page has yet told them what either
+     one is. Both answers already existed — in the README and in the package
+     docs — which is to say they existed for people reading Go, and not for
+     the people actually looking at this. Same reasoning as the funding bar
+     for the position: the canvas below is thousands of pixels tall, so
+     anything under it is not on the page as far as a visitor is concerned. -->
+<section id="explain">
+  <button class="explain-card" id="openRule110" type="button" aria-haspopup="dialog">
+    <b>What is Rule&nbsp;110?</b>
+    <span class="muted">Eight yes/no answers, written as one number. It is
+      enough to compute anything a computer can.</span>
+    <span class="explain-go">read&nbsp;→</span>
+  </button>
+  <button class="explain-card" id="openScript" type="button" aria-haspopup="dialog">
+    <b>Inside one transaction</b>
+    <span class="muted">Every cell is a coin, and the coin will only be spent
+      if the new bit is the one the rule demands.</span>
+    <span class="explain-go">read&nbsp;→</span>
+  </button>
+</section>
+
 <!-- Funding, directly under the header and ALWAYS present.
      This deployment runs on real transaction fees and stops when they run out,
      so "how do I give it money" is not an error path — it is a standing fact
@@ -114,7 +137,437 @@
 <div id="err" hidden></div>
 <div id="tip" hidden></div>
 
+<!-- The explainers live at the bottom of the document so the part of this file
+     that describes the PAGE stays readable at the top. They are native
+     <dialog>s: showModal() brings the focus trap, Esc-to-close and the
+     backdrop with it, none of which is worth hand-rolling.
+
+     Numbers that depend on the deployment are written as N here and filled in
+     from /api/state by explain.js. A hardcoded ring size would be wrong the
+     day somebody deploys a different one, and the wrong number would be in
+     the paragraph explaining how the thing works. -->
+
+<dialog id="dlgRule110" class="explainer" aria-labelledby="ttlRule110">
+<form method="dialog" class="explain-close"><button aria-label="Close">✕</button></form>
+<article>
+
+<h2 id="ttlRule110">What is Rule&nbsp;110?</h2>
+
+<p class="lede">A row of cells, each one on or off, that rewrites itself over
+and over by the simplest rule you could write down. It turns out that is enough
+to compute anything.</p>
+
+<h3>A row of lights</h3>
+
+<p>Picture a row of lights. Each is on or off. Every tick, each light looks at
+exactly three things — itself, its left neighbour and its right neighbour — and
+decides whether to be on or off next. Every light decides at the same moment,
+and every light uses the same rule.</p>
+
+<p>That is the whole machine. There is no memory beyond the row itself, nothing
+that counts ticks, and nothing that can see further than one cell away.</p>
+
+<p>Draw each new row underneath the last one and you get the picture behind this
+box: the row runs across, and time runs <em>down</em>. Every horizontal line on
+that diagram is one generation of the row. Every vertical position is one cell,
+living out its life.</p>
+
+<h3>Eight questions, eight answers</h3>
+
+<p>A cell can only see three lights, and three lights can only be in eight
+arrangements: all off, one on, two on, and so forth. So a rule is nothing more
+than eight answers — one for each arrangement. On, or off.</p>
+
+<p>Eight yes/no answers is eight bits, which is a number from 0 to 255. That is
+not a way of <em>encoding</em> the rule; it is what the rule is. There are 256
+rules of this kind, and that is all of them, forever.</p>
+
+<p><b>Rule 110 is the rule whose eight answers, written out, spell 110.</b>
+Click any answer below to change it and watch the picture change with it.</p>
+
+<div class="demo" id="ruleDemo">
+  <div class="rule-table" id="ruleTable"></div>
+  <p class="rule-readout">
+    <span>This is rule <b id="ruleNum">110</b></span>
+    <code id="ruleBits">01101110</code>
+    <button type="button" id="ruleReset">back to 110</button>
+  </p>
+  <canvas id="rulePattern" class="demo-canvas"></canvas>
+  <p class="demo-note muted">
+    <label><input type="checkbox" id="ruleRandom"> start from noise instead of
+      a single live cell</label>
+  </p>
+</div>
+
+<p>Try 0 — everything dies. Try 255 — everything floods. Try 90, and you get a
+perfect fractal that never surprises you again. Most of the 256 do one of those
+three things: die, freeze, or dissolve into noise.</p>
+
+<h3>Why this one is different</h3>
+
+<p>Rule 110 does none of the three. It settles into a striped background that
+repeats forever, and then <em>things move across that background</em>. Compact
+little patterns slide left and right at different speeds, surviving indefinitely,
+crossing an otherwise regular field. They are usually called gliders.</p>
+
+<p>And when two gliders meet, something happens. They pass through each other,
+or they annihilate, or they collide and leave a different glider behind. Which
+one depends on what met what, and where.</p>
+
+<p>That is the whole reason this rule is interesting. A glider is a thing that
+carries information from one place to another. A collision is a thing that acts
+on information. Once you have both, you are no longer describing a pattern —
+you are describing a machine.</p>
+
+<h3>Why it can compute anything</h3>
+
+<p>Matthew Cook proved it. The argument runs by translation: take any computer
+program, rewrite it as a Turing machine, rewrite that as a thing called a tag
+system, rewrite <em>that</em> as a stream of gliders fired into a Rule 110 row.
+Set the row up that way and let it run, and the collisions carry out the
+program. The answer is in the pattern when it stops.</p>
+
+<p>So there is no program you could write, in any language, on any machine, that
+could not be run instead as a Rule 110 starting position. It is a universal
+computer whose entire specification is eight bits.</p>
+
+<details>
+  <summary>The chain of translations, and the fine print</summary>
+  <p>Cook's construction goes Turing machine → 2-tag system (Cocke and Minsky)
+  → cyclic tag system → gliders in Rule 110. Announced in 1998, published as
+  <i>Universality in Elementary Cellular Automata</i>, Complex Systems 15(1),
+  2004.</p>
+  <p>Two honest caveats. First, the construction needs an infinite row whose
+  background is that specific repeating stripe in both directions — it is not
+  started from a finite blob on an empty line. Specialists call this <i>weak</i>
+  universality, and it is the standard result for Rule 110. Second, Cook's
+  original emulation was exponentially slow. Neary and Woods brought it down to
+  polynomial time in 2006, and showed that predicting Rule 110 is P-complete —
+  which is a formal way of saying there is no shortcut: to know what the row
+  looks like at generation a million, something has to do the work.</p>
+  <p>Rule 110 is not alone: 124, 137 and 193 are the same rule reflected and
+  inverted. But among the 256 it is the simplest thing anybody has proved
+  universal in one dimension with two states and three neighbours. There is
+  nothing left to take away.</p>
+</details>
+
+<h3>What that means for this page</h3>
+
+<p>Not that this deployment is computing anything. It is a ring of <span class="js-cells">N</span> cells —
+finite, and wrapped end to end, so the leftmost cell's neighbour is the
+rightmost one. A finite ring has finitely many possible rows, so sooner or later
+it must repeat one and cycle forever. That is a fact about rings, not a defect.</p>
+
+<p>What is running here is the rule itself, one generation at a time, with every
+single bit of it proved on the Bitcoin ledger. The pattern is the point; the
+proof is the point. Universality is just the reason this particular rule is
+worth the electricity.</p>
+
+<p class="explain-next">
+  <button type="button" class="linkish" id="gotoScript">
+    So how does a bit of this get proved? →</button>
+</p>
+
+</article>
+</dialog>
+
+
+<dialog id="dlgScript" class="explainer" aria-labelledby="ttlScript">
+<form method="dialog" class="explain-close"><button aria-label="Close">✕</button></form>
+<article>
+
+<h2 id="ttlScript">Inside one transaction</h2>
+
+<p class="lede">Every cell in the ring is a coin. The coin's spending condition
+is the rule itself — so the only way to move a cell forward is to be right about
+it.</p>
+
+<h3>The one-sentence version</h3>
+
+<p>A Bitcoin coin is not really a coin, it is a locked box with a condition on
+it. Normally the condition is "show me a signature from whoever owns this". Here
+the condition is: <b>"show me the next row, and I will check that my own bit of
+it is what Rule 110 says it should be."</b></p>
+
+<p>So advancing one cell by one generation means spending its coin. If the bit
+being claimed is wrong, the spend is not merely dishonest — it is invalid, the
+same way a forged signature is invalid, and no node on the network will carry
+it. The rule is not enforced by this program. It is enforced by everyone.</p>
+
+<p><span class="js-cells">N</span> cells means <span class="js-cells">N</span> coins,
+<span class="js-cells">N</span> locks and <span class="js-cells">N</span> transactions per generation, each one on
+its own unbroken chain going back to the first row.</p>
+
+<h3>The coin carries the whole row</h3>
+
+<p>A lock in Bitcoin is a small program, and this one has the current row
+attached to the end of it as plain data. The row is packed one bit per cell:
+cell <i>i</i> lives in byte <i>i</i>÷8, at bit position <i>i</i> mod 8, counting
+from the least significant end. For this ring that is <span class="js-cells">N</span> bits in
+<span class="js-rowbytes">N/8</span> bytes.</p>
+
+<p>Every one of the <span class="js-cells">N</span> coins carries the entire row, not just its own bit. A cell
+has to see its neighbours to apply the rule, and the only thing it can see is
+what it is holding.</p>
+
+<details>
+  <summary>Where exactly the row sits, and why <code>OP_RETURN</code> is not a burn</summary>
+  <p>The lock ends with <code>OP_RETURN</code> followed by a length byte and the
+  row. Ordinarily <code>OP_RETURN</code> means "this output is unspendable, the
+  rest is data" — but here it is the compiler's boundary marker between the code
+  and the state, sitting at the end of a script that is very much spendable. The
+  bytes after it never execute. They are still readable by the code above,
+  which is what lets a lock carry memory at all.</p>
+  <p>For a 256-cell ring the tail is literally
+  <code>6a 20 &lt;32 bytes of row&gt;</code>: <code>6a</code> is
+  <code>OP_RETURN</code>, <code>20</code> is 32, and then the row.</p>
+</details>
+
+<h3>Six numbers make a cell</h3>
+
+<p>Every cell in the ring runs <em>the same compiled program</em>. What makes
+one of them cell 3 rather than cell 200 is six numbers baked into it: for each
+of its three neighbours, which byte to read and what to divide by.</p>
+
+<p>Reading a single bit out of a row, in a language with no bit indexing, comes
+out as ordinary arithmetic: take the byte, divide by a power of two to shift the
+bit you want down to the bottom, then take the remainder mod 2.</p>
+
+<div class="demo" id="bitDemo">
+  <p class="demo-note">
+    <label>cell <input type="number" id="bitCell" value="3" min="0"></label>
+    <span class="muted">of a <span class="js-cells">N</span>-cell ring</span>
+  </p>
+  <div id="bitOut" class="bit-out"></div>
+</div>
+
+<p>The ring wrap is in those numbers and nowhere else. Cell 0's right neighbour
+is the last cell of the ring purely because cell 0's constants say so. There is
+no wrap-around check anywhere in the program, no branch, no special case for the
+ends — just a different pair of numbers, which costs nothing.</p>
+
+<details>
+  <summary>Why a zero byte gets glued on first</summary>
+  <p>Bitcoin's numbers are little-endian sign-magnitude: the top bit of the last
+  byte is the sign. So a lone byte between <code>0x80</code> and <code>0xFF</code>
+  would be read as <em>negative</em>, and half of all possible row bytes would
+  produce a nonsense neighbourhood. Gluing a zero byte on the end before
+  converting forces the value into a plain 0–255. It is one <code>OP_CAT</code>,
+  and without it the automaton would be quietly wrong exactly half the time.</p>
+</details>
+
+<h3>The rule table is one number</h3>
+
+<p>Recall that the rule <em>is</em> a number, and that neighbourhood
+(<i>l</i>,&nbsp;<i>c</i>,&nbsp;<i>r</i>) is answer number 4<i>l</i>+2<i>c</i>+<i>r</i>.
+So looking up the rule is looking up one bit of the number 110 — the same
+divide-and-take-the-remainder move as before:</p>
+
+<pre class="code">next = (110 / 2^(4l + 2c + r)) % 2</pre>
+
+<p>The whole transition table of the automaton is the literal <code>6e</code>
+sitting in the lock. Deploy the identical program with <code>1e</code> instead
+and you have Rule 30.</p>
+
+<details>
+  <summary>How it raises 2 to a power without branching</summary>
+  <p>There is no exponentiation opcode, and an eight-way <code>OP_IF</code> tree
+  would be both large and slow. But <i>l</i>, <i>c</i> and <i>r</i> are each 0 or
+  1, so the power factors exactly:</p>
+  <pre class="code">2^(4l+2c+r) = 2^4l · 2^2c · 2^r = (1+15l)(1+3c)(1+r)</pre>
+  <p>Three multiplications and two additions, no branch, and the largest number
+  in flight is 128. The rule lookup in the deployed script contains no
+  conditional of any kind.</p>
+</details>
+
+<h3>What the lock actually insists on</h3>
+
+<p>Three things, in order:</p>
+
+<ol>
+  <li>the row being handed to it is the right length;</li>
+  <li>its own bit of that row is the answer the rule gives for the three bits it
+    just read;</li>
+  <li>the coin this spend creates is <em>this same lock again</em>, carrying the
+    new row.</li>
+</ol>
+
+<p>The third is what makes it a chain rather than a one-off. Without it you
+could prove one correct step and then walk away with a coin that had nothing to
+do with the automaton. With it, the only thing a cell's coin can ever become is
+the same cell, one generation later.</p>
+
+<h3>How a lock can see the transaction spending it</h3>
+
+<p>Here is the difficulty. Bitcoin Script cannot look at the transaction that is
+spending it. It has no opcode for "what are my outputs". So how can a lock demand
+anything about the coin being created?</p>
+
+<p>The trick is to make the spender supply that information, and then make it
+impossible to lie about it. The spender pushes a description of the spending
+transaction as an argument. The lock then takes those bytes and <em>builds a
+signature out of them</em>, using a private key of 1 and a fixed, published
+number for the random nonce — no secrets, just arithmetic on constants everyone
+knows. Then it checks that signature the ordinary way.</p>
+
+<p>A signature check only passes if the signature matches the transaction the
+node is actually validating. So it passes only if the bytes the spender pushed
+really are a true description of this spend. Push anything else and the check
+fails. The lock has, in effect, made the network read its own transaction back
+to it.</p>
+
+<p>From there it is easy. That description contains a hash of all the outputs,
+so the lock rebuilds the output it wants — its own code, with the new row glued
+on — hashes it, and demands the two match.</p>
+
+<details>
+  <summary>The mechanism in full</summary>
+  <p>The pushed description is the BIP-143 sighash preimage: version, the
+  transaction's inputs and outputs in hashed form, the outpoint being spent, its
+  value, and the <i>scriptCode</i> — a copy of the lock itself, state included.
+  The lock computes <code>s = (hash256(preimage) + r)·k⁻¹ mod n</code> with a
+  fixed nonce <code>k = 2</code> (so <code>r</code> is the x-coordinate of 2G,
+  the constant <code>c6047f94…09ee5</code> you can see in the script), packs it
+  into DER, and runs <code>OP_CHECKSIGVERIFY</code> against the public key for
+  private key 1 — which is just the generator point G,
+  <code>0279be667e…16f81798</code>. <code>OP_CHECKSIG</code> hashes the real
+  transaction itself, so it agrees only if the pushed bytes hash to the same
+  thing.</p>
+  <p>Immediately afterwards the script re-reads the last four bytes of the
+  preimage and requires them to be <code>0x41</code>. That pins the signature
+  hash type: without it a spender could choose a mode that blanks out the
+  outputs field, and the covenant would be checking its continuation against
+  nothing.</p>
+  <p>This construction is why these scripts need the Chronicle upgrade.
+  Normalising the signature to its low form uses <code>OP_2MUL</code>, an opcode
+  that was disabled for years. A node validating under the older Genesis rules
+  rejects every one of these transactions with "attempt to execute disabled
+  opcode OP_2MUL".</p>
+</details>
+
+<h3>The key that unlocks it is not a key</h3>
+
+<p>Nothing signs anything here. The unlocking side of a cell transaction is six
+pushed values and not one opcode:</p>
+
+<pre class="code">codePart | nextRow | changePKH | changeAmount | newAmount | txPreimage</pre>
+
+<p>The code, the row being claimed, where the leftover money goes, how much, how
+much stays in the cell, and the description of the transaction. There is no
+signature and no password. Anyone at all can advance a cell — they just cannot
+advance it wrongly.</p>
+
+<h3>The real thing</h3>
+
+<p>All of the above compiles to <b>916 opcodes</b>. That number is the same
+whether the ring has 8 cells or 256; only the row it carries gets longer. Here
+is the actual lock for cell 1 of an 8-cell ring, with the machinery elided and
+the automaton left in full:</p>
+
+<pre class="code asm">  0  OP_DUP
+  1  OP_CODESEPARATOR        <span class="cm">everything below is what the description commits to</span>
+
+    <span class="cm">… 523 opcodes that rebuild a signature from the pushed
+       description and check it — the part that makes the lock
+       able to see its own transaction …</span>
+
+525  OP_VERIFY
+526  OP_DUP OP_SIZE OP_4 OP_SUB OP_SPLIT OP_NIP OP_BIN2NUM
+533  41
+534  OP_NUMEQUALVERIFY       <span class="cm">pin the hash type, so no field can be blanked</span>
+
+    <span class="cm">… cut the row back out of the description …</span>
+
+630  OP_DUP OP_FALSE OP_4    <span class="cm">left neighbour: byte 0, divide by 4</span>
+641  OP_SPLIT OP_NIP OP_SWAP OP_SPLIT OP_DROP
+646  00 OP_CAT OP_BIN2NUM    <span class="cm">the zero byte that keeps it positive</span>
+649  OP_SWAP OP_DIV OP_2 OP_MOD
+
+655  OP_FALSE OP_2           <span class="cm">itself: byte 0, divide by 2</span>
+666  OP_SPLIT OP_NIP OP_SWAP OP_SPLIT OP_DROP
+671  00 OP_CAT OP_BIN2NUM
+674  OP_SWAP OP_DIV OP_2 OP_MOD
+
+681  OP_FALSE OP_TRUE        <span class="cm">right neighbour: byte 0, divide by 1</span>
+691  OP_SPLIT OP_NIP OP_SWAP OP_SPLIT OP_DROP
+696  00 OP_CAT OP_BIN2NUM
+699  OP_SWAP OP_DIV OP_2 OP_MOD
+
+704  OP_TRUE OP_15 OP_6 OP_ROLL OP_MUL OP_ADD   <span class="cm">1 + 15l</span>
+710  OP_TRUE OP_3 OP_5 OP_ROLL OP_MUL OP_ADD    <span class="cm">1 + 3c</span>
+716  OP_MUL
+717  OP_TRUE OP_ROT OP_ADD OP_MUL               <span class="cm">× (1 + r)  =  2^(4l+2c+r)</span>
+
+722  6e                      <span class="cm">110. the entire rule table.</span>
+723  OP_SWAP OP_DIV OP_2 OP_MOD                 <span class="cm">the answer</span>
+
+730  OP_FALSE OP_2           <span class="cm">now read the same bit out of the CLAIMED row</span>
+740  OP_SPLIT OP_NIP OP_SWAP OP_SPLIT OP_DROP
+745  00 OP_CAT OP_BIN2NUM
+748  OP_SWAP OP_DIV OP_2 OP_MOD
+753  OP_NUMEQUALVERIFY       <span class="cm">— and they had better match.</span>
+
+    <span class="cm">… rebuild this same lock carrying the new row, add the
+       change output, hash the pair …</span>
+
+896  OP_HASH256
+897  OP_6 OP_ROLL OP_SIZE 28 OP_SUB OP_SPLIT OP_NIP 20 OP_SPLIT OP_DROP
+907  OP_EQUAL                <span class="cm">must equal the outputs the network sees</span>
+
+914  OP_RETURN               <span class="cm">end of code</span>
+915  02                      <span class="cm">the row: cell 1 is alive</span></pre>
+
+<p>Line 722 is worth a second look. That single byte is the entire transition
+table of the automaton, sitting in a lock on a coin.</p>
+
+<details>
+  <summary>Reproducing this yourself</summary>
+  <p>The contract is <code>contracts/Cell.runar.go</code> in this repository —
+  87 lines that are simultaneously the source compiled to Bitcoin Script and
+  ordinary runnable Go, so <code>go test ./contracts</code> executes the same
+  logic natively. <code>internal/cellscript</code> compiles it and binds the six
+  constants per cell. The listing above is the output of
+  <code>cellscript.Compile(8, 110)</code> then <code>LockingScript(1, row)</code>,
+  disassembled.</p>
+</details>
+
+<h3>What is proved, and what is not</h3>
+
+<p>This is the part it would be easy to overstate, so plainly:</p>
+
+<p><b>Each transaction proves exactly one bit — its own.</b> Cell 3's lock reads
+three bits out of the row it holds, computes the rule, and checks bit 3 of the
+row it is handed. It does not look at bit 4. It will accept a next row whose
+every other bit is nonsense, so long as bit 3 is right. Cell 4 will do the same
+for bit 4.</p>
+
+<p><b>Nothing in Bitcoin Script forces the <span class="js-cells">N</span> chains to be handed the same next
+row.</b> There is no opcode anywhere comparing one cell's row to another's, and
+no shared output they all have to agree on. That independence is precisely what
+lets a whole generation be proved in parallel, and this is what it costs.</p>
+
+<p>So a complete correct generation is proved by <span class="js-cells">N</span> transactions <em>plus</em> the
+claim that all <span class="js-cells">N</span> were handed the same row. The first half the network enforces.
+The second half it does not.</p>
+
+<p>That second half is checkable by anybody, though, and not on trust: every
+cell's row is public, sitting in its lock, and the row a cell's covenant
+actually read is recoverable from the transaction's own unlocking data. The
+repository ships <code>rule110 audit</code>, which re-derives every row from its
+predecessor and compares it against what each covenant demonstrably saw. That
+check is real, and it is cheap. It is just not something a miner would reject a
+transaction for failing.</p>
+
+<p class="explain-next">
+  <button type="button" class="linkish" id="gotoRule110">
+    ← What is Rule 110, though?</button>
+</p>
+
+</article>
+</dialog>
+
 <script src="wallet.js"></script>
 <script src="app.js"></script>
+<script src="explain.js"></script>
 </body>
 </html>
