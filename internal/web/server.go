@@ -5,6 +5,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"embed"
@@ -16,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dymurray/rule-110-arcade/internal/engine"
@@ -65,6 +67,53 @@ var staticETags = func() map[string]string {
 	return tags
 }()
 
+// versionedIndex is index.html with each asset it references carrying that
+// file's content hash, rendered once at startup, alongside the ETag of the
+// rendered bytes.
+//
+// The ETag on app.js is only ever as good as the cache in front of it, and that
+// turns out not to be good enough. This deployment is served through
+// Cloudflare, which rewrites Cache-Control on .js and .css to a fixed four
+// hours and then answers from its own copy without asking — so the validator is
+// never sent, and a deploy stays invisible for four hours. A four-hour-old
+// app.js went on throwing a ReferenceError at every click while the origin
+// served the fix. That is not a header this side can win by setting harder: the
+// rewrite happens on the way out of the edge, whatever the origin said. It was
+// reproduced against a cache-busted URL, which missed, went to origin, and
+// still came back rewritten.
+//
+// A URL is not advisory the way a header is. ?v=<hash> changes the moment the
+// file changes, so a new build is a new cache key in every cache at once and
+// none of them holds anything to answer it with. index.html is the live pointer
+// that carries them, which works precisely because the page is the one response
+// the edge does not keep — text/html is not one of the extensions it caches.
+//
+// no-cache stays on the assets too. Versioning is what makes a stale hit
+// impossible; the validator is what makes the cost of being wrong about that a
+// 304 rather than a wrong build.
+var versionedIndex, versionedIndexETag = func() ([]byte, string) {
+	page, err := fs.ReadFile(staticRoot, "index.html")
+	if err != nil {
+		panic(err)
+	}
+	for p, tag := range staticETags {
+		if p == "/index.html" {
+			continue
+		}
+		name := strings.TrimPrefix(p, "/")
+		v := "?v=" + strings.Trim(tag, `"`)
+		// Attribute position only. The page names app.js and explain.js in
+		// prose as well, and a version stamped into a comment is noise that
+		// reads like a bug. Both spellings, because a reference written
+		// absolutely tomorrow should not quietly stop being versioned.
+		for _, ref := range []string{name, "/" + name} {
+			page = bytes.ReplaceAll(page, []byte(`="`+ref+`"`), []byte(`="`+ref+v+`"`))
+		}
+	}
+	sum := sha256.Sum256(page)
+	return page, `"` + hex.EncodeToString(sum[:16]) + `"`
+}()
+
 // staticHandler serves the embedded assets with a validator.
 //
 // "no-cache" does not mean "do not store" — it means revalidate before reuse.
@@ -75,11 +124,21 @@ var staticETags = func() map[string]string {
 func staticHandler() http.Handler {
 	files := http.FileServer(http.FS(staticRoot))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if p == "/" {
-			p = "/index.html"
+		// The page is rendered rather than read from the embed, so it is tagged
+		// for the bytes it actually sends: stamping it with the hash of the
+		// embedded file would be a validator that lies, answering 304 to a
+		// browser holding a copy that points at the previous build's scripts.
+		//
+		// Only "/" needs handling. http.FileServer redirects /index.html to ./
+		// before serving anything, so the raw page has no second URL to escape
+		// through.
+		if r.URL.Path == "/" {
+			w.Header().Set("ETag", versionedIndexETag)
+			w.Header().Set("Cache-Control", "no-cache")
+			http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(versionedIndex))
+			return
 		}
-		if tag, ok := staticETags[p]; ok {
+		if tag, ok := staticETags[r.URL.Path]; ok {
 			w.Header().Set("ETag", tag)
 			w.Header().Set("Cache-Control", "no-cache")
 			// http.ServeContent reads the ETag already on the header and

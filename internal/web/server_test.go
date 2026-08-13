@@ -3,12 +3,15 @@ package web
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -622,5 +625,86 @@ func TestFollowShipsOffWithAWayBackToTheEnd(t *testing.T) {
 	if !strings.Contains(page, `id="toBottom"`) {
 		t.Error("no go-to-bottom control: with follow off, someone who scrolls " +
 			"into history has no way back to the live edge but dragging")
+	}
+}
+
+// The page is the one response no cache is allowed to keep, and the only
+// pointer a browser follows to the rest of the build. So everything it names
+// has to carry a version, or that asset is the one a stale cache answers with
+// the previous build's bytes — which is exactly how a four-hour-old app.js went
+// on throwing a ReferenceError at every click while the origin served the fix.
+//
+// This walks the page rather than a list of filenames on purpose. A list is a
+// thing to forget to update, and explain.js — added a release after the caching
+// headers were — is the proof that it does get forgotten.
+func TestEveryAssetThePageLoadsCarriesItsVersion(t *testing.T) {
+	rec := httptest.NewRecorder()
+	staticHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / = %d, want 200", rec.Code)
+	}
+
+	refs := regexp.MustCompile(`(?:src|href)="([^"]+)"`).FindAllStringSubmatch(rec.Body.String(), -1)
+	if len(refs) == 0 {
+		t.Fatal("the page references no assets at all; the page or this regexp changed shape")
+	}
+
+	checked := 0
+	for _, m := range refs {
+		u, err := url.Parse(m[1])
+		if err != nil {
+			continue
+		}
+		p := u.Path
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		tag, ok := staticETags[p]
+		if !ok || p == "/index.html" {
+			continue // an external URL, or the page itself
+		}
+		checked++
+		want := strings.Trim(tag, `"`)
+		if got := u.Query().Get("v"); got != want {
+			t.Errorf("%s carries v=%q, want %q (its content hash): a cache keyed on this URL "+
+				"has no reason to ever ask for the new build", m[1], got, want)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no embedded asset was checked; the page and the embed have drifted apart")
+	}
+}
+
+// The version is a cache key, not a lookup key. Whatever it says — this build's
+// hash, a previous one, nonsense — the current bytes come back. Anything else
+// would turn a stale bookmark into a 404 on the page's own scripts.
+func TestAVersionedURLStillServesTheCurrentAsset(t *testing.T) {
+	plain := httptest.NewRecorder()
+	staticHandler().ServeHTTP(plain, httptest.NewRequest(http.MethodGet, "/app.js", nil))
+
+	for _, q := range []string{"?v=" + strings.Trim(staticETags["/app.js"], `"`), "?v=0000", "?v="} {
+		rec := httptest.NewRecorder()
+		staticHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/app.js"+q, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /app.js%s = %d, want 200", q, rec.Code)
+		}
+		if rec.Body.String() != plain.Body.String() {
+			t.Fatalf("GET /app.js%s served different bytes than /app.js", q)
+		}
+	}
+}
+
+// The page is rewritten on the way out, so its validator has to be a hash of
+// what was actually sent. Tagging it with the hash of the embedded file instead
+// would be a validator that lies: change app.js, and the browser revalidates
+// the page, is told 304, and keeps a copy pointing at the old script.
+func TestThePageIsTaggedForTheBytesItSends(t *testing.T) {
+	rec := httptest.NewRecorder()
+	staticHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	sum := sha256.Sum256(rec.Body.Bytes())
+	want := `"` + hex.EncodeToString(sum[:16]) + `"`
+	if got := rec.Header().Get("ETag"); got != want {
+		t.Fatalf("ETag on / = %s, want %s (the hash of the body actually sent)", got, want)
 	}
 }
