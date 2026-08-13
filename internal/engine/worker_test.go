@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -357,19 +358,20 @@ func TestRetractionSparesARealTransaction(t *testing.T) {
 func engineOn(t *testing.T, f *fixture) *Engine {
 	t.Helper()
 	e := &Engine{
-		chain:      &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
-		compiled:   f.compiled,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		deployment: f.facts,
-		tips:       make([]chain.CellChain, f.facts.Cells),
-		store:      f.store,
-		mode:       ModeRunning,
-		rate:       1,
-		changed:    make(chan struct{}),
-		txIndex:    map[string]txLoc{},
-		halted:     map[int]bool{},
-		haltReason: map[int]string{},
-		lastMined:  map[int]uint64{},
+		chain:       &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
+		compiled:    f.compiled,
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		deployment:  f.facts,
+		tips:        make([]chain.CellChain, f.facts.Cells),
+		store:       f.store,
+		mode:        ModeRunning,
+		rate:        1,
+		changed:     make(chan struct{}),
+		txIndex:     map[string]txLoc{},
+		halted:      map[int]bool{},
+		haltReason:  map[int]string{},
+		lastMined:   map[int]uint64{},
+		unseenSince: make([]atomic.Int64, f.facts.Cells),
 		// The recovery seams, so a repair can be driven against the fixture's
 		// ledger rather than a wallet. See Engine.ledger.
 		ledger:         f.ledger,

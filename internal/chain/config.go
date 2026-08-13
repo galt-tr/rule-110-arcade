@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 
@@ -142,7 +143,36 @@ type Config struct {
 	// The cost is that the configured rate becomes advisory: when the network is
 	// slow to accept, cells wait and the reported lag climbs. That is the
 	// backpressure whose absence was the whole problem.
+	//
+	// The value is an open question rather than a constant, and 1 is the most
+	// cautious answer rather than a measured one. Against it: arcade v0.12+
+	// keys each dependency family to one partition and retries missing parents
+	// rather than rejecting for ordering alone; 1.54M transactions at up to
+	// 1,891/s produced zero ordering rejections; and this application has itself
+	// sustained 139-deep unconfirmed chains with none. See UnseenTimeout, then
+	// the depth ladder in the README.
 	MaxUnseenDepth uint64
+
+	// UnseenTimeout bounds how long the acceptance gate may hold one cell.
+	//
+	// Without it the gate has no exit. A status that never arrives blocks that
+	// cell for ever, and a status that never arrives is not hypothetical: arcade
+	// delivers over a single-goroutine SSE fan-out with an 8192-frame per-client
+	// buffer, and one block sweeping this many transactions emits a MINED burst
+	// an order of magnitude larger than that. It drops the overflow, and its
+	// mid-stream catch-up truncates at 10,000 frames — past which the events are
+	// gone from the stream for good.
+	//
+	// Nor does it take a dropped frame. Backlogged transactions SKIP the seen
+	// statuses entirely, going straight from RECEIVED to MINED when a block
+	// sweeps them, so a cell can wait a whole block interval on an
+	// acknowledgement that was never going to be sent.
+	//
+	// Past this deadline the cell advances anyway. A missing status then costs
+	// one slow cell instead of a stopped automaton — which is the trade the gate
+	// was always supposed to be making. 0 disables the deadline, restoring the
+	// wait-for-ever behaviour, and is not recommended.
+	UnseenTimeout time.Duration
 
 	// MaxLag bounds how far the clock may run ahead of the slowest cell before
 	// it stops asking for new generations. Without it, a rate the chain cannot
@@ -286,7 +316,11 @@ func DefaultConfig() Config {
 		// depth ÷ block interval.
 		MaxUnconfirmedDepth: 0,
 		// A cell waits for its own parent to be accepted before building on it.
-		MaxUnseenDepth:      1,
+		MaxUnseenDepth: 1,
+		// Roughly two block intervals. The gate is meant to make a cell wait for
+		// its parent, not to make it wait for an acknowledgement that is never
+		// coming — and past two blocks the difference is no longer in doubt.
+		UnseenTimeout:       10 * time.Minute,
 		MaxLag:              32,
 		FeeSatPerKB:         125,
 		MinBroadcastFeeRate: 100,
@@ -341,6 +375,13 @@ func (c *Config) Validate() error {
 	// alone: zero legitimately means "no depth limit".
 	if c.MaxLag == 0 {
 		c.MaxLag = DefaultConfig().MaxLag
+	}
+	// A negative duration would expire the acceptance gate on its first refusal,
+	// disabling it silently rather than loudly. Zero is a real choice — wait for
+	// ever — so only the nonsense is rejected.
+	if c.UnseenTimeout < 0 {
+		return fmt.Errorf("chain: unseen timeout must not be negative, got %s "+
+			"(0 means wait for ever; see Config.UnseenTimeout)", c.UnseenTimeout)
 	}
 	// Both of these are caught here because both fail a long way from their
 	// cause. A zero fee rate prices every transaction at nothing, and nothing

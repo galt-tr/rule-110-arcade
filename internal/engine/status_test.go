@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64
 		haltReason:  map[int]string{},
 		lastMined:   map[int]uint64{},
 		lastSeen:    map[int]uint64{},
+		unseenSince: make([]atomic.Int64, cells),
 		needsRepair: map[int]bool{},
 		retries:     map[int]retryState{},
 		// Persistence is asynchronous now, so the tests run the real writer

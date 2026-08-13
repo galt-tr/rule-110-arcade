@@ -179,6 +179,9 @@ Flags every subcommand accepts, beyond the five above:
                            (0 = unbounded). 1, the default, means a cell waits for its
                            parent to land before building on it — arcade's 202 is
                            "accepted for processing", not "in a mempool"
+  -unseen-timeout duration how long -max-unseen may hold one cell before it advances
+                           anyway (0 = wait for ever). The gate waits for something that
+                           is coming; a dropped or skipped status never is
   -max-lag uint            how far the clock may run ahead of the slowest cell
 
 Subcommand flags:
@@ -239,6 +242,8 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 		"how far a cell may run ahead of its newest mined transaction (0 = unbounded)")
 	fs.Uint64Var(&cfg.MaxUnseenDepth, "max-unseen", cfg.MaxUnseenDepth,
 		"how far a cell may run ahead of its newest ACCEPTED transaction (0 = unbounded); 1 means a cell waits for its parent to land")
+	fs.DurationVar(&cfg.UnseenTimeout, "unseen-timeout", cfg.UnseenTimeout,
+		"how long -max-unseen may hold one cell before it advances anyway (0 = wait for ever)")
 	fs.Uint64Var(&cfg.MaxLag, "max-lag", cfg.MaxLag,
 		"how far the clock may run ahead of the slowest cell")
 	fs.IntVar(&cfg.ApplyConcurrency, "apply-concurrency", cfg.ApplyConcurrency,

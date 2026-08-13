@@ -365,6 +365,18 @@ type Engine struct {
 	// Config.MaxUnseenDepth.
 	lastSeen map[int]uint64
 
+	// unseenSince[cell] is when the acceptance gate first refused this cell a
+	// turn, as Unix nanoseconds, or 0 while it is not refusing one. Past
+	// Config.UnseenTimeout the cell is let through anyway, so a status that never
+	// arrives costs one slow cell rather than a stopped one.
+	//
+	// Atomic rather than under e.mu, because turnReady runs under the READ lock
+	// and is called on every notify by every cell. Taking the write lock there
+	// would put all 256 workers back in a queue behind each other, which is the
+	// contention this file spent a day removing. A fixed-length slice is safe
+	// because the cell count cannot change while the engine runs.
+	unseenSince []atomic.Int64
+
 	// starvedSince is when funding ran out, or the zero time. lastProbe paces
 	// the single retry that resumes the automaton once coin arrives.
 	starvedSince time.Time
@@ -564,6 +576,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		rate:           startRate(opts),
 		lastMined:      make(map[int]uint64, d.Cells),
 		lastSeen:       make(map[int]uint64, d.Cells),
+		unseenSince:    make([]atomic.Int64, d.Cells),
 		changed:        make(chan struct{}),
 		txIndex:        make(map[string]txLoc),
 		halted:         make(map[int]bool),

@@ -192,6 +192,7 @@ func (e *Engine) turnReady(cell int) bool {
 		seen      = e.lastSeen[cell]
 		maxDeep   = e.chain.Config.MaxUnconfirmedDepth
 		maxUnseen = e.chain.Config.MaxUnseenDepth
+		timeout   = e.chain.Config.UnseenTimeout
 		leader    = e.leader
 		rederive  = e.needsRederive
 	)
@@ -249,9 +250,60 @@ func (e *Engine) turnReady(cell int) bool {
 	// unsigned integers tip-seen would then wrap to an enormous number and clamp
 	// the cell shut for ever, with nothing anywhere saying why.
 	if maxUnseen > 0 && tip > seen && tip-seen >= maxUnseen {
-		return false
+		if !e.unseenGateExpired(cell, timeout) {
+			return false
+		}
+		// Fall through: the acknowledgement is late enough that waiting longer
+		// is no longer telling us anything.
+	} else {
+		// Not gated, so any timer this cell was running is stale.
+		e.unseenSince[cell].Store(0)
 	}
 	return tip < target
+}
+
+// unseenGateExpired reports whether the acceptance gate has held this cell past
+// its deadline, starting the clock on the first refusal.
+//
+// The gate's whole purpose is to wait for something that is coming. It has no
+// answer for something that is NOT coming, and both halves of the status path
+// can produce that: arcade drops events it cannot fan out fast enough and its
+// catch-up truncates rather than replaying them all, and a backlogged
+// transaction skips the seen statuses entirely on its way to MINED. Either way
+// the cell waits on an acknowledgement no one will ever send.
+//
+// Letting it through is the lesser failure. Arcade keys a dependency family to
+// one partition and retries a missing parent rather than rejecting for ordering
+// alone, so arriving early costs a retry; waiting for ever costs the cell.
+//
+// Returning true RESETS the timer, so the next refusal starts a fresh deadline.
+// A cell whose status is genuinely lost then advances once per timeout rather
+// than freewheeling — still gated, just no longer stopped.
+func (e *Engine) unseenGateExpired(cell int, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false // deadline disabled; wait as long as it takes
+	}
+	now := time.Now()
+	since := e.unseenSince[cell].Load()
+	if since == 0 {
+		// First refusal. Start the clock and wait — a CAS rather than a Store so
+		// two concurrent callers cannot restart each other's deadline.
+		e.unseenSince[cell].CompareAndSwap(0, now.UnixNano())
+		return false
+	}
+	if now.Sub(time.Unix(0, since)) < timeout {
+		return false
+	}
+	if !e.unseenSince[cell].CompareAndSwap(since, 0) {
+		// Someone else took this expiry. One cell, one release.
+		return false
+	}
+	e.perf.unseenTimeouts.Inc()
+	e.logger.Warn("acceptance gate timed out; advancing without an acknowledgement",
+		"cell", cell, "waited", now.Sub(time.Unix(0, since)).Round(time.Second),
+		"timeout", timeout,
+		"cause", "arcade never delivered a status for this cell's newest transaction")
+	return true
 }
 
 // depthPoll is how often a cell re-checks its turn when the depth gate is
@@ -265,6 +317,47 @@ func (e *Engine) turnReady(cell int) bool {
 // gate is on: 128 cells waking four times a second is a real cost to carry for
 // a case the default configuration does not have.
 const depthPoll = 250 * time.Millisecond
+
+// wakeupDelay is how long this cell should sleep before re-testing its turn on a
+// timer, or 0 to sleep until something notifies it.
+//
+// A cell held by the acceptance gate has to wake for its own deadline, and this
+// is why it cannot rely on notify(). The deadline exists precisely for the case
+// where no status arrives — and no status means no notify. The clock's own ticks
+// are not a substitute either: when enough cells are stuck the clock stops
+// raising the target, so the one situation the deadline is for is the one
+// situation nothing else wakes anybody. That is the shape of the wedge this
+// fixes.
+//
+// It is a single timer per blocked cell, firing once when the deadline is
+// actually due, rather than the depth gate's blanket 250 ms poll — the cost the
+// depthPoll comment is careful about. Whichever is sooner wins.
+func (e *Engine) wakeupDelay(cell int, depthGated bool) time.Duration {
+	d := e.unseenWakeup(cell)
+	if depthGated && (d <= 0 || depthPoll < d) {
+		return depthPoll
+	}
+	return d
+}
+
+// unseenWakeup is how long until this cell's acceptance deadline expires, or 0
+// if it is not waiting on one.
+func (e *Engine) unseenWakeup(cell int) time.Duration {
+	timeout := e.chain.Config.UnseenTimeout
+	if timeout <= 0 {
+		return 0
+	}
+	since := e.unseenSince[cell].Load()
+	if since == 0 {
+		return 0
+	}
+	if remaining := time.Until(time.Unix(0, since).Add(timeout)); remaining > 0 {
+		return remaining
+	}
+	// Already due. Something else won the race back to the top of the loop;
+	// re-test promptly rather than sleeping on a deadline that has passed.
+	return time.Millisecond
+}
 
 // awaitTurn blocks until this cell should advance, or until ctx ends (returning
 // false).
@@ -316,10 +409,11 @@ func (e *Engine) awaitTurn(ctx context.Context, cell int) bool {
 			return true
 		}
 
-		// nil unless the depth gate is armed, and a nil channel never fires.
+		// nil unless something needs re-checking on a timer, and a nil channel
+		// never fires.
 		var poll <-chan time.Time
-		if gated {
-			poll = time.After(depthPoll)
+		if d := e.wakeupDelay(cell, gated); d > 0 {
+			poll = time.After(d)
 		}
 		select {
 		case <-ctx.Done():
