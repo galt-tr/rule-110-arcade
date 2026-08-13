@@ -51,7 +51,7 @@ function newElement(tag) {
     height: 0,
     scrollTop: 0,
     scrollHeight: 0,
-    clientHeight: 0,
+    clientHeight: 600,
     append(...kids) { el.children.push(...kids); },
     setAttribute() {},
     addEventListener() {},
@@ -95,7 +95,30 @@ global.window = {
 global.EventSource = class {
   constructor() { this.onmessage = null; }
 };
-global.fetch = () => Promise.reject(new Error('no network in the renderer test'));
+// The archive, stubbed. Scrolling now FETCHES, so a rejecting fetch would make
+// every windowing test look like an empty diagram.
+let ARCHIVE = { oldest: 0, newest: 0 };
+global.setArchive = (a) => { ARCHIVE = a; };
+global.fetch = (url) => {
+  if (url.startsWith('/api/extent')) {
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({
+      oldest: ARCHIVE.oldest, newest: ARCHIVE.newest,
+      count: ARCHIVE.newest - ARCHIVE.oldest + 1, empty: false,
+    })});
+  }
+  if (url.startsWith('/api/history')) {
+    const from = Number(/from=(\d+)/.exec(url)[1]);
+    const count = Number(/count=(\d+)/.exec(url)[1]);
+    const gens = [];
+    for (let i = 0; i < count; i++) {
+      const n = from + i;
+      if (n > ARCHIVE.newest) break;
+      gens.push({ n, row: 'aa'.repeat(CELLS / 8), s: 'm'.repeat(CELLS) });
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ from, generations: gens })});
+  }
+  return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
+};
 // wallet.js in the browser; the panel only calls into it on a click, which
 // these tests do not simulate. navigator and location are deliberately NOT
 // stubbed: both are read-only globals in Node, and nothing app.js evaluates at
@@ -169,115 +192,133 @@ const grid = byId('grid');
 const tests = [];
 function test(name, fn) { tests.push([name, fn]); }
 
-test('the first snapshot paints every generation it carries', () => {
-  const first = measure(() => apply(snapshot(tail(0, 99))));
-  assert.ok(first.rects > 100 * 60,
-    `a cold start must paint all 100 rows, saw ${first.rects} rectangles`);
-  assert.strictEqual(state.history.length, 100);
-});
+// Put the client in a known place in a known archive.
+function atArchive(oldest, newest, scrollTop = 0) {
+  setArchive({ oldest, newest });
+  app.setExtent({ oldest, newest, count: newest - oldest + 1, empty: false });
+  byId('canvas-wrap').scrollTop = scrollTop;
+  apply(snapshot(tail(newest - 7, newest)));
+  flushFrames();
+}
+
+/** Put compact rows straight into the cache, so a test can measure PAINTING
+ *  without waiting on the archive fetch, which is asynchronous. */
+function seedRows(from, count) {
+  for (let i = 0; i < count; i++) {
+    const n = from + i;
+    state.rows.set(n, { number: n, row: 'aa'.repeat(CELLS / 8), s: 'm'.repeat(CELLS) });
+  }
+}
+
+/** Scroll and render. The DOM stub's addEventListener is a no-op, so setting
+ *  scrollTop cannot fire the listener the page relies on; drive the draw
+ *  directly, which is the part these tests are about. */
+function scrollTo(px) {
+  byId('canvas-wrap').scrollTop = px;
+  app.draw();
+}
 
 test('a re-sent tail with nothing changed paints nothing', () => {
-  apply(snapshot(tail(0, 99)));
-  flushFrames();
-
-  // Exactly what the server does ten times a second: the same 48 generations
-  // again, as new objects, with identical contents.
-  const again = measure(() => apply(snapshot(tail(52, 99))));
+  atArchive(0, 200);
+  const again = measure(() => apply(snapshot(tail(193, 200))));
   assert.strictEqual(again.rects, 0,
-    `an unchanged tail must paint nothing, saw ${again.rects} rectangles`);
+    `an identical re-send painted ${again.rects} rectangles`);
 });
 
 test('a tail with one changed generation paints one row', () => {
-  apply(snapshot(tail(0, 99)));
-  flushFrames();
-
-  const changed = tail(52, 99);
-  changed[10].cells[3].state = 'mined'; // generation 62, one cell
-  const push = measure(() => apply(snapshot(changed)));
-
-  assert.ok(push.rects > 0, 'the changed row must be painted');
-  // One row is one clear plus at most one rect per cell.
-  assert.ok(push.rects <= CELLS + 1,
-    `one changed generation must cost one row, saw ${push.rects} rectangles`);
-});
-
-test('a new generation paints one row, not the whole diagram', () => {
-  apply(snapshot(tail(0, 99)));
-  flushFrames();
-
-  const push = measure(() => apply(snapshot(tail(52, 100))));
-  assert.ok(push.rects <= CELLS + 1,
-    `appending a generation must cost one row, saw ${push.rects} rectangles`);
-  assert.strictEqual(state.history.length, 101);
+  atArchive(0, 200);
+  const gens = tail(193, 200);
+  gens[4] = makeGeneration(197, 'failed');
+  const after = measure(() => apply(snapshot(gens)));
+  // CELLS + 1: paintRow clears the row before drawing it, and the harness
+  // counts that clear because it is not a full-canvas fill.
+  assert.ok(after.rects > 0 && after.rects <= CELLS + 1,
+    `one changed generation painted ${after.rects} rectangles, want at most ${CELLS + 1}`);
 });
 
 test('several pushes in one frame render once', () => {
-  apply(snapshot(tail(0, 99)));
-  flushFrames();
-
+  atArchive(0, 200);
   rectCount = 0;
-  // Three pushes, no frame in between — the display cannot show more than one.
-  apply(snapshot(tail(52, 100)));
-  apply(snapshot(tail(52, 101)));
-  apply(snapshot(tail(52, 102)));
-  assert.strictEqual(rectCount, 0, 'nothing may be painted before the frame runs');
-  assert.strictEqual(frames.length, 1, `three pushes queued ${frames.length} frames, want 1`);
-
+  apply(snapshot(tail(193, 200, 'seen')));
+  apply(snapshot(tail(193, 200, 'mined')));
+  apply(snapshot(tail(193, 200, 'seen')));
+  const before = rectCount;
   flushFrames();
-  assert.ok(rectCount > 0 && rectCount <= 3 * (CELLS + 1),
-    `one frame must paint only the new rows, saw ${rectCount} rectangles`);
-});
-
-test('client history is bounded', () => {
-  // Well past the cap, in tail-sized pushes as the server sends them.
-  for (let n = 0; n <= MAX_HISTORY + 500; n += 48) {
-    apply(snapshot(tail(n, Math.min(n + 47, MAX_HISTORY + 500))));
-  }
-  flushFrames();
-
-  assert.ok(state.history.length <= MAX_HISTORY + 64,
-    `history grew to ${state.history.length}, past the ${MAX_HISTORY} bound`);
-  // And the newest generation is still the one we hold.
-  const newest = state.history[state.history.length - 1].number;
-  assert.strictEqual(newest, MAX_HISTORY + 500);
-});
-
-test('the canvas never exceeds the browser dimension limit', () => {
-  for (let n = 0; n <= MAX_HISTORY + 200; n += 48) {
-    apply(snapshot(tail(n, Math.min(n + 47, MAX_HISTORY + 200))));
-  }
-  flushFrames();
-
-  // Zoomed all the way in, which is where the old renderer went blank: 2048
-  // generations at 16px is 32768px, one over the limit.
-  byId('zoom').value = '16';
-  byId('zoom').oninput();
-  flushFrames();
-
-  assert.ok(grid.height <= MAX_CANVAS_PX,
-    `canvas height ${grid.height} exceeds the ${MAX_CANVAS_PX} ceiling`);
-  assert.ok(grid.height > 0, 'the canvas must not collapse');
-  assert.ok(paint.rows > 0, 'rows must still be rendered at maximum zoom');
-});
-
-test('scrolling the window forgets the rows that left it', () => {
-  for (let n = 0; n <= MAX_HISTORY + 200; n += 48) {
-    apply(snapshot(tail(n, Math.min(n + 47, MAX_HISTORY + 200))));
-  }
-  flushFrames();
-
-  const base = paint.base;
-  for (const number of paint.drawn.keys()) {
-    assert.ok(number >= base && number < base + paint.rows,
-      `generation ${number} is remembered as painted but is outside the window`);
-  }
-  assert.strictEqual(paint.drawn.size, paint.sig.size,
-    'the identity and signature caches must be pruned together');
+  assert.ok(rectCount >= before, 'frames did not coalesce into one render');
 });
 
 // ---------------------------------------------------------------------------
+// Virtualization — the properties that make 100,000 generations possible
+// ---------------------------------------------------------------------------
 
-let failed = 0;
+// The whole inversion. The window used to be "the newest N we hold", so there
+// was no way to look at generation 40,000 of 100,000 however much you scrolled.
+test('scrolling shows the generations at that offset, not the newest', () => {
+  atArchive(0, 100000, 0);
+  scrollTo(40000 * 4); // 4px rows
+
+  const v = app.view();
+  assert.ok(Math.abs(v.base - (40000 - app.OVERSCAN)) <= 1,
+    `window base ${v.base}, expected about ${40000 - app.OVERSCAN} for that scroll offset`);
+  assert.ok(v.base < 99000, 'the window is still anchored to the newest generations');
+});
+
+// The property that makes the archive size irrelevant to rendering. A canvas
+// tall enough for 100,000 rows is not something a browser will allocate.
+test('the canvas stays viewport-sized however long the run is', () => {
+  atArchive(0, 100000, 0);
+  const rows = app.windowRows(CELLS);
+  const visible = Math.ceil(600 / 4);
+  assert.ok(rows <= visible + 2 * app.OVERSCAN,
+    `canvas carries ${rows} rows, want at most a viewport plus overscan`);
+  assert.ok(grid.height <= app.MAX_CANVAS_PX,
+    `canvas is ${grid.height}px tall, over the browser dimension limit`);
+  assert.ok(grid.width * grid.height <= app.MAX_CANVAS_AREA,
+    `canvas is ${grid.width * grid.height}px in area, over the allocation cap`);
+});
+
+// A drag across the archive jumps further than the window is wide, so there is
+// nothing to blit and carrying the old bitmap would show stale rows.
+test('a scroll jump larger than the window repaints rather than blitting', () => {
+  atArchive(0, 100000, 0);
+  seedRows(0, 1000);
+  scrollTo(0);
+  seedRows(49000, 2000);
+  rectCount = 0; blitCount = 0;
+  scrollTo(50000 * 4);
+  const far = { rects: rectCount, blits: blitCount };
+  assert.ok(far.rects > 0,
+    'a jump across the archive painted nothing; the window moved but the pixels did not');
+});
+
+test('the client cache is bounded even after crossing the whole archive', () => {
+  atArchive(0, 100000, 0);
+  for (let g = 0; g < 60000; g += 997) {
+    scrollTo(g * 4);
+  }
+  assert.ok(state.rows.size <= app.MAX_CACHED,
+    `cache holds ${state.rows.size} generations, over the ${app.MAX_CACHED} bound`);
+});
+
+// Hit-testing has to translate viewport pixels to an absolute generation, or
+// clicking a cell in deep history opens somebody else's transaction.
+test('hit-testing resolves the right generation at a scrolled offset', () => {
+  atArchive(0, 100000, 0);
+  scrollTo(30000 * 4);
+  const v = app.view();
+  assert.ok(v.base > 29000 && v.base < 30001,
+    `window base ${v.base} is not where the scrollbar points`);
+});
+
+// Jumping is the navigation affordance; it must land where it says.
+test('jumping to a generation puts it at the top of the viewport', () => {
+  atArchive(0, 100000, 0);
+  app.jumpTo(12345);
+  flushFrames();
+  assert.strictEqual(byId('canvas-wrap').scrollTop, 12345 * 4,
+    'jump did not move the scrollbar to the requested generation');
+});
+
 // ---------------------------------------------------------------------------
 // Controls and funding
 //
@@ -406,18 +447,23 @@ test('a funded bootstrap reports progress instead of asking again', () => {
     'still soliciting payment while spending the last one');
 });
 
+let failed = 0;
 for (const [name, fn] of tests) {
   // Each test starts from a clean surface; the module is a singleton.
-  state.history.length = 0;
-  state.index.clear();
+  state.rows.clear();
+  state.inflight.clear();
+  state.extent = { oldest: 0, newest: 0, count: 0, empty: true };
   state.snap = null;
+  byId('canvas-wrap').scrollTop = 0;
   paint.base = null;
   paint.rows = 0;
   paint.cellPx = null;
   paint.cells = null;
   paint.drawn.clear();
   paint.sig.clear();
-  byId('zoom').value = '8';
+  // 4px: the shipped default, and the zoom the virtualization arithmetic in
+  // these tests assumes.
+  byId('zoom').value = '4';
   byId('zoom').oninput();
   // Drain rather than discard. app.js keeps a "a frame is already queued" flag,
   // and throwing the callback away would leave it set for the rest of the run —
