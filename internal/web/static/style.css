@@ -19,14 +19,28 @@
      the pattern would be wrong. */
   --failed-dead: #5c2226;
 
-  /* The funding panel. Warm against a cold diagram, because it is the one part
-     of the page that asks the viewer for something. */
-  --fund-line: #6b5a2a;
+  /* The funding panel. It has three urgencies and they must be legible against
+     a dark diagram without shouting in the resting state. */
   --fund-good: #7fd6a0;
+  --fund-warn: #e8c46a;
+  --fund-warn-bg: #241f14;
   --fund-bad: var(--failed);
+  --fund-bad-bg: #2a1519;
 }
 
 * { box-sizing: border-box; }
+
+/* [hidden] has to win, and by default it does not.
+ *
+ * The UA stylesheet's `[hidden] { display: none }` is an ordinary author-beatable
+ * rule, so ANY rule here that sets `display` on the same element silently
+ * outranks it — and several do, because the footer controls are flex rows.
+ * The locked-controls change set `hidden` on the rate label and it stayed on
+ * screen: the property was set, the element was still displayed, and a
+ * deployment that refuses rate changes went on offering a rate slider.
+ *
+ * Not catchable by the renderer tests, which drive a DOM stub with no CSS. */
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
@@ -170,26 +184,71 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 /* ---------------------------------------------------------------------------
    Funding
 
-   Shown only when the deployment is actually asking for money -- bootstrapping
-   with nothing, or starved. app.js decides; this is only how it looks.
+   Always present, directly under the header and above the diagram. What changes
+   is urgency, not visibility: `low` and `stopped` are set by app.js from the
+   engine's own numbers. See renderFund for why this is not conditional.
    --------------------------------------------------------------------------- */
 
 #fund {
   margin: 0;
-  padding: 14px 16px;
+  padding: 10px 18px;
   background: var(--panel);
-  border-top: 1px solid var(--fund-line);
+  border-bottom: 1px solid var(--line);
+  /* A left rule is the whole escalation cue in the resting state: present
+     enough to read as part of the furniture, quiet enough not to compete with
+     the diagram, and already in place so that turning it amber or red is a
+     change of colour rather than a change of layout. */
+  border-left: 3px solid var(--line);
 }
 
-#fund h2 {
-  margin: 0 0 4px;
-  font-size: 14px;
+#fund.low {
+  border-left-color: var(--fund-warn);
+  background: var(--fund-warn-bg);
+}
+
+/* Stopped is the one state that may interrupt. The automaton is not running,
+   the diagram is frozen, and without this the page looks broken rather than
+   hungry. */
+#fund.stopped {
+  border-left-color: var(--fund-bad);
+  background: var(--fund-bad-bg);
+}
+
+#fund.working {
+  border-left-color: var(--fund-good);
+}
+
+.fund-bar {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.fund-msg { min-width: 0; }
+.fund-msg b { color: var(--text); }
+#fund.low .fund-msg b { color: var(--fund-warn); }
+#fund.stopped .fund-msg b { color: var(--fund-bad); }
+.fund-msg #fundWhy { display: block; }
+
+.fund-act {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* The button is the point of the panel, so it does not look like the zoom
+   control. Solid, not outlined. */
+#fundBtn {
+  background: var(--accent);
+  color: #06101c;
+  border-color: var(--accent);
   font-weight: 600;
-  color: var(--accent);
 }
-
-#fund p { margin: 0 0 10px; }
-.muted { color: var(--muted); font-size: 12px; }
+#fundBtn:hover:not(:disabled) { filter: brightness(1.1); }
+#fund.stopped #fundBtn { background: var(--fund-bad); border-color: var(--fund-bad); color: #fff; }
 
 .fund-row {
   display: flex;
@@ -199,7 +258,7 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   margin: 8px 0;
 }
 
-.fund-row label { color: var(--muted); font-size: 12px; }
+.muted { color: var(--muted); font-size: 12px; }
 
 #fund input[type="number"],
 #fund input[type="text"] {
@@ -211,7 +270,7 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   font: inherit;
 }
 #fund input[type="number"] { width: 12ch; }
-#fund input[type="text"] { flex: 1 1 40ch; min-width: 0; }
+#fund input[type="text"] { flex: 1 1 32ch; min-width: 0; }
 
 /* The address is the fallback path's whole payload, so it has to survive being
    selected, copied and read aloud. Wrapping beats truncation. */
@@ -225,7 +284,7 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   word-break: break-all;
 }
 
-.fund-status { font-size: 12px; color: var(--muted); }
+.fund-status { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
 .fund-status.good { color: var(--fund-good); }
 .fund-status.bad { color: var(--fund-bad); }
 
@@ -233,11 +292,10 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   cursor: pointer;
   color: var(--muted);
   font-size: 12px;
-  margin-top: 6px;
+  margin-top: 8px;
 }
 
 #fund button:disabled {
   opacity: 0.5;
   cursor: default;
-  border-color: var(--line);
 }

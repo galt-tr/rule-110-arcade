@@ -492,53 +492,99 @@ rate.onchange = () => control('rate', { rate: +rate.value });
  *  does not take public funding (the endpoint 404s). */
 let fundTarget = null;
 
-/** Show the panel when the deployment is actually asking for money: while it is
- *  bootstrapping and has none, or once it has run out. Not otherwise — a
- *  standing donation box on a healthy automaton is noise. */
+/** The funding panel, which is ALWAYS shown once we know funding is possible.
+ *
+ * It used to appear only when the automaton was starved or bootstrapping, and
+ * that was wrong twice over. It made "you can pay for this" look like an error
+ * state, when on a public exhibit it is the whole social contract — the thing
+ * runs on real fees and strangers keep it alive. And it hid the one control
+ * that matters at exactly the moment it mattered, because the panel sat below a
+ * canvas thousands of pixels tall: the automaton stopped, the page said so
+ * somewhere nobody was looking, and it simply appeared broken.
+ *
+ * So the panel is permanent and its URGENCY is what changes. Three states, and
+ * they escalate on evidence the engine already publishes:
+ *
+ *   stopped  starved — every cell is out of coin and nothing is advancing.
+ *   low      the pool cannot fund a full generation, or cells are already
+ *            retrying a shortfall. This is the LEADING indicator: starvation
+ *            is only declared after a 20-second grace, so without this the
+ *            page looks healthy right up until it halts.
+ *   (none)   running, funded, quietly fundable anyway.
+ */
 function renderFund(s) {
   const panel = document.getElementById('fund');
   if (!panel) return;
 
   // No target means /api/funding 404'd: this deployment does not take public
-  // funding, so the panel can never be useful. Hide it explicitly rather than
-  // returning and leaving whatever state it was in — that is correct only by
-  // accident of the markup starting hidden.
+  // funding, so the panel can never be useful.
   if (!fundTarget) {
     panel.hidden = true;
     return;
   }
+  panel.hidden = false;
 
-  const wanted = !!s.bootstrap || !!s.starved;
-  panel.hidden = !wanted;
-  if (!wanted) return;
-
-  const phase = s.bootstrap?.phase;
   const title = document.getElementById('fundTitle');
   const why = document.getElementById('fundWhy');
+  const btn = document.getElementById('fundBtn');
+  const boot = s.bootstrap;
+  const phase = boot?.phase;
 
+  // Mid-bootstrap and already paid: money has arrived and is being spent.
+  // Keep the panel up so the sequence is visible, but stop asking.
   if (phase && phase !== 'funding' && phase !== 'waiting') {
-    // Money has arrived and the deployment is spending it. Keep the panel up so
-    // the sequence is visible, but stop asking.
+    panel.className = 'working';
     title.textContent = phase === 'fuel' ? 'Minting fuel…' : 'Creating generation 0…';
-    why.textContent = 'Funded. This takes a few seconds.';
-    document.getElementById('fundBtn').disabled = true;
+    why.textContent = 'Funded — this takes a few seconds.';
+    btn.disabled = true;
+    return;
+  }
+  btn.disabled = false;
+
+  if (boot) {
+    panel.className = 'stopped';
+    const need = boot.minSatoshis || 0;
+    const have = boot.have || 0;
+    title.textContent = 'Nothing has run yet — fund it to start it';
+    why.textContent =
+      `It needs about ${need.toLocaleString()} sat to mint its first fuel and create ` +
+      `generation 0. It has ${have.toLocaleString()}.`;
     return;
   }
 
-  document.getElementById('fundBtn').disabled = false;
-  if (s.bootstrap) {
-    title.textContent = 'Fund this automaton to start it';
-    const need = s.bootstrap.minSatoshis || 0;
-    const have = s.bootstrap.have || 0;
+  if (s.starved) {
+    panel.className = 'stopped';
+    title.textContent = 'STOPPED — out of funds';
     why.textContent =
-      `Nothing has run yet. It needs about ${need.toLocaleString()} satoshis to mint ` +
-      `its first fuel and create generation 0; it has ${have.toLocaleString()}.`;
-  } else {
-    title.textContent = 'This automaton has run out of coin';
-    why.textContent =
-      'Every cell transition costs a fee, so it stops when the fuel pool empties. ' +
-      'Any amount restarts it.';
+      'Every cell transition costs a fee and the pool is empty, so the automaton has ' +
+      'halted. Any amount restarts it, and it resumes on its own.';
+    return;
   }
+
+  if (isLowOnFuel(s)) {
+    panel.className = 'low';
+    title.textContent = 'Running low on fuel';
+    why.textContent =
+      `${s.poolCoins.toLocaleString()} coins left and one funds one cell transition, so ` +
+      `there is under a generation in hand. It stops when they run out.`;
+    return;
+  }
+
+  panel.className = '';
+  title.textContent = 'Keep it running';
+  why.textContent =
+    `Every one of the ${s.cells} cells pays a fee to advance. ${s.poolCoins.toLocaleString()} ` +
+    `coins in hand. Anyone can top it up, any time.`;
+}
+
+/** Whether the pool can still fund a whole generation.
+ *
+ * One coin funds one cell transition, so fewer coins than cells means the next
+ * generation cannot complete — which is the honest definition of "low" here and
+ * is visible well before the engine declares starvation. waitingOnCoin catches
+ * the same thing from the other side: cells already retrying a shortfall. */
+function isLowOnFuel(s) {
+  return s.waitingOnCoin > 0 || (s.poolCoins || 0) < s.cells;
 }
 
 /** Say something to the payer, and leave it said. */

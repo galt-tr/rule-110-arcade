@@ -15,6 +15,43 @@
   <div class="stats" id="stats"></div>
 </header>
 
+<!-- Funding, directly under the header and ALWAYS present.
+     This deployment runs on real transaction fees and stops when they run out,
+     so "how do I give it money" is not an error path — it is a standing fact
+     about the thing, and the page says so at all times. It sits above the
+     diagram deliberately: the canvas is thousands of pixels tall, and anything
+     below it is invisible exactly when it matters most. -->
+<section id="fund" hidden>
+  <div class="fund-bar">
+    <div class="fund-msg">
+      <b id="fundTitle">Keep it running</b>
+      <span id="fundWhy" class="muted"></span>
+    </div>
+    <div class="fund-act">
+      <input id="fundAmount" type="number" min="0" step="1000" inputmode="numeric"
+             aria-label="amount in satoshis">
+      <span class="muted">sat</span>
+      <button id="fundBtn" type="button">Fund it</button>
+    </div>
+  </div>
+
+  <p id="fundStatus" class="fund-status" hidden></p>
+
+  <details id="fundManual">
+    <summary>No wallet? Pay by hand</summary>
+    <p class="muted">
+      Send to this address on <b id="fundNetwork">this network</b>, then paste the
+      transaction id once it is mined.
+    </p>
+    <code id="fundAddress" class="addr"></code>
+    <button id="fundCopy" type="button">copy</button>
+    <div class="fund-row">
+      <input id="fundTxid" type="text" placeholder="transaction id" spellcheck="false">
+      <button id="fundTxidBtn" type="button">Credit it</button>
+    </div>
+  </details>
+</section>
+
 <main>
   <div id="canvas-wrap">
     <div id="surface">
@@ -60,36 +97,6 @@
     <span class="key"><i class="sw failed-dead"></i>failed (dead cell)</span>
   </div>
 </footer>
-
-<!-- The funding panel. Hidden unless the deployment is asking for money: while
-     it is bootstrapping and has none, or once it has run out. -->
-<section id="fund" hidden>
-  <h2 id="fundTitle">Fund this automaton</h2>
-  <p id="fundWhy" class="muted"></p>
-
-  <div class="fund-row">
-    <label for="fundAmount">amount</label>
-    <input id="fundAmount" type="number" min="0" step="1000" inputmode="numeric">
-    <span class="muted">sat</span>
-    <button id="fundBtn" type="button">Fund with your wallet</button>
-  </div>
-
-  <p id="fundStatus" class="fund-status" hidden></p>
-
-  <details id="fundManual">
-    <summary>Pay by hand instead</summary>
-    <p class="muted">
-      Send to this address on <b id="fundNetwork">this network</b>, then paste the
-      transaction id once it is mined.
-    </p>
-    <code id="fundAddress" class="addr"></code>
-    <button id="fundCopy" type="button">copy</button>
-    <div class="fund-row">
-      <input id="fundTxid" type="text" placeholder="transaction id" spellcheck="false">
-      <button id="fundTxidBtn" type="button">Credit it</button>
-    </div>
-  </details>
-</section>
 
 <div id="err" hidden></div>
 <div id="tip" hidden></div>
