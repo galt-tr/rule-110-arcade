@@ -15,6 +15,7 @@
 /.[a-z]*.out
 /.[a-z]*.err
 /.[a-z]*.log
+/.[a-z]*.txt
 
 # Build output.
 /rule110
