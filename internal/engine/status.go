@@ -108,8 +108,11 @@ func (e *Engine) watchStatus(ctx context.Context) {
 // it — which is the difference between a diagram that is merely live and one
 // that is correct.
 func (e *Engine) reconcile(ctx context.Context) {
-	tick := time.NewTicker(10 * time.Second)
+	tick := time.NewTicker(reconcileInterval)
 	defer tick.Stop()
+
+	// Owned by this goroutine alone, so no lock. See reconcileLimit.
+	budget := reconcileLimit
 
 	for {
 		select {
@@ -126,13 +129,50 @@ func (e *Engine) reconcile(ctx context.Context) {
 		// and only a batch of them per pass, because the in-flight set grows
 		// with the automaton and a pass that outlasts its own interval never
 		// completes again.
-		pending, err := e.store.Stale(ctx, reconcileAfter, reconcileLimit)
+		pending, err := e.store.Stale(ctx, reconcileAfter, budget)
 		if err != nil {
 			e.logger.ErrorContext(ctx, "load stale transactions", "err", err)
 			continue
 		}
-		e.reconcileBatch(ctx, pending)
+
+		// Stamp before polling, not after. A pass cut short by its deadline must
+		// still have moved these rows to the back of the queue, or the same head
+		// of unanswerable transactions is re-selected every tick and hides the
+		// whole backlog behind it. See Store.MarkPolled.
+		if err := e.store.MarkPolled(ctx, txidsOf(pending)); err != nil {
+			e.logger.WarnContext(ctx, "mark polled", "err", err)
+		}
+
+		// A pass may not outlast its own cadence: overlapping passes would poll
+		// the same rows twice and multiply the load on the thing being repaired.
+		pass, cancel := context.WithTimeout(ctx, reconcileInterval)
+		e.reconcileBatch(pass, pending)
+		cancel()
+
+		budget = nextReconcileBudget(budget, len(pending))
 	}
+}
+
+// nextReconcileBudget sizes the following pass from how full this one came back.
+//
+// A saturated pass is the only evidence available that more is waiting — the
+// alternative, counting the backlog, is a second query over the same growing
+// table every tick. So: double while saturated, halve back toward the floor when
+// not. Convergence is quick in both directions and it costs nothing to measure.
+func nextReconcileBudget(budget, returned int) int {
+	if returned >= budget {
+		return min(budget*2, reconcileMaxLimit)
+	}
+	return max(budget/2, reconcileLimit)
+}
+
+// txidsOf is the transaction ids of a batch of rows, in order.
+func txidsOf(rows []history.CellTx) []string {
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.TxID)
+	}
+	return ids
 }
 
 // applyStatus records a status update against whichever cell owns the txid.
@@ -629,12 +669,26 @@ const (
 	// path and polling only duplicates its work.
 	reconcileAfter = 90 * time.Second
 
-	// reconcileLimit bounds one pass, and reconcileWorkers bounds how many
-	// arcade lookups are in flight at once. Serially, a pass over a large
-	// in-flight set takes hours; the point of the reconciler is to converge on
-	// arcade, and a pass that never finishes converges on nothing.
-	reconcileLimit   = 512
-	reconcileWorkers = 16
+	// reconcileInterval is how often a pass runs. A pass is also bounded by it,
+	// so one can never outlast its own cadence.
+	reconcileInterval = 10 * time.Second
+
+	// reconcileLimit is the FLOOR of one pass, and reconcileMaxLimit its ceiling.
+	// The budget between them moves with the backlog.
+	//
+	// A fixed 512 every 10 seconds is 51 repairs a second. Against 256
+	// transactions a second of broadcast that is not a safety net; it is a
+	// gesture, and it cannot close a gap it is five times too small to keep up
+	// with. But sizing for the worst case permanently would spend the whole
+	// budget re-polling a healthy system, so the pass grows only while it is
+	// coming back full — which is exactly the signal that more is waiting.
+	//
+	// The ceiling is what 32 workers can actually finish inside one interval at
+	// arcade's per-lookup latency, because GetTx is one HTTP round trip per
+	// transaction: arcade exposes no batch status query.
+	reconcileLimit    = 512
+	reconcileMaxLimit = 4096
+	reconcileWorkers  = 32
 )
 
 // reconcileBatch polls arcade for a batch of in-flight transactions.

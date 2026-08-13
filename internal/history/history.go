@@ -507,6 +507,42 @@ func (s *Store) Stale(ctx context.Context, age time.Duration, limit int) ([]Cell
 	return scanCells(rows)
 }
 
+// MarkPolled stamps rows the reconciler has picked up, so that a pass always
+// makes progress even when it resolves nothing.
+//
+// Stale orders by updated_at and the reconciler only writes a row when it
+// LEARNS something. So a transaction arcade cannot answer for — one it has not
+// ingested yet, or one it has genuinely lost — keeps its timestamp, stays at the
+// head of the ordering, and is re-selected at the front of every pass for ever.
+// A handful of those hide the entire backlog behind them while the counters say
+// the reconciler is working.
+//
+// Bumping updated_at moves a polled row to the back of the queue and, because
+// Stale also filters on it, gives each row a natural re-poll interval of the
+// caller's age bound rather than re-asking every tick. Call it BEFORE polling:
+// a pass that is cut short must still have advanced.
+func (s *Store) MarkPolled(ctx context.Context, txids []string) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString(`UPDATE cell_txs SET updated_at = ? WHERE status NOT IN ('mined', 'failed') AND txid IN (`)
+	args := make([]any, 0, len(txids)+1)
+	args = append(args, time.Now().UTC())
+	for i, id := range txids {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("?")
+		args = append(args, id)
+	}
+	b.WriteString(")")
+	if _, err := s.db.ExecContext(ctx, s.rebind(b.String()), args...); err != nil {
+		return fmt.Errorf("history: mark polled: %w", err)
+	}
+	return nil
+}
+
 // Load returns generations in [from, from+limit), newest-inclusive, with their
 // transactions attached.
 func (s *Store) Load(ctx context.Context, from uint64, limit int) ([]Generation, error) {
