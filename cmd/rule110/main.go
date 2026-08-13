@@ -162,9 +162,13 @@ Flags every subcommand accepts, beyond the five above:
   -cell-sats uint          satoshis each cell UTXO carries
   -max-db-conns int        storage connection pool size
   -apply-concurrency int   monitor workers applying arcade status batches
-  -full-status             subscribe to every status transition, not just the milestones.
-                           2x the events for an identical diagram, because the extra
-                           transitions all collapse onto one displayed state (default false)
+  -full-status             subscribe to every status transition, not just the milestones
+                           (default true). 2x the events, and it buys nothing for the
+                           DIAGRAM — the extra transitions collapse onto one displayed
+                           state. It buys the acceptance gate: ACCEPTED_BY_NETWORK is
+                           full-updates-only and releases -max-unseen 55x sooner than
+                           SEEN_ON_NETWORK does. Turn it off only once -max-unseen is deep
+                           enough that the gate is not in every generation's critical path
   -chronicle               verify with Chronicle-era script rules; required, because the
                            covenant contains OP_2MUL (default true)
   -fee-sat-per-kb int      fee rate, above arcade's 100 sat/kB floor
@@ -249,7 +253,8 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.IntVar(&cfg.ApplyConcurrency, "apply-concurrency", cfg.ApplyConcurrency,
 		"monitor workers applying arcade status batches")
 	fs.BoolVar(&cfg.FullStatusUpdates, "full-status", cfg.FullStatusUpdates,
-		"subscribe to every status transition, not just the milestones (2x the events for the same diagram)")
+		"subscribe to every status transition (2x the events; needed at a shallow -max-unseen, "+
+			"because ACCEPTED_BY_NETWORK releases the gate 55x sooner than SEEN_ON_NETWORK)")
 	fs.BoolVar(&cfg.LockControls, "lock-controls", envBool("RULE110_LOCK_CONTROLS", cfg.LockControls),
 		"refuse every play/pause/step/rate request; /api/control is unauthenticated, so this is the lock")
 	fs.BoolVar(&cfg.PublicFunding, "public-funding", envBool("RULE110_PUBLIC_FUNDING", cfg.PublicFunding),

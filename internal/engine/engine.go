@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"slices"
 	"sync"
@@ -928,6 +929,41 @@ const (
 	milestoneStatusPerTx = 2
 )
 
+// How long an acknowledgement takes to arrive, which is what the acceptance gate
+// waits for. Both are p50 from the same instrumented run.
+//
+// The gap between them is the whole reason -full-status is not simply a display
+// setting: ACCEPTED_BY_NETWORK is a full-updates-only transition, and it is the
+// FIRST status that releases the gate. Waiting for SEEN_ON_NETWORK instead means
+// waiting 55x longer.
+const (
+	ackLatencyFull      = 154 * time.Millisecond  // create → ACCEPTED_BY_NETWORK
+	ackLatencyMilestone = 8513 * time.Millisecond // create → SEEN_ON_NETWORK
+)
+
+// sustainableRate is the fastest a cell can advance when the acceptance gate is
+// in its critical path.
+//
+// A cell may run `depth` generations ahead of its newest acknowledged
+// transaction, and an acknowledgement takes `ack`, so it advances `depth`
+// generations per `ack` and no faster — however quick the code is, and whatever
+// rate was asked for. Depth 0 disables the gate, so nothing is capped.
+//
+// This is the arithmetic that makes -full-status and -max-unseen one decision
+// rather than two: halving the event volume by dropping ACCEPTED_BY_NETWORK
+// multiplies the acknowledgement latency by 55, and only a deeper gate absorbs
+// that.
+func sustainableRate(depth uint64, full bool) float64 {
+	if depth == 0 {
+		return math.Inf(1)
+	}
+	ack := ackLatencyMilestone
+	if full {
+		ack = ackLatencyFull
+	}
+	return float64(depth) / ack.Seconds()
+}
+
 // SetRate sets generations per second, clamped to something a chain can serve.
 func (e *Engine) SetRate(r float64) {
 	if e.opts.LockControls {
@@ -938,6 +974,7 @@ func (e *Engine) SetRate(r float64) {
 	e.rate = rate
 	cells := e.deployment.Cells
 	full := e.chain.Config.FullStatusUpdates
+	depth := e.chain.Config.MaxUnseenDepth
 	e.notify()
 	e.mu.Unlock()
 
@@ -952,7 +989,8 @@ func (e *Engine) SetRate(r float64) {
 	remedy := "lower the rate, or run fewer cells"
 	if full {
 		perTx = fullStatusMultiplier
-		remedy = "restart with -full-status=false, which halves this at no cost to the diagram"
+		remedy = "raise -max-unseen far enough that the acceptance gate is not per-generation, " +
+			"then -full-status=false halves this"
 	}
 	// The budget binds whether or not full updates are on. Guarding this warning
 	// on `full` meant the one configuration that CAN still outrun arcade — many
@@ -963,6 +1001,28 @@ func (e *Engine) SetRate(r float64) {
 			"rate", rate, "events_per_second", int(events), "budget", arcadeEventBudget,
 			"full_status", full, "remedy", remedy)
 	}
+
+	// The other ceiling, and the one that bites hardest when -full-status is
+	// turned off to relieve the first. It is not a throughput problem and does
+	// not look like one: every cell simply waits, the achieved rate settles far
+	// below the configured one, and nothing says why.
+	if s := sustainableRate(depth, full); rate > s {
+		e.logger.Warn("rate exceeds what the acceptance gate can release; cells will wait",
+			"rate", rate, "sustainable", math.Round(s*100)/100,
+			"max_unseen", depth, "full_status", full,
+			"why", "a cell advances -max-unseen generations per acknowledgement, and an "+
+				"acknowledgement takes "+ackFor(full).String(),
+			"remedy", "raise -max-unseen, or turn -full-status back on to be acknowledged on "+
+				"ACCEPTED_BY_NETWORK rather than waiting for SEEN_ON_NETWORK")
+	}
+}
+
+// ackFor is how long an acknowledgement takes under this subscription.
+func ackFor(full bool) time.Duration {
+	if full {
+		return ackLatencyFull
+	}
+	return ackLatencyMilestone
 }
 
 // Step asks every cell to advance exactly one generation.

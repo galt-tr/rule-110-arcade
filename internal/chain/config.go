@@ -222,21 +222,27 @@ type Config struct {
 	Throughput bool
 
 	// FullStatusUpdates asks arcade for every status transition rather than the
-	// milestones. It is OFF, because for this application it is a pure cost.
+	// milestones. It costs roughly double the event volume — 4 transitions per
+	// transaction rather than 2 — against a fan-out measured at ~1,500-1,700
+	// events/s, so it is not something to leave on without a reason.
 	//
-	// The diagram has five states, and stateFor collapses ACCEPTED_BY_NETWORK,
-	// SEEN_ON_NETWORK and SEEN_MULTIPLE_NODES onto ONE of them (TxSeen). So the
-	// extra transitions are discarded on arrival: we were paying roughly double
-	// the event volume — 4 events per transaction rather than 2 — to render
-	// exactly the same picture.
+	// There is a reason, and it is NOT the diagram. stateFor collapses
+	// ACCEPTED_BY_NETWORK, SEEN_ON_NETWORK and SEEN_MULTIPLE_NODES onto one
+	// displayed state, so as far as the picture is concerned the extra
+	// transitions are discarded on arrival.
 	//
-	// That volume is not free anywhere. Arcade's SSE fan-out is a single
-	// goroutine issuing one synchronous Postgres probe per event per client,
-	// measured at ~1,500-1,700 events/s, and every event we ask for and throw
-	// away is one it cannot spend on an event we need.
+	// It is MaxUnseenDepth. ACCEPTED_BY_NETWORK is a full-updates-only
+	// transition, and it is the FIRST status that releases the acceptance gate.
+	// Measured end to end: create → ACCEPTED is 154 ms at p50, while
+	// ACCEPTED → SEEN_ON_NETWORK is a further 8,513 ms. At depth 1 the gate sits
+	// in every generation's critical path, so that difference is the generation
+	// period itself — about 6 gen/s on ACCEPTED against about 0.12 on SEEN.
 	//
-	// Turn it on only at a low generation rate, where the extra transitions are
-	// affordable and might be interesting to watch.
+	// So the two settings are coupled, and the coupling runs one way: this may be
+	// turned off once MaxUnseenDepth is large enough that the gate is no longer
+	// per-generation. Roughly, sustainable rate ≈ depth ÷ acknowledgement
+	// latency. checkStatusBudget spells that out at startup rather than leaving
+	// it to be rediscovered as an unexplained 55x slowdown.
 	FullStatusUpdates bool
 
 	// ApplyConcurrency is how many workers the monitor uses to apply arcade
@@ -332,9 +338,13 @@ func DefaultConfig() Config {
 		// this number and it has to cover the keeper's own measure-and-mint
 		// latency. At 256 cells and 0.5 gen/s the ring burns 128 coins a second,
 		// so 20,000 bought 62 seconds of swing and 60,000 buys 187.
-		FuelPoolSize:      60000,
-		Throughput:        true,
-		FullStatusUpdates: false,
+		FuelPoolSize: 60000,
+		Throughput:   true,
+		// ON, and coupled to MaxUnseenDepth below rather than to the diagram:
+		// ACCEPTED_BY_NETWORK is a full-updates-only transition and the first one
+		// that releases the acceptance gate. At depth 1 that is worth roughly 55x
+		// the generation rate. See FullStatusUpdates.
+		FullStatusUpdates: true,
 		// ~512 status events a second at 128 tx/s with full updates. The toolbox
 		// default of 8 is documented as too low; 32 is adequate only if every
 		// apply is fast, and an applier that cannot drain the hand-off queue
