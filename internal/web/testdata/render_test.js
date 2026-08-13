@@ -537,6 +537,85 @@ test('no spinner when nothing is being minted', () => {
   assert.strictEqual(byId('fundSpin').hidden, true, 'the spinner runs when nothing is happening');
 });
 
+// --- a run that restarts ---------------------------------------------------
+//
+// These cover a live failure. A page left open across a restart kept measuring
+// its scrollbar against the run that was gone: `follow` pinned the viewport to
+// the bottom of a spacer sized for generations the archive no longer held, so
+// every row came back empty and nothing could be clicked. It looked exactly
+// like a dead deployment.
+
+/** Let the extent re-read (a fetch, therefore a promise chain) settle. */
+const settle = () => new Promise(r => setImmediate(r));
+
+test('a restarted run stops measuring the scrollbar against the old one', async () => {
+  atArchive(0, 800);
+  assert.strictEqual(state.extent.newest, 800, 'precondition: sized for the long run');
+
+  // The automaton restarts: the archive is now short, and the stream says the
+  // run is back near the beginning.
+  setArchive({ oldest: 0, newest: 100 });
+  apply(snapshot(tail(94, 100)));
+  await settle();
+
+  assert.strictEqual(state.extent.newest, 100,
+    `extent still claims ${state.extent.newest}; the spacer is sized for a run that no longer exists`);
+});
+
+test('a restart drops rows cached from the run that ended', async () => {
+  atArchive(0, 800);
+  seedRows(700, 50);
+  assert.ok(state.rows.has(720), 'precondition: the old run is cached');
+
+  setArchive({ oldest: 0, newest: 100 });
+  apply(snapshot(tail(94, 100)));
+  await settle();
+
+  assert.ok(!state.rows.has(720),
+    'a generation from the ended run survived; numbering restarts, so it would be drawn as the new run');
+});
+
+test('after a restart the viewport lands on generations that exist', async () => {
+  // The restarted run is still longer than the viewport, so where the view
+  // lands is a real choice rather than "all of it".
+  atArchive(0, 4000);
+  setArchive({ oldest: 0, newest: 400 });
+  apply(snapshot(tail(394, 400)));
+  await settle();
+
+  // Follow pins to the bottom of the spacer, which is what produced the blank
+  // page: the bottom of a spacer sized for 4,000 generations is nowhere near
+  // the 400 that survive.
+  const wrap = byId('canvas-wrap');
+  wrap.scrollHeight = state.extent.count * 4;
+  scrollTo(Math.max(0, wrap.scrollHeight - wrap.clientHeight));
+
+  // Measured against what the archive REALLY holds (0..400), not against the
+  // client's own belief — comparing a stale extent with itself always agrees,
+  // which is exactly how this shipped.
+  const v = app.view();
+  assert.ok(v.base >= 0 && v.base <= 400,
+    `the viewport is parked on generation ${v.base}, outside the 0..400 the archive holds — every row blank, no cell clickable`);
+  assert.ok(app.wanted().base <= 400,
+    `the archive is being asked for generation ${app.wanted().base}, past its end at 400`);
+});
+
+test('ordinary growth does not count as a restart', async () => {
+  atArchive(0, 200);
+  seedRows(150, 50);
+  const before = state.rows.size;
+  // The frontier advances; the archive is unchanged.
+  apply(snapshot(tail(201, 208)));
+  await settle();
+
+  assert.strictEqual(state.extent.newest, 208, 'the frontier should still lead the extent');
+  assert.ok(state.rows.size >= before,
+    'growing the run threw away the cache, so every scroll would refetch');
+});
+
+// Async-aware: the extent is re-read over the network, so the tests that cover
+// a restart have to be able to await it.
+(async () => {
 for (const [name, fn] of tests) {
   // Each test starts from a clean surface; the module is a singleton.
   state.rows.clear();
@@ -562,7 +641,7 @@ for (const [name, fn] of tests) {
   flushFrames();
 
   try {
-    fn();
+    await fn();
     console.log('ok   ' + name);
   } catch (err) {
     failed++;
@@ -575,3 +654,4 @@ if (failed) {
   process.exit(1);
 }
 console.log('all renderer tests passed');
+})();
