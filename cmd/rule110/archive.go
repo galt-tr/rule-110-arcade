@@ -31,6 +31,10 @@ func (a archive) Extent(ctx context.Context) (oldest, newest uint64, ok bool, er
 	return a.store.Extent(ctx)
 }
 
-func (a archive) TxID(ctx context.Context, generation uint64, cell int) (string, bool, error) {
-	return a.store.TxIDAt(ctx, generation, cell)
+func (a archive) Cell(ctx context.Context, generation uint64, cell int) (web.CellDetail, bool, error) {
+	d, ok, err := a.store.CellAt(ctx, generation, cell)
+	if err != nil || !ok {
+		return web.CellDetail{}, ok, err
+	}
+	return web.CellDetail{TxID: d.TxID, Status: d.Status, Err: d.Err}, true, nil
 }

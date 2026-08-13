@@ -165,20 +165,36 @@ func TestExtentReportsTheArchiveRange(t *testing.T) {
 	}
 }
 
-// The other half of dropping ids from the bulk payload: one id, on demand.
-func TestTxIDAtIsAPointLookup(t *testing.T) {
+// The other half of dropping ids from the bulk payload: one cell, on demand —
+// and it must carry the refusal reason as well as the id, because a failed cell
+// without its reason is a red square with nothing to say.
+func TestCellAtIsAPointLookup(t *testing.T) {
 	s := testStore(t)
 	seed(t, s, 3, 8)
 
-	txid, ok, err := s.TxIDAt(t.Context(), 1, 4)
+	d, ok, err := s.CellAt(t.Context(), 1, 4)
 	if err != nil || !ok {
-		t.Fatalf("TxIDAt: ok=%v err=%v", ok, err)
+		t.Fatalf("CellAt: ok=%v err=%v", ok, err)
 	}
-	if txid == "" {
+	if d.TxID == "" {
 		t.Error("no transaction id for a cell that has one")
 	}
+	if d.Status == "" {
+		t.Error("no status returned")
+	}
 
-	if _, ok, err := s.TxIDAt(t.Context(), 999, 0); err != nil || ok {
+	if err := s.UpdateStatus(t.Context(), d.TxID, StatusFailed, "arcade: REJECTED: nope"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+	again, ok, err := s.CellAt(t.Context(), 1, 4)
+	if err != nil || !ok {
+		t.Fatalf("CellAt after failure: ok=%v err=%v", ok, err)
+	}
+	if again.Err == "" {
+		t.Error("a refused cell reported no reason; that reason is what an outage is diagnosed from")
+	}
+
+	if _, ok, err := s.CellAt(t.Context(), 999, 0); err != nil || ok {
 		t.Errorf("a generation that never existed reported a transaction (ok=%v, err=%v)", ok, err)
 	}
 }

@@ -830,14 +830,16 @@ function cellAt(ev) {
  * page load from 25.5 MB to kilobytes, and this is the other half of that
  * trade. `cell_txs` is keyed on (generation, cell), so it is a point lookup. */
 const txCache = new Map();
-async function txidFor(number, cell) {
+/** Guards against a slow lookup overwriting a newer hover. */
+let hoverToken = 0;
+async function detailFor(number, cell) {
   const key = number + ':' + cell;
   if (txCache.has(key)) return txCache.get(key);
   try {
     const res = await fetch(`/api/tx?generation=${number}&cell=${cell}`);
-    const txid = res.ok ? (await res.json()).txid : null;
-    txCache.set(key, txid);
-    return txid;
+    const d = res.ok ? await res.json() : null;
+    txCache.set(key, d);
+    return d;
   } catch {
     return null;
   }
@@ -846,8 +848,8 @@ async function txidFor(number, cell) {
 canvas.onclick = async (ev) => {
   const hit = cellAt(ev);
   if (!hit || hit.stateChar === '-') return;
-  const txid = await txidFor(hit.number, hit.index);
-  if (txid) window.open(arcadeTxURL(txid), '_blank', 'noopener');
+  const d = await detailFor(hit.number, hit.index);
+  if (d && d.txid) window.open(arcadeTxURL(d.txid), '_blank', 'noopener');
 };
 
 canvas.onmousemove = (ev) => {
@@ -858,13 +860,29 @@ canvas.onmousemove = (ev) => {
 
   const bits = bitsOf(gen, state.snap.cells);
   const cellState = STATE_OF[hit.stateChar] || 'pending';
-  tip.innerHTML =
+  const head =
     `<b>cell ${c}</b> · generation ${number}<br>` +
-    `state: ${bits[c] ? 'alive' : 'dead'} · tx: ${cellState}<br>` +
-    (hit.stateChar !== '-' ? `<span class="hint">click to open in arcade</span>` : '');
+    `state: ${bits[c] ? 'alive' : 'dead'} · tx: ${cellState}<br>`;
+
+  // The id and the refusal reason are not in the bulk payload any more — that
+  // is the trade that made the archive viewable — so they are fetched for the
+  // cell under the pointer and cached. Render immediately with what is known,
+  // then fill them in: a tooltip that waits on a request is a tooltip that
+  // flickers.
+  tip.innerHTML = head;
   tip.hidden = false;
   tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 440) + 'px';
   tip.style.top = (ev.clientY + 14) + 'px';
+
+  if (hit.stateChar === '-') return;
+  const token = ++hoverToken;
+  detailFor(number, c).then((d) => {
+    // A later hover has already replaced this one; do not overwrite it.
+    if (token !== hoverToken || !d) return;
+    tip.innerHTML = head +
+      (d.txid ? `${d.txid}<br><span class="hint">click to open in arcade</span>` : '') +
+      (d.err ? `<br><span style="color:var(--failed)">${d.err}</span>` : '');
+  });
 };
 canvas.onmouseleave = () => { tip.hidden = true; };
 window.addEventListener('resize', scheduleRender);

@@ -24,8 +24,9 @@ type Archive interface {
 	Window(ctx context.Context, from uint64, count int, cells int) ([]CompactGeneration, error)
 	// Extent is the oldest and newest generation recorded.
 	Extent(ctx context.Context) (oldest, newest uint64, ok bool, err error)
-	// TxID is one cell's transaction, for a click.
-	TxID(ctx context.Context, generation uint64, cell int) (string, bool, error)
+	// Cell is one cell's transaction and, when it was refused, arcade's reason
+	// for refusing it — the two things the bulk payload leaves out.
+	Cell(ctx context.Context, generation uint64, cell int) (CellDetail, bool, error)
 }
 
 // CompactGeneration mirrors history.CompactGeneration, declared here so a test
@@ -77,10 +78,20 @@ type extentResponse struct {
 	Empty  bool   `json:"empty"`
 }
 
+// CellDetail mirrors history.CellDetail; declared here for the same reason the
+// other wire types are.
+type CellDetail struct {
+	TxID   string `json:"txid"`
+	Status string `json:"status"`
+	Err    string `json:"err,omitempty"`
+}
+
 type txResponse struct {
 	Generation uint64 `json:"generation"`
 	Cell       int    `json:"cell"`
 	TxID       string `json:"txid"`
+	Status     string `json:"status,omitempty"`
+	Err        string `json:"err,omitempty"`
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -160,9 +171,9 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	txid, ok, err := s.archive.TxID(r.Context(), generation, cell)
+	d, ok, err := s.archive.Cell(r.Context(), generation, cell)
 	if err != nil {
-		s.logger.Error("read transaction id", "generation", generation, "cell", cell, "err", err)
+		s.logger.Error("read cell detail", "generation", generation, "cell", cell, "err", err)
 		http.Error(w, "could not read the transaction", http.StatusInternalServerError)
 		return
 	}
@@ -170,7 +181,7 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	writeJSON(w, txResponse{Generation: generation, Cell: cell, TxID: txid})
+	writeJSON(w, txResponse{Generation: generation, Cell: cell, TxID: d.TxID, Status: d.Status, Err: d.Err})
 }
 
 // gzipPool reuses writers: the archive endpoint is called on every scroll, and

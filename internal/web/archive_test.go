@@ -51,14 +51,14 @@ func (f *fakeArchive) Extent(context.Context) (uint64, uint64, bool, error) {
 	return f.oldest, f.newest, !f.empty, nil
 }
 
-func (f *fakeArchive) TxID(_ context.Context, generation uint64, cell int) (string, bool, error) {
+func (f *fakeArchive) Cell(_ context.Context, generation uint64, cell int) (CellDetail, bool, error) {
 	if f.err != nil {
-		return "", false, f.err
+		return CellDetail{}, false, f.err
 	}
 	if generation > f.newest || cell < 0 {
-		return "", false, nil
+		return CellDetail{}, false, nil
 	}
-	return "abc123", true, nil
+	return CellDetail{TxID: "abc123", Status: "failed", Err: "arcade: REJECTED: no good"}, true, nil
 }
 
 func archiveServer(t *testing.T, a Archive) *httptest.Server {
@@ -192,6 +192,13 @@ func TestTxIDIsServedOnDemand(t *testing.T) {
 	}
 	if !strings.Contains(body, "abc123") {
 		t.Errorf("body = %s, want the transaction id", body)
+	}
+	// The refusal reason must come with it. A failed cell without its reason is
+	// a red square with nothing to say, and that reason is what an outage gets
+	// diagnosed from — it was in the old tooltip and must not be lost with the
+	// bulk payload.
+	if !strings.Contains(body, "REJECTED") {
+		t.Errorf("body = %s, want arcade's refusal reason alongside the id", body)
 	}
 
 	if code, _ := getBody(t, srv.URL+"/api/tx?generation=99999&cell=0"); code != http.StatusNotFound {

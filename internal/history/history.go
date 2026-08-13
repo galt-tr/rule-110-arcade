@@ -972,20 +972,30 @@ func (s *Store) Extent(ctx context.Context) (oldest, newest uint64, ok bool, err
 	return uint64(lo.Int64), uint64(hi.Int64), true, nil
 }
 
-// TxIDAt returns one cell's transaction id, and whether there is one.
+// CellDetail is everything about one cell that the bulk payload leaves out.
+type CellDetail struct {
+	TxID   string `json:"txid"`
+	Status string `json:"status"`
+	// Err is arcade's own words when the transition was refused. It is the
+	// point of asking: a failed cell without its reason is a red square with
+	// nothing to say, and that reason is what an outage is diagnosed from.
+	Err string `json:"err,omitempty"`
+}
+
+// CellAt returns one cell's transaction, and whether there is a row at all.
 //
 // The counterpart to LoadCompact dropping every id: this is a primary-key
-// equality hit on (generation, cell), so serving them one at a time on click
+// equality hit on (generation, cell), so serving them one at a time on demand
 // costs less than shipping them all did.
-func (s *Store) TxIDAt(ctx context.Context, generation uint64, cell int) (string, bool, error) {
-	var txid string
-	q := `SELECT txid FROM cell_txs WHERE generation = ? AND cell = ?`
-	err := s.db.QueryRowContext(ctx, s.rebind(q), generation, cell).Scan(&txid)
+func (s *Store) CellAt(ctx context.Context, generation uint64, cell int) (CellDetail, bool, error) {
+	var d CellDetail
+	q := `SELECT txid, status, err FROM cell_txs WHERE generation = ? AND cell = ?`
+	err := s.db.QueryRowContext(ctx, s.rebind(q), generation, cell).Scan(&d.TxID, &d.Status, &d.Err)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return "", false, nil
+		return CellDetail{}, false, nil
 	case err != nil:
-		return "", false, fmt.Errorf("history: txid at %d/%d: %w", generation, cell, err)
+		return CellDetail{}, false, fmt.Errorf("history: cell at %d/%d: %w", generation, cell, err)
 	}
-	return txid, txid != "", nil
+	return d, true, nil
 }
