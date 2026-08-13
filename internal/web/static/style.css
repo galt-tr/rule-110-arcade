@@ -97,7 +97,16 @@ main { flex: 1; display: flex; min-height: 0; }
   min-height: 0;
   padding: 12px 0 12px 0;
 }
-#surface { display: flex; align-items: flex-start; }
+/* The spacer. Its height is the whole run; it draws nothing. */
+#surface { position: relative; }
+/* And the part that stays in view. Sticky rather than fixed so it keeps the
+   scroller's coordinate space and the horizontal scrollbar still works. */
+#pinned {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: flex-start;
+}
 #gutter {
   position: sticky;
   left: 0;
@@ -139,6 +148,17 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 .zoom { display: flex; gap: 8px; align-items: center; color: var(--muted); }
 .zoom input { width: 110px; }
 .follow { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+.jump { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+.jump input {
+  width: 11ch;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+}
 
 .rate { display: flex; gap: 8px; align-items: center; color: var(--muted); }
 .rate input { width: 160px; }

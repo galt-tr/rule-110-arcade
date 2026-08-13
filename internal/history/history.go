@@ -851,3 +851,151 @@ func (s *Store) ReleaseLease(ctx context.Context, name, owner string) error {
 	}
 	return nil
 }
+
+// CompactGeneration is one row of the diagram with everything the RENDERER
+// needs and nothing else.
+//
+// States is one character per cell — the first letter of the status — rather
+// than a record per cell. That is the whole reason the archive is viewable:
+// measured on the live deployment, a generation carrying txids is 26,097 bytes
+// and 62% of that is the transaction ids, which the UI needs one at a time on
+// click and never in bulk. Dropping them takes a generation to ~350 bytes, and
+// the states compress to almost nothing because a settled row is the same
+// character 256 times.
+//
+// See TxIDAt for the other half: the id is a primary-key point lookup when
+// somebody actually asks for one.
+type CompactGeneration struct {
+	Number uint64 `json:"n"`
+	RowHex string `json:"row"`
+	// States has one character per cell, indexed by cell number: the status's
+	// first letter, or '-' for a cell with no record in that generation.
+	States string `json:"s"`
+}
+
+// noRecord is the state character for a cell that has no row in a generation.
+const noRecord = '-'
+
+// LoadCompact returns generations in [from, from+limit) without transaction ids.
+//
+// Deliberately NOT Load with the ids stripped afterwards: Load selects txid and
+// err, so the cost we are avoiding would already have been paid in the database,
+// over the wire and in Go's heap before anything got dropped. This selects the
+// three columns it needs over the same (generation, cell) primary key range
+// scan, so it is index-served without a new index.
+func (s *Store) LoadCompact(ctx context.Context, from uint64, limit int, cells int) ([]CompactGeneration, error) {
+	if limit <= 0 || cells <= 0 {
+		return nil, nil
+	}
+	q := `SELECT number, row_hex FROM generations
+	      WHERE number >= ? ORDER BY number LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), from, limit)
+	if err != nil {
+		return nil, fmt.Errorf("history: load compact generations: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		gens  []CompactGeneration
+		state []([]byte) // per generation, one byte per cell
+		index = map[uint64]int{}
+	)
+	for rows.Next() {
+		var g CompactGeneration
+		if err := rows.Scan(&g.Number, &g.RowHex); err != nil {
+			return nil, fmt.Errorf("history: scan compact generation: %w", err)
+		}
+		blank := make([]byte, cells)
+		for i := range blank {
+			blank[i] = noRecord
+		}
+		index[g.Number] = len(gens)
+		gens = append(gens, g)
+		state = append(state, blank)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history: load compact generations: %w", err)
+	}
+	if len(gens) == 0 {
+		return nil, nil
+	}
+
+	cq := `SELECT generation, cell, status FROM cell_txs
+	       WHERE generation >= ? AND generation <= ?`
+	crows, err := s.db.QueryContext(ctx, s.rebind(cq), gens[0].Number, gens[len(gens)-1].Number)
+	if err != nil {
+		return nil, fmt.Errorf("history: load compact cells: %w", err)
+	}
+	defer crows.Close()
+
+	for crows.Next() {
+		var (
+			gen    uint64
+			cell   int
+			status string
+		)
+		if err := crows.Scan(&gen, &cell, &status); err != nil {
+			return nil, fmt.Errorf("history: scan compact cell: %w", err)
+		}
+		i, ok := index[gen]
+		if !ok || cell < 0 || cell >= cells || status == "" {
+			continue
+		}
+		state[i][cell] = status[0]
+	}
+	if err := crows.Err(); err != nil {
+		return nil, fmt.Errorf("history: load compact cells: %w", err)
+	}
+
+	for i := range gens {
+		gens[i].States = string(state[i])
+	}
+	return gens, nil
+}
+
+// Extent reports the oldest and newest generation recorded, and whether there
+// are any at all.
+//
+// Deliberately not Stats, which counts rows: COUNT(*) is a full table scan on
+// PostgreSQL and cell_txs reaches tens of millions of rows on a long run. MIN
+// and MAX on a primary key are index reads. The scrollbar needs the extent on
+// every page load, so it has to be the cheap question.
+func (s *Store) Extent(ctx context.Context) (oldest, newest uint64, ok bool, err error) {
+	var lo, hi sql.NullInt64
+	q := `SELECT MIN(number), MAX(number) FROM generations`
+	if err := s.db.QueryRowContext(ctx, q).Scan(&lo, &hi); err != nil {
+		return 0, 0, false, fmt.Errorf("history: extent: %w", err)
+	}
+	if !lo.Valid || !hi.Valid {
+		return 0, 0, false, nil
+	}
+	return uint64(lo.Int64), uint64(hi.Int64), true, nil
+}
+
+// CellDetail is everything about one cell that the bulk payload leaves out.
+type CellDetail struct {
+	TxID   string `json:"txid"`
+	Status string `json:"status"`
+	// Err is arcade's own words when the transition was refused. It is the
+	// point of asking: a failed cell without its reason is a red square with
+	// nothing to say, and that reason is what an outage is diagnosed from.
+	Err string `json:"err,omitempty"`
+}
+
+// CellAt returns one cell's transaction, and whether there is a row at all.
+//
+// The counterpart to LoadCompact dropping every id: this is a primary-key
+// equality hit on (generation, cell), so serving them one at a time on demand
+// costs less than shipping them all did.
+func (s *Store) CellAt(ctx context.Context, generation uint64, cell int) (CellDetail, bool, error) {
+	var d CellDetail
+	q := `SELECT txid, status, err FROM cell_txs WHERE generation = ? AND cell = ?`
+	err := s.db.QueryRowContext(ctx, s.rebind(q), generation, cell).Scan(&d.TxID, &d.Status, &d.Err)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return CellDetail{}, false, nil
+	case err != nil:
+		return CellDetail{}, false, fmt.Errorf("history: cell at %d/%d: %w", generation, cell, err)
+	}
+	return d, true, nil
+}

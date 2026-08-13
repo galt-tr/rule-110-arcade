@@ -9,6 +9,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -62,6 +63,11 @@ type Server struct {
 	engine Automaton
 	logger *slog.Logger
 
+	// archive is nil unless durable history is configured, and the archive
+	// routes 404 when it is. It is what lets the UI reach past the engine's live
+	// ring into the whole run.
+	archive Archive
+
 	// funder is nil unless public funding is configured, and the two funding
 	// routes 404 when it is. A deployment that does not want the surface does
 	// not have it, rather than having it and refusing.
@@ -77,6 +83,11 @@ type Option func(*Server)
 // WithFunder enables POST /api/fund and GET /api/funding.
 func WithFunder(f Funder) Option {
 	return func(s *Server) { s.funder = f }
+}
+
+// WithArchive enables the history endpoints the scrollbar reads.
+func WithArchive(a Archive) Option {
+	return func(s *Server) { s.archive = a }
 }
 
 // withClock replaces the rate limiter's clock, so its behaviour over time can
@@ -109,6 +120,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/control", s.handleControl)
 	// Registered unconditionally and 404 when no funder is configured, so the
 	// route table does not depend on construction order.
+	// The archive: a window anywhere in the run, its extent, and one
+	// transaction id on demand. Together these are what make a scrollbar over
+	// 100,000 generations possible; see internal/web/archive.go.
+	mux.HandleFunc("GET /api/history", s.handleHistory)
+	mux.HandleFunc("GET /api/extent", s.handleExtent)
+	mux.HandleFunc("GET /api/tx", s.handleTx)
 	mux.HandleFunc("GET /api/funding", s.handleFundingTarget)
 	mux.HandleFunc("POST /api/fund", s.handleFund)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -141,8 +158,16 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.engine.Snapshot())
+// handleState is the scalars plus the live edge — NOT the whole ring.
+//
+// It used to return every generation the engine held, which measured 25.5 MB on
+// the live deployment: 1,024 generations at 26,097 bytes each, 62% of it
+// transaction ids, on every page load. Deep history now comes from
+// /api/history, in a form that drops the ids and compresses, so there is
+// nothing left for this to carry beyond enough rows to draw the live edge
+// before the first archive window arrives.
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	s.writeJSONGzip(w, r, s.engine.SnapshotTail())
 }
 
 // handleEvents streams snapshots as they change.
@@ -289,8 +314,15 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	encodeJSON(w, v)
+}
+
+// encodeJSON writes v, shared by the plain and gzipped paths.
+func encodeJSON(w io.Writer, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		http.Error(w, "encode error", http.StatusInternalServerError)
+		if rw, ok := w.(http.ResponseWriter); ok {
+			http.Error(rw, "encode error", http.StatusInternalServerError)
+		}
 	}
 }
 

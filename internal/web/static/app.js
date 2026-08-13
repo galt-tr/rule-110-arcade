@@ -31,23 +31,42 @@ const COLOR = {
   failedDead: color('--failed-dead', '#5c2226'),
 };
 
-/** How many generations the client keeps. Matches the server's own bound
- *  (engine.maxHistory); holding more than the server will ever send is memory
- *  spent on generations that can never be refreshed.
+/** How many generations the client caches, across the WHOLE archive.
  *
- * The client used to keep everything it was ever sent, which is a slow fuse:
- * canvas height is generations x cellPx, browsers refuse a dimension over about
- * 32767px, and past that the diagram does not degrade — it goes blank. */
-const MAX_HISTORY = 1024;
+ * Not a window on the newest rows any more — an LRU over wherever the viewer
+ * has been. The diagram is scrolled, not tailed, so the useful thing to keep is
+ * what is near the scroll position, and what falls out is re-fetched in a
+ * request that costs about ten kilobytes.
+ *
+ * Each cached generation is a row of hex and one status character per cell —
+ * ~350 bytes — rather than 256 objects carrying transaction ids. That is what
+ * makes holding thousands of them affordable at all. */
+const MAX_CACHED = 8192;
 
-/** Trimming reindexes, so trim in chunks rather than once per generation. */
-const TRIM_SLACK = 64;
+/** How long the scroll must be still before the archive is asked for anything.
+ *
+ * Dragging the scrollbar across the run redraws every frame, and every frame
+ * lands on a window nobody has cached. Fetching per frame measured at 59
+ * requests and ~8.3 million cell_txs rows scanned for ONE second of one user
+ * flinging the bar — far more load than ten people reading. Waiting for the
+ * motion to stop turns that into a single request for the window they actually
+ * landed on. Painting is NOT deferred: whatever is already cached draws
+ * immediately, so the diagram still moves under the cursor. */
+const FETCH_SETTLE_MS = 120;
+
+/** How many rows to render beyond the viewport, above and below.
+ *
+ * Scrolling within the overscan repaints nothing. It is the difference between
+ * a drag that feels continuous and one that fetches on every frame. */
+const OVERSCAN = 200;
 
 /** Ceiling on either canvas dimension, under the browsers' ~32767px limit.
  *
- * At 16px cells 2048 generations would be 32768px — one pixel over, and blank.
- * Rather than cap the history and lose it, cap what is RENDERED: zoomed all the
- * way in you see fewer rows, and zooming out brings them back. */
+ * It no longer bounds what is VIEWABLE — the canvas is the size of the viewport
+ * plus overscan, and the scrollbar comes from an empty spacer as tall as the
+ * whole run. This survives as a floor-of-last-resort so a very tall window or a
+ * very large zoom cannot produce a canvas the browser silently refuses to
+ * allocate, which does not degrade — it goes blank. */
 const MAX_CANVAS_PX = 32000;
 
 /** Ceiling on canvas AREA, in pixels.
@@ -65,6 +84,7 @@ const canvas = document.getElementById('grid');
 const ctx = canvas.getContext('2d');
 const tip = document.getElementById('tip');
 const wrap = document.getElementById('canvas-wrap');
+const surface = document.getElementById('surface');
 
 // 4px, not 8. Width is cells x cellPx and the ring is 256: at 8px the diagram
 // opens 2048px wide, which is wider than most viewports, so the live edge starts
@@ -73,15 +93,30 @@ const wrap = document.getElementById('canvas-wrap');
 let cellPx = 4;       // driven by the zoom control, not the viewport
 let follow = true;    // auto-scroll only while pinned to the newest row
 
-/** Everything the client holds, accumulated across pushes.
+/** Everything the client holds.
  *
- * `snap` is the newest scalars; `history` is every generation we have been sent,
- * ascending; `index` maps a generation number to its position so a tail merges
- * without rebuilding and re-sorting the whole array each time. */
+ * `snap` is the newest scalars. `rows` is an LRU cache of COMPACT generations
+ * keyed by generation number — `{number, row, s}` where `s` is one status
+ * character per cell — filled from /api/history as the viewer scrolls and from
+ * the live stream at the frontier. `extent` is what the archive says it holds,
+ * and is what the scrollbar measures.
+ *
+ * There is deliberately no array and no index: position is arithmetic on the
+ * generation number now, so nothing has to be kept sorted. */
 const state = {
   snap: null,
-  history: [],
-  index: new Map(),
+  rows: new Map(),
+  extent: { oldest: 0, newest: 0, count: 0, empty: true },
+  /** Ranges already requested, so a drag does not ask twice. */
+  inflight: new Set(),
+};
+
+/** Status character -> palette key. The compact archive uses the first letter
+ *  of the stored status and '-' for a cell with no record; the live stream uses
+ *  the first letter of the display state. Both land here. */
+const STATE_OF = {
+  m: 'mined', s: 'seen', b: 'broadcast', f: 'failed',
+  a: 'pending', p: 'pending', '-': 'pending',
 };
 
 /** What is currently ON the canvas bitmap, which is not the same thing as what
@@ -103,23 +138,18 @@ const paint = {
   sig: new Map(),
 };
 
-/** Everything about a generation that reaches the canvas: the row's bits, and
- *  each cell's transaction state. `err` is deliberately absent — it shows in the
- *  tooltip, never in a pixel. */
-function signatureOf(gen, cells) {
-  const genCells = gen.cells || [];
-  // States are pending/broadcast/seen/mined/failed, distinct in their first
-  // character, so one char per cell is a faithful signature.
-  let sig = (gen.row || '') + '|';
-  for (let i = 0; i < cells; i++) {
-    const cell = genCells[i];
-    sig += cell && cell.state ? cell.state[0] : 'p';
-  }
-  return sig;
+/** Everything about a generation that reaches the canvas.
+ *
+ * Now literally the stored form: the row's bits and one status character per
+ * cell. Building a signature used to mean walking 256 objects; it is now a
+ * string concatenation, because that IS the representation. */
+function signatureOf(gen) {
+  return (gen.row || '') + '|' + (gen.s || '');
 }
 
-/** The generations actually rendered, newest last. Hit-testing reads this. */
-let view = [];
+/** The window currently on the canvas: first generation number and count.
+ *  Hit-testing and the gutter read this. */
+let view = { base: 0, rows: 0 };
 
 /** Unpack a hex row into a bit array, cell 0 first (matches the contract).
  *
@@ -127,7 +157,7 @@ let view = [];
  * invalidated the only way it can go stale: a generation whose row changed
  * arrives as a new object. */
 function bitsOf(gen, cells) {
-  if (gen._bits && gen._bits.length === cells) return gen._bits;
+  if (gen._bits && gen._bits.length === cells && gen._bitsRow === gen.row) return gen._bits;
   const hex = gen.row || '';
   const bits = new Uint8Array(cells);
   for (let i = 0; i < cells; i++) {
@@ -135,62 +165,127 @@ function bitsOf(gen, cells) {
     bits[i] = (byte >> (i % 8)) & 1;
   }
   gen._bits = bits;
+  gen._bitsRow = gen.row;
   return bits;
 }
 
-/** Merge a pushed snapshot into what we already hold.
+/** Fold a pushed snapshot into the cache.
  *
- * Updates carry only a recent tail, so replacing the array wholesale would throw
- * away everything the viewer scrolled back to look at. Generations are keyed by
- * their number and the incoming copy wins. */
+ * The stream carries the newest few generations in full, with a record per
+ * cell; the archive carries everything in the compact form. Both are reduced to
+ * the compact form HERE so that exactly one representation reaches the
+ * renderer — the alternative is two code paths for drawing the same pixels,
+ * differing only near the frontier, which is precisely where a bug would be
+ * least visible.
+ *
+ * Live data WINS over cached: near the frontier the stream's status is fresher
+ * than whatever the archive returned when the window was fetched.
+ */
 function ingest(s) {
   state.snap = s;
-  const incoming = s.history || [];
-  let disordered = false;
-
-  for (const g of incoming) {
-    const at = state.index.get(g.number);
-    if (at !== undefined) {
-      state.history[at] = g;
-      continue;
+  const cells = s.cells || 0;
+  for (const g of s.history || []) {
+    const genCells = g.cells || [];
+    let chars = '';
+    for (let i = 0; i < cells; i++) {
+      const c = genCells[i];
+      chars += c && c.state ? c.state[0] : 'p';
     }
-    const last = state.history[state.history.length - 1];
-    if (last && g.number < last.number) disordered = true;
-    state.index.set(g.number, state.history.length);
-    state.history.push(g);
+    state.rows.set(g.number, { number: g.number, row: g.row, s: chars });
   }
+  // The stream is the authority on how far the run has got.
+  if (typeof s.generation === 'number' && s.generation > state.extent.newest) {
+    state.extent.newest = s.generation;
+    state.extent.count = state.extent.newest - state.extent.oldest + 1;
+    state.extent.empty = false;
+  }
+  trimCache();
+}
 
-  // A tail is contiguous and ascending, so this is the path that never runs —
-  // but a reconnect that replays an older window would otherwise leave the
-  // array unsorted, and every row would be drawn at the wrong height.
-  if (disordered) {
-    state.history.sort((a, b) => a.number - b.number);
-    reindex();
-  }
-  if (state.history.length > MAX_HISTORY + TRIM_SLACK) {
-    state.history = state.history.slice(state.history.length - MAX_HISTORY);
-    reindex();
+/** Bound the cache. Evicts whatever is furthest from the current window, since
+ *  that is the least likely to be scrolled back to. */
+function trimCache() {
+  if (state.rows.size <= MAX_CACHED) return;
+  const centre = view.base + view.rows / 2;
+  const keys = [...state.rows.keys()].sort(
+    (a, b) => Math.abs(b - centre) - Math.abs(a - centre));
+  for (let i = 0; i < keys.length && state.rows.size > MAX_CACHED; i++) {
+    state.rows.delete(keys[i]);
   }
 }
 
-function reindex() {
-  state.index.clear();
-  for (let i = 0; i < state.history.length; i++) {
-    state.index.set(state.history[i].number, i);
-  }
-}
-
-/** How many rows fit under the canvas ceilings at this zoom.
+/** How many rows the canvas should carry: the viewport plus overscan either
+ *  side, clamped to what a canvas can actually be.
  *
- * Two limits, and the area one only exists because the ring got wider: the
- * height cap alone is satisfied by a canvas far too large to allocate once the
- * width is a couple of thousand pixels. Whichever binds first wins; zooming out
- * relaxes both. */
-function renderableRows(cells) {
+ * This is the change that makes the whole archive viewable. The canvas used to
+ * be as tall as the history, which put a hard ceiling on the history at ~32,000
+ * rows (3,906 at the default zoom, area-limited) and 100,000 flatly out of
+ * reach. It is now the size of what you can see, and the scrollbar comes from an
+ * empty spacer instead — so the number of generations stops being a rendering
+ * problem at all. */
+function windowRows(cells) {
+  const visible = Math.ceil((wrap.clientHeight || 600) / cellPx);
+  const want = visible + 2 * OVERSCAN;
   const byHeight = Math.floor(MAX_CANVAS_PX / cellPx);
   const width = Math.max(1, (cells || 1) * cellPx);
   const byArea = Math.floor(MAX_CANVAS_AREA / (width * cellPx));
-  return Math.max(1, Math.min(byHeight, byArea));
+  return Math.max(1, Math.min(want, byHeight, byArea));
+}
+
+/** The window the viewer most recently landed on, and the timer that asks for
+ *  it. See FETCH_SETTLE_MS. */
+let wanted = null;
+let fetchTimer = null;
+function scheduleFetch() {
+  if (fetchTimer) clearTimeout(fetchTimer);
+  fetchTimer = setTimeout(() => {
+    fetchTimer = null;
+    if (wanted) ensureRows(wanted.base, wanted.rows);
+  }, FETCH_SETTLE_MS);
+}
+
+/** Ask the archive for any generation in [from, from+count) we do not hold.
+ *
+ * Requests are issued per missing RUN rather than per generation, and a run
+ * already in flight is not asked for twice — a drag crosses hundreds of
+ * generations and would otherwise issue hundreds of requests. */
+async function ensureRows(from, count) {
+  if (state.extent.empty) return;
+  const lo = Math.max(from, state.extent.oldest);
+  const hi = Math.min(from + count - 1, state.extent.newest);
+  if (hi < lo) return;
+
+  const runs = [];
+  let start = null;
+  for (let n = lo; n <= hi; n++) {
+    const have = state.rows.has(n);
+    if (!have && start === null) start = n;
+    if ((have || n === hi) && start !== null) {
+      runs.push([start, (have ? n - 1 : n)]);
+      start = null;
+    }
+  }
+
+  for (const [a, b] of runs) {
+    const key = a + ':' + b;
+    if (state.inflight.has(key)) continue;
+    state.inflight.add(key);
+    try {
+      const res = await fetch(`/api/history?from=${a}&count=${b - a + 1}`);
+      if (!res.ok) continue;
+      const body = await res.json();
+      for (const g of body.generations || []) {
+        // Never overwrite a live row: the stream is fresher at the frontier.
+        if (!state.rows.has(g.n)) state.rows.set(g.n, { number: g.n, row: g.row, s: g.s });
+      }
+      trimCache();
+      scheduleRender();
+    } catch {
+      /* a failed window simply stays blank and is retried on the next scroll */
+    } finally {
+      state.inflight.delete(key);
+    }
+  }
 }
 
 /** Bring the bitmap's geometry in line with the window about to be drawn,
@@ -230,6 +325,10 @@ function reflow(base, rows, cells) {
 
   canvas.style.width = w + 'px';
   canvas.style.height = h + 'px';
+  // The spacer is what the scrollbar measures: as tall as the WHOLE run, while
+  // the canvas above stays the size of a viewport. This is the trick that makes
+  // 100,000 generations scrollable at all.
+  surface.style.height = Math.max(1, state.extent.count * cellPx) + 'px';
 
   // Rows that scrolled out of the window are no longer on the bitmap, whatever
   // the blit left behind; forget them so they repaint if they come back.
@@ -260,10 +359,9 @@ function paintRow(gen, row, cells) {
   ctx.fillStyle = COLOR.dead;
   ctx.fillRect(0, y, cells * cellPx, cellPx);
 
-  const genCells = gen.cells || [];
+  const chars = gen.s || '';
   for (let c = 0; c < cells; c++) {
-    const cell = genCells[c];
-    const cellState = cell ? cell.state : 'pending';
+    const cellState = STATE_OF[chars[c]] || 'pending';
     // A dead cell is background regardless of its transaction — the pattern
     // has to stay readable as a pattern first — with one exception. A failure
     // is a fact about the chain, not about the automaton, and roughly half of
@@ -283,51 +381,69 @@ function paintRow(gen, row, cells) {
  *  depend on transaction state, so a push that only changes colours leaves them
  *  alone. */
 const gutterState = { base: null, rows: null, cellPx: null };
-function drawGutter(rows) {
-  const base = rows.length ? rows[0].number : 0;
-  if (gutterState.base === base && gutterState.rows === rows.length &&
+function drawGutter(base, rows) {
+  if (gutterState.base === base && gutterState.rows === rows &&
       gutterState.cellPx === cellPx) {
     return;
   }
   const g = document.getElementById('gutter');
   const every = Math.max(1, Math.ceil(14 / cellPx));
-  const lines = rows.map((gen, i) =>
-    (i % every === 0 ? String(gen.number).padStart(6) : ''));
+  // padStart(8), not 6: six digits stops aligning at a million generations,
+  // which at half a generation per second is under a month away.
+  const lines = [];
+  for (let i = 0; i < rows; i++) {
+    lines.push(i % every === 0 ? String(base + i).padStart(8) : '');
+  }
   g.style.lineHeight = cellPx + 'px';
   g.style.fontSize = Math.min(10, Math.max(6, cellPx)) + 'px';
   g.textContent = lines.join('\n');
   gutterState.base = base;
-  gutterState.rows = rows.length;
+  gutterState.rows = rows;
   gutterState.cellPx = cellPx;
 }
 
 function draw() {
   const s = state.snap;
   if (!s) return;
-  document.getElementById('empty').hidden = state.history.length > 0;
+  const cells = s.cells || 0;
 
-  const limit = renderableRows(s.cells);
-  view = state.history.length > limit
-    ? state.history.slice(state.history.length - limit)
-    : state.history;
+  // Where the viewer is, in generations. This is the whole inversion: the
+  // window used to be "the newest N we hold", so there was no way to look at
+  // generation 40,000 of 100,000. It is now wherever the scrollbar is.
+  const rows = windowRows(cells);
+  const firstVisible = Math.floor(wrap.scrollTop / cellPx);
+  let base = state.extent.oldest + firstVisible - OVERSCAN;
+  base = Math.max(state.extent.oldest, base);
+  if (base + rows > state.extent.newest + 1) {
+    base = Math.max(state.extent.oldest, state.extent.newest + 1 - rows);
+  }
 
-  // Decide BEFORE resizing: once the canvas grows, the old scrollTop no longer
-  // describes where the viewer was.
+  document.getElementById('empty').hidden = !state.extent.empty;
+
+  // Decide BEFORE resizing: once the geometry changes, the old scrollTop no
+  // longer describes where the viewer was.
   const pinned = follow && atBottom();
 
-  const base = view.length ? view[0].number : 0;
-  reflow(base, view.length, s.cells);
-  drawGutter(view);
+  reflow(base, rows, cells);
+  view = { base, rows };
+  drawGutter(base, rows);
 
-  for (let i = 0; i < view.length; i++) {
-    const gen = view[i];
-    if (paint.drawn.get(gen.number) === gen) continue;
-    const sig = signatureOf(gen, s.cells);
-    paint.drawn.set(gen.number, gen);
-    if (paint.sig.get(gen.number) === sig) continue; // re-sent, identical pixels
-    paintRow(gen, i, s.cells);
-    paint.sig.set(gen.number, sig);
+  for (let i = 0; i < rows; i++) {
+    const number = base + i;
+    const gen = state.rows.get(number);
+    if (!gen) continue;
+    if (paint.drawn.get(number) === gen) continue;
+    const sig = signatureOf(gen);
+    paint.drawn.set(number, gen);
+    if (paint.sig.get(number) === sig) continue; // re-sent, identical pixels
+    paintRow(gen, i, cells);
+    paint.sig.set(number, sig);
   }
+
+  // Ask for what the window wants once the scroll settles. After painting, so
+  // what is already cached shows immediately rather than waiting on a request.
+  wanted = { base, rows };
+  scheduleFetch();
 
   // Only chase the leading edge when the viewer is already there. Scrolling
   // them back down while they are reading history is worse than losing the
@@ -475,8 +591,11 @@ followBox.onchange = () => {
 // Scrolling away from the bottom releases follow, so reading history is not a
 // fight with the renderer; scrolling back re-arms it.
 wrap.addEventListener('scroll', () => {
-  if (!followBox.checked) return;
-  follow = atBottom();
+  if (followBox.checked) follow = atBottom();
+  // Scrolling now CHANGES WHAT IS DRAWN, not just which part of a painted
+  // bitmap is visible. This is the listener that turns the spacer into a view
+  // of the archive.
+  scheduleRender();
 });
 
 const rate = document.getElementById('rate');
@@ -691,43 +810,79 @@ document.getElementById('fundTxidBtn').onclick = async () => {
 
 /** Which cell is under the pointer, or null. */
 function cellAt(ev) {
-  if (!state.snap || !view.length) return null;
+  if (!state.snap) return null;
+  const cells = state.snap.cells;
   const r = canvas.getBoundingClientRect();
-  const g = Math.floor((ev.clientY - r.top) / cellPx);
-  const c = state.snap.cells - 1 - Math.floor((ev.clientX - r.left) / cellPx);
-  const gen = view[g];
-  if (!gen || c < 0 || c >= state.snap.cells) return null;
-  return { gen, cell: (gen.cells && gen.cells[c]) || {}, index: c };
+  const row = Math.floor((ev.clientY - r.top) / cellPx);
+  const c = cells - 1 - Math.floor((ev.clientX - r.left) / cellPx);
+  if (row < 0 || row >= view.rows || c < 0 || c >= cells) return null;
+  const number = view.base + row;
+  const gen = state.rows.get(number);
+  if (!gen) return null;
+  return { gen, number, index: c, stateChar: (gen.s || '')[c] || '-' };
 }
 
-/** Arcade's status page for a transaction. */
-function arcadeTxURL(txid) {
-  return state.snap.arcadeUrl.replace(/\/+$/, '') + '/tx/' + txid;
+/** Fetch one cell's transaction id.
+ *
+ * On demand, and that is the point rather than an optimisation. Transaction ids
+ * were 62% of the payload and the UI wants exactly one of them at a time — the
+ * one under the pointer. Dropping them from the bulk payload is what took a
+ * page load from 25.5 MB to kilobytes, and this is the other half of that
+ * trade. `cell_txs` is keyed on (generation, cell), so it is a point lookup. */
+const txCache = new Map();
+/** Guards against a slow lookup overwriting a newer hover. */
+let hoverToken = 0;
+async function detailFor(number, cell) {
+  const key = number + ':' + cell;
+  if (txCache.has(key)) return txCache.get(key);
+  try {
+    const res = await fetch(`/api/tx?generation=${number}&cell=${cell}`);
+    const d = res.ok ? await res.json() : null;
+    txCache.set(key, d);
+    return d;
+  } catch {
+    return null;
+  }
 }
 
-// Click a cell to open its transaction in arcade.
-canvas.onclick = (ev) => {
+canvas.onclick = async (ev) => {
   const hit = cellAt(ev);
-  if (!hit || !hit.cell.txid) return;
-  window.open(arcadeTxURL(hit.cell.txid), '_blank', 'noopener');
+  if (!hit || hit.stateChar === '-') return;
+  const d = await detailFor(hit.number, hit.index);
+  if (d && d.txid) window.open(arcadeTxURL(d.txid), '_blank', 'noopener');
 };
 
-// Hover a cell to see which transaction proved it.
 canvas.onmousemove = (ev) => {
   const hit = cellAt(ev);
-  if (!hit) { tip.hidden = true; canvas.style.cursor = 'default'; return; }
-  const { gen, cell } = hit;
-  const c = hit.index;
-  canvas.style.cursor = cell.txid ? 'pointer' : 'default';
+  if (!hit) { tip.hidden = true; return; }
+  const { gen, number, index: c } = hit;
+  canvas.style.cursor = hit.stateChar === '-' ? 'default' : 'pointer';
+
   const bits = bitsOf(gen, state.snap.cells);
-  tip.innerHTML =
-    `<b>cell ${c}</b> · generation ${gen.number}<br>` +
-    `state: ${bits[c] ? 'alive' : 'dead'} · tx: ${cell.state || 'pending'}<br>` +
-    (cell.txid ? `${cell.txid}<br><span class="hint">click to open in arcade</span>` : '') +
-    (cell.err ? `<br><span style="color:var(--failed)">${cell.err}</span>` : '');
+  const cellState = STATE_OF[hit.stateChar] || 'pending';
+  const head =
+    `<b>cell ${c}</b> · generation ${number}<br>` +
+    `state: ${bits[c] ? 'alive' : 'dead'} · tx: ${cellState}<br>`;
+
+  // The id and the refusal reason are not in the bulk payload any more — that
+  // is the trade that made the archive viewable — so they are fetched for the
+  // cell under the pointer and cached. Render immediately with what is known,
+  // then fill them in: a tooltip that waits on a request is a tooltip that
+  // flickers.
+  tip.innerHTML = head;
   tip.hidden = false;
   tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 440) + 'px';
   tip.style.top = (ev.clientY + 14) + 'px';
+
+  if (hit.stateChar === '-') return;
+  const token = ++hoverToken;
+  detailFor(number, c).then((d) => {
+    // A later hover has already replaced this one; do not overwrite it.
+    if (token !== hoverToken || !d) return;
+    tip.innerHTML = head +
+      (d.txid ? `${d.txid}<br><span class="hint">click to open in arcade</span>` : '') +
+      (d.err ? `<br><span style="color:var(--failed)">${d.err}</span>` : '');
+  });
 };
 canvas.onmouseleave = () => { tip.hidden = true; };
 window.addEventListener('resize', scheduleRender);
@@ -737,6 +892,58 @@ window.addEventListener('resize', scheduleRender);
 const events = new EventSource('/api/events');
 events.onmessage = (ev) => apply(JSON.parse(ev.data));
 
+/** Learn how much history exists, so the spacer — and therefore the scrollbar —
+ *  can be as tall as the whole run. */
+async function loadExtent() {
+  const res = await fetch('/api/extent');
+  if (!res.ok) return;
+  const e = await res.json();
+  if (e.empty) return;
+  state.extent = { oldest: e.oldest, newest: e.newest, count: e.count, empty: false };
+  scheduleRender();
+}
+
+/** Put generation n at the top of the viewport. */
+function jumpTo(n) {
+  if (state.extent.empty) return;
+  const clamped = Math.min(Math.max(n, state.extent.oldest), state.extent.newest);
+  follow = false;
+  followBox.checked = false;
+  wrap.scrollTop = (clamped - state.extent.oldest) * cellPx;
+  scheduleRender();
+}
+
+const jumpInput = document.getElementById('jump');
+const jumpBtn = document.getElementById('jumpBtn');
+if (jumpBtn) {
+  const go = () => {
+    const n = Number(jumpInput.value);
+    if (!Number.isFinite(n)) return;
+    jumpTo(n);
+    // Linkable: someone who finds something interesting can send it to
+    // somebody else.
+    history.replaceState(null, '', '#gen=' + Math.round(n));
+  };
+  jumpBtn.onclick = go;
+  jumpInput.onkeydown = (ev) => { if (ev.key === 'Enter') go(); };
+}
+
+loadExtent()
+  .then(() => {
+    const m = /(?:^|#|&)gen=(\d+)/.exec(location.hash);
+    if (m) {
+      jumpTo(Number(m[1]));
+      return;
+    }
+    // No deep link: open at the live edge, which is where the tail-anchored
+    // version always was and what someone arriving at a running automaton
+    // expects to see. Scrolling back is the new capability; landing at
+    // generation 0 of a 20,000-generation run would be a regression dressed as
+    // a feature.
+    wrap.scrollTop = wrap.scrollHeight;
+    scheduleRender();
+  })
+  .catch(() => {});
 fetch('/api/state').then(r => r.json()).then(apply).catch(() => {});
 loadFundTarget().catch(() => {});
 
@@ -744,10 +951,15 @@ loadFundTarget().catch(() => {});
 // used by the page itself.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    apply, state, paint, MAX_HISTORY, MAX_CANVAS_PX,
+    apply, state, paint, MAX_CACHED, MAX_CANVAS_PX, MAX_CANVAS_AREA, OVERSCAN,
+    draw, jumpTo, windowRows,
     // The panel is driven by GET /api/funding, which the harness has no network
     // for. Exposing the setter is cheaper than stubbing fetch well enough to
     // deliver a body, and it is the same field loadFundTarget assigns.
     setFundTarget(t) { fundTarget = t; },
+    setExtent(e) { state.extent = e; },
+    setFollow(f) { follow = f; },
+    view: () => view,
+    canvas,
   };
 }

@@ -598,7 +598,10 @@ func cmdRun(args []string) error {
 		Leader:           leaseHolder(ctx, store, logger),
 	}, logger)
 
-	var webOpts []web.Option
+	// The archive is always served: it is how the UI reaches past the engine's
+	// live ring into the whole run, and it is what stopped /api/state shipping
+	// 25.5 MB on every page load.
+	webOpts := []web.Option{web.WithArchive(archive{store: store})}
 	if cfg.PublicFunding {
 		webOpts = append(webOpts, web.WithFunder(newFunder(c, cfg.BootstrapMinimum(genesisSize))))
 	}

@@ -54,9 +54,16 @@
 
 <main>
   <div id="canvas-wrap">
+    <!-- #surface is an empty spacer as tall as the WHOLE run: it is what the
+         scrollbar measures. #pinned rides the viewport, so the canvas inside it
+         only ever has to be as tall as what you can see. That split is what
+         makes 100,000 generations scrollable — a canvas that tall is not a
+         thing a browser will allocate. -->
     <div id="surface">
-      <div id="gutter"></div>
-      <canvas id="grid"></canvas>
+      <div id="pinned">
+        <div id="gutter"></div>
+        <canvas id="grid"></canvas>
+      </div>
     </div>
     <div id="empty">waiting for the first generation…</div>
   </div>
@@ -75,6 +82,11 @@
       <span>zoom</span>
       <input id="zoom" type="range" min="1" max="8" step="1" value="4">
       <output id="zoomOut">4px</output>
+    </label>
+    <label class="jump">
+      <span>go to</span>
+      <input id="jump" type="number" min="0" step="1" placeholder="generation">
+      <button id="jumpBtn" type="button">go</button>
     </label>
     <label class="follow">
       <input id="follow" type="checkbox" checked>
