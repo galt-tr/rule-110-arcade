@@ -162,7 +162,9 @@ Flags every subcommand accepts, beyond the five above:
   -cell-sats uint          satoshis each cell UTXO carries
   -max-db-conns int        storage connection pool size
   -apply-concurrency int   monitor workers applying arcade status batches
-  -full-status             subscribe to every status transition (~4x the events)
+  -full-status             subscribe to every status transition, not just the milestones.
+                           2x the events for an identical diagram, because the extra
+                           transitions all collapse onto one displayed state (default false)
   -chronicle               verify with Chronicle-era script rules; required, because the
                            covenant contains OP_2MUL (default true)
   -fee-sat-per-kb int      fee rate, above arcade's 100 sat/kB floor
@@ -242,7 +244,7 @@ func bindCommon(fs *flag.FlagSet, cfg *chain.Config) *string {
 	fs.IntVar(&cfg.ApplyConcurrency, "apply-concurrency", cfg.ApplyConcurrency,
 		"monitor workers applying arcade status batches")
 	fs.BoolVar(&cfg.FullStatusUpdates, "full-status", cfg.FullStatusUpdates,
-		"subscribe to every status transition (~4x the events; turn off above ~3 gen/s)")
+		"subscribe to every status transition, not just the milestones (2x the events for the same diagram)")
 	fs.BoolVar(&cfg.LockControls, "lock-controls", envBool("RULE110_LOCK_CONTROLS", cfg.LockControls),
 		"refuse every play/pause/step/rate request; /api/control is unauthenticated, so this is the lock")
 	fs.BoolVar(&cfg.PublicFunding, "public-funding", envBool("RULE110_PUBLIC_FUNDING", cfg.PublicFunding),

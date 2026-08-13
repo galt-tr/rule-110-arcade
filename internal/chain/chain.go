@@ -115,12 +115,11 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Chain, error) 
 		URL:           cfg.ArcadeURL,
 		EventsURL:     cfg.eventsURL(),
 		CallbackToken: callbackToken,
-		// Every transition, not just terminal ones: the diagram is showing the
-		// lifecycle, so the intermediate states are the point.
-		//
-		// This is roughly a 4x multiplier on event volume, and arcade's SSE
-		// fan-out is measured at ~1,500-1,700 events/s, so above about three
-		// generations a second it is the wrong trade and should be turned off.
+		// OFF by default, and the reason is engine.stateFor: it maps
+		// ACCEPTED_BY_NETWORK, SEEN_ON_NETWORK and SEEN_MULTIPLE_NODES all onto
+		// TxSeen, so the intermediate transitions are discarded the moment they
+		// arrive. Asking for them doubled the event volume to render an
+		// identical diagram. See Config.FullStatusUpdates.
 		FullStatusUpdates: cfg.FullStatusUpdates,
 	})
 

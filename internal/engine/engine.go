@@ -886,18 +886,33 @@ func (e *Engine) SetMode(m Mode) {
 // SetRate and the Options path so there is one answer to what a rate may be.
 func clampRate(r float64) float64 { return min(max(r, 0.05), 20) }
 
-// arcadeEventBudget is roughly how many status events a second arcade's SSE
-// fan-out has been measured to sustain, and fullStatusMultiplier is how many
-// events a transaction produces when every transition is subscribed to rather
-// than only the terminal one.
+// arcadeEventBudget is how many status events a second arcade's SSE fan-out has
+// been measured to sustain, and the two multipliers are how many events one
+// transaction produces with and without every transition subscribed.
 //
-// Both are observations of a particular deployment rather than anything arcade
-// promises, which is why exceeding them warns instead of clamping. A number
-// this soft has no business silently overriding what an operator asked for.
+// The budget is not a guess. Arcade's fan-out is a single goroutine issuing one
+// synchronous Postgres probe per event per token-scoped client, timed at
+// 0.583 ms/probe against a 4.5M-row table — hence ~1,500-1,700 events/s. The
+// live pods report the same thing as `fanout_avg` (0.3-0.6 ms), and they log the
+// shortfall as "client send buffer full", which reads as an accusation against
+// the consumer and generally is not one.
+//
+// Still an observation of one deployment rather than anything arcade promises,
+// which is why exceeding it warns instead of clamping. A number this soft has no
+// business silently overriding what an operator asked for.
+//
+// The budget also describes the WRONG failure. It is a steady-state rate, and
+// the thing that actually overruns arcade is a block: one block sweeps
+// rate x cells x block-interval transactions and emits MINED for all of them at
+// once, which no per-second budget can express. That burst is why the gates
+// below have deadlines and why the reconciler is sized to the backlog.
 const (
-	arcadeEventBudget    = 1500
+	arcadeEventBudget = 1500
+	// ACCEPTED_BY_NETWORK, SEEN_ON_NETWORK, SEEN_MULTIPLE_NODES, MINED.
 	fullStatusMultiplier = 4
-	terminalStatusPerTx  = 1
+	// The milestones are a SEEN and a MINED — two, not one. Measured at ~2,000
+	// events/s for a 1000 TPS run with full updates off.
+	milestoneStatusPerTx = 2
 )
 
 // SetRate sets generations per second, clamped to something a chain can serve.
@@ -920,14 +935,20 @@ func (e *Engine) SetRate(r float64) {
 	// status that never arrives — the diagram simply stops being true, with
 	// nothing anywhere saying so until the reconciler catches it 90 seconds
 	// later.
-	perTx := terminalStatusPerTx
+	perTx := milestoneStatusPerTx
+	remedy := "lower the rate, or run fewer cells"
 	if full {
 		perTx = fullStatusMultiplier
+		remedy = "restart with -full-status=false, which halves this at no cost to the diagram"
 	}
-	if events := rate * float64(cells*perTx); events > arcadeEventBudget && full {
+	// The budget binds whether or not full updates are on. Guarding this warning
+	// on `full` meant the one configuration that CAN still outrun arcade — many
+	// cells at a high rate with the multiplier already off — was the one
+	// configuration that never said so.
+	if events := rate * float64(cells*perTx); events > arcadeEventBudget {
 		e.logger.Warn("rate exceeds the measured arcade event budget; statuses will lag or be dropped",
 			"rate", rate, "events_per_second", int(events), "budget", arcadeEventBudget,
-			"remedy", "restart with -full-status=false, which drops this to one event per transaction")
+			"full_status", full, "remedy", remedy)
 	}
 }
 

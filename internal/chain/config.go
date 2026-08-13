@@ -191,9 +191,22 @@ type Config struct {
 	// strategy. Off means every cell competes for the same change set.
 	Throughput bool
 
-	// FullStatusUpdates asks arcade for every status transition rather than
-	// terminal ones only. Good for a diagram, roughly 4x the event volume, and
-	// arcade's SSE fan-out is measured at ~1,500-1,700 events/s.
+	// FullStatusUpdates asks arcade for every status transition rather than the
+	// milestones. It is OFF, because for this application it is a pure cost.
+	//
+	// The diagram has five states, and stateFor collapses ACCEPTED_BY_NETWORK,
+	// SEEN_ON_NETWORK and SEEN_MULTIPLE_NODES onto ONE of them (TxSeen). So the
+	// extra transitions are discarded on arrival: we were paying roughly double
+	// the event volume — 4 events per transaction rather than 2 — to render
+	// exactly the same picture.
+	//
+	// That volume is not free anywhere. Arcade's SSE fan-out is a single
+	// goroutine issuing one synchronous Postgres probe per event per client,
+	// measured at ~1,500-1,700 events/s, and every event we ask for and throw
+	// away is one it cannot spend on an event we need.
+	//
+	// Turn it on only at a low generation rate, where the extra transitions are
+	// affordable and might be interesting to watch.
 	FullStatusUpdates bool
 
 	// ApplyConcurrency is how many workers the monitor uses to apply arcade
@@ -287,7 +300,7 @@ func DefaultConfig() Config {
 		// so 20,000 bought 62 seconds of swing and 60,000 buys 187.
 		FuelPoolSize:      60000,
 		Throughput:        true,
-		FullStatusUpdates: true,
+		FullStatusUpdates: false,
 		// ~512 status events a second at 128 tx/s with full updates. The toolbox
 		// default of 8 is documented as too low; 32 is adequate only if every
 		// apply is fast, and an applier that cannot drain the hand-off queue

@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -435,5 +437,82 @@ func TestRebuildsBackOff(t *testing.T) {
 	}
 	if pauses[len(pauses)-1] > maxRebuildPause {
 		t.Errorf("pause %v exceeded the cap %v", pauses[len(pauses)-1], maxRebuildPause)
+	}
+}
+
+// Turning FullStatusUpdates off has to cost the diagram nothing, and this is
+// where that is decided: stateFor maps the three pre-mining statuses onto the
+// SAME displayed state, so subscribing to all of them renders an identical
+// picture to subscribing to the milestones.
+//
+// That is the entire argument for the default, and it is an argument about
+// arcade's wire vocabulary rather than about our code — so it is worth a test
+// that fails loudly if arcade ever adds a transition that means something new.
+// The cost of getting it wrong is not cosmetic: every extra event is one the
+// single-goroutine SSE fan-out cannot spend on an event we need.
+func TestMilestoneStatusesReachEveryDisplayedState(t *testing.T) {
+	full := map[arcade.Status]TxState{}
+	for _, s := range []arcade.Status{
+		arcade.StatusAcceptedByNetwork,
+		arcade.StatusSeenOnNetwork,
+		arcade.StatusSeenMultipleNodes,
+		arcade.StatusMined,
+		arcade.StatusRejected,
+	} {
+		st, ok := stateFor(s)
+		if !ok {
+			t.Fatalf("%s maps to no state at all", s)
+		}
+		full[s] = st
+	}
+
+	// The milestones: what arcade sends when FullStatusUpdates is off.
+	milestones := []arcade.Status{
+		arcade.StatusSeenOnNetwork,
+		arcade.StatusMined,
+		arcade.StatusRejected,
+	}
+	reachable := map[TxState]bool{}
+	for _, s := range milestones {
+		st, _ := stateFor(s)
+		reachable[st] = true
+	}
+
+	for s, st := range full {
+		if !reachable[st] {
+			t.Errorf("%s displays as %q, which no milestone status reaches — turning "+
+				"-full-status off would now lose a state from the diagram, and the "+
+				"default must be reconsidered", s, st)
+		}
+	}
+
+	// And the converse, which is the part that makes the extra events waste:
+	// the two we stop paying for say nothing the milestones do not.
+	for _, s := range []arcade.Status{arcade.StatusAcceptedByNetwork, arcade.StatusSeenMultipleNodes} {
+		if got := full[s]; got != TxSeen {
+			t.Errorf("%s now displays as %q rather than %q; it carries information the "+
+				"milestones do not and is no longer free to drop", s, got, TxSeen)
+		}
+	}
+}
+
+// The event-budget warning must fire on the configuration that can still
+// outrun arcade with the multiplier already off. Guarding it on
+// FullStatusUpdates meant the one case an operator could not otherwise see was
+// the one case that stayed silent.
+func TestRateWarningDoesNotDependOnFullStatusUpdates(t *testing.T) {
+	// SetRate logs inline on the calling goroutine, so a plain buffer is safe.
+	var buf bytes.Buffer
+	e := newTestEngine(t, 256)
+	e.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	e.chain.Config.FullStatusUpdates = false
+	e.deployment.Cells = 256
+
+	// 256 cells x 2 milestones x 8 gen/s = 4,096 events/s, well past the budget.
+	e.SetRate(8)
+
+	if got := buf.String(); !strings.Contains(got, "arcade event budget") {
+		t.Errorf("no budget warning with full-status off at a rate that exceeds it by "+
+			"nearly 3x; logged: %q", got)
 	}
 }
