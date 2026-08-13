@@ -137,6 +137,46 @@ func TestRecordTxBatchOfNothingIsNotAnError(t *testing.T) {
 	}
 }
 
+// The reconciler exists to find transactions whose status was lost, and those
+// are the `broadcast` ones. `seen` rows are healthy — waiting for a block — and
+// they are also OLDER, because they were acknowledged and moved on while the
+// stuck ones sat. Ordering by age alone therefore spends the entire pass on
+// rows that are fine: measured on a live deployment with four deadlocked cells,
+// one pass returned 512 `seen` and zero `broadcast`.
+func TestStaleReturnsUnacknowledgedRowsFirst(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.RecordGeneration(t.Context(), 1, "aa"); err != nil {
+		t.Fatal(err)
+	}
+	// The `seen` rows go in first, so they are the older ones — the shape that
+	// defeated the old ordering.
+	for i, r := range []CellTx{
+		{Generation: 1, Cell: 0, TxID: "seen-old-1", Status: StatusSeen},
+		{Generation: 1, Cell: 1, TxID: "seen-old-2", Status: StatusSeen},
+		{Generation: 1, Cell: 2, TxID: "seen-old-3", Status: StatusSeen},
+		{Generation: 1, Cell: 3, TxID: "broadcast-newer", Status: StatusBroadcast},
+	} {
+		if err := s.RecordTx(t.Context(), r); err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+	}
+
+	// A limit smaller than the row count: the un-acknowledged row has to win a
+	// place, which is the whole point.
+	got, err := s.Stale(t.Context(), 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2", len(got))
+	}
+	if got[0].TxID != "broadcast-newer" {
+		t.Errorf("first row is %q, want the un-acknowledged one — the pass is being "+
+			"spent on transactions the network has already accepted, which is how "+
+			"four cells stayed deadlocked through every reconciler pass", got[0].TxID)
+	}
+}
+
 func TestDedupeCellTxsKeepsTheLastPerKeyInOrder(t *testing.T) {
 	got := dedupeCellTxs([]CellTx{
 		{Generation: 1, Cell: 0, TxID: "a"},

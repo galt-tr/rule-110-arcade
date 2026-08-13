@@ -476,9 +476,29 @@ func (s *Store) Unsettled(ctx context.Context) ([]CellTx, error) {
 // unfiltered set grows with the automaton, and a reconciler whose pass takes
 // longer than its own interval never finishes a pass again.
 func (s *Store) Stale(ctx context.Context, age time.Duration, limit int) ([]CellTx, error) {
+	// Un-acknowledged rows FIRST, then oldest. Ordering by age alone made this
+	// pass useless, and measurably so.
+	//
+	// "Not terminal" lumps together two populations with opposite meanings. A
+	// `seen` row is healthy: the network has it and it is waiting for a block,
+	// which at a 200-second block interval means many thousands are outstanding
+	// in a system with nothing wrong at all. A `broadcast` row is the one that
+	// might be lost — nobody has said anything about it.
+	//
+	// The `seen` rows are also OLDER, because they were acknowledged and moved
+	// on while the stuck ones sat. So ordering by age put them first and they
+	// filled the whole limit: on a live deployment with four deadlocked cells,
+	// one pass selected 512 `seen` rows and ZERO `broadcast` rows, every pass,
+	// for as long as it ran. The safety net could not see the only thing it
+	// exists to catch.
+	//
+	// That mattered more than it sounds, because MaxUnseenDepth makes a lost
+	// status permanent: a cell may not build on a parent the network has not
+	// acknowledged, so a dropped SEEN event stops that cell for ever unless
+	// something re-polls it. This is that something.
 	q := `SELECT generation, cell, txid, status, err FROM cell_txs
 	      WHERE status NOT IN ('mined', 'failed') AND txid <> '' AND updated_at < ?
-	      ORDER BY updated_at LIMIT ?`
+	      ORDER BY CASE WHEN status = 'broadcast' THEN 0 ELSE 1 END, updated_at LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, s.rebind(q), time.Now().UTC().Add(-age), limit)
 	if err != nil {
 		return nil, fmt.Errorf("history: query stale: %w", err)
