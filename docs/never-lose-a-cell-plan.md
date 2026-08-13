@@ -203,12 +203,27 @@ caught, or item 1.3 has traded one failure for another.
 TestSmokeRingSurvivesAScriptedRejectionStorm   (build tag: smoke)
 ```
 
-Stand up an `httptest.Server` implementing the four routes the toolbox actually
-uses — `POST /tx`, `GET /tx/{txid}`, `GET /events` (SSE with `Last-Event-ID`),
-health — plus the ChainTracks routes (`/height`, `/tip`,
-`/header/height/{n}`). The toolbox already fakes this surface for its own tests
-(`pkg/arcade/client_test.go`, `pkg/arcade/sse_test.go`), so the shapes are known
-and can be followed rather than invented.
+**This fake already exists — in a package we cannot import.**
+`internal/testenv/mockarcade` (`arcade.go:37`) is an `httptest.Server` speaking
+real Arcade HTTP + SSE, driving the *real* `arcade.Client`, with exactly the
+controls this test needs: `SetBroadcastResponder`, `SetTxRecord`, `EmitStatus`.
+There is a matching `mockarcade.ChainTracks`. But it lives under the toolbox's
+`internal/`, so Go's visibility rule puts it out of reach of this module.
+
+Two options, and the first is better for everyone:
+
+1. **Ask the toolbox to promote it** to `pkg/arcadetest` (or export it from
+   `pkg/arcade`). Every application built on the toolbox needs precisely this to
+   test its own recovery behaviour offline, and the toolbox already maintains it.
+   This is the single most useful thing the toolbox could give downstream users.
+2. Failing that, write our own against the same four routes — `POST /tx`,
+   `GET /tx/{txid}`, `GET /events` (SSE with `Last-Event-ID`), health — plus the
+   ChainTracks routes (`/height`, `/tip`, `/header/height/{n}`). The shapes are
+   pinned by `pkg/arcade/client_test.go` and `sse_test.go`, so it is transcription
+   rather than invention.
+
+Start with option 2 so the plan is not blocked on another team, and raise option 1
+in parallel.
 
 The fake is *scriptable*: reject a named fraction of submissions, stall the event
 stream, drop events outright, then return to normal. Run the real engine, the
@@ -221,81 +236,156 @@ real toolbox and a real SQLite wallet against it and assert:
 This is the closest thing to the live failure that can run in CI, and it is what
 would have caught the 248 before it happened.
 
+### 2.7 The basket separation we depend on without saying so
+
+```
+TestCellOutputsAreNeverInTheFuelBasket
+```
+
+The toolbox has a known-unfixed gap: `funder.FundArgs` carries no exclusion list,
+so a caller-provided input that is *also* claimable in the funding basket can be
+selected a second time, producing duplicate inputs
+(`docs/rejection-hardening-audit.md:344-366`, rated High and deliberately not
+implemented). We are safe from it for one reason only — cell outputs go to
+`CellBasket` and fuel comes from `"fuel"`.
+
+That is load-bearing and currently unwritten anywhere. A cheap assertion that no
+cell output is ever minted into the fuel basket turns an implicit safety
+property into a checked one.
+
 ---
 
 ## Part 3 — Toolbox tests
 
-Two properties, both offline. Where a real database is needed, SQLite is enough
-for correctness and Postgres adds the concurrency dimension; gate the Postgres
-runs behind the harness the repo already uses so CI stays hermetic.
+**Read this section against what already exists.** A survey of the toolbox's test
+tree found that the headline reservation property is *already covered*, and that
+the real gaps are somewhere else entirely. Proposing duplicates would have been
+the wrong deliverable.
 
-### 3.1 Reservation is safe under concurrency
+### 3.0 What is already proven — do not rebuild it
 
-```
-TestConcurrentClaimsNeverIssueTheSameCoinTwice
-```
+| Property | Test | Runs |
+|---|---|---|
+| Concurrent claims never issue the same coin twice, at the store layer | `utxostoretest` `ClaimExclusivityConcurrent` (`pkg/utxostore/utxostoretest/suite.go:446`) — 3 rounds × 90 coins × 3 workers × all 3 claim shapes | untagged: memstore + SQLite; `-tags integration`: Postgres + Aerospike |
+| **N concurrent `CreateAction` against one shared basket never double-claim an input** | `conformance.contentionClaim` (`pkg/storage/conformance/contention.go:25`), n=12, asserts `claimed[key] == 1` and that failures are only `ErrNotEnoughFunds` / `ErrUTXOContention` | untagged: memstore+SQLite and over REST; tagged: PG Mode A, Aerospike hybrid |
+| Funder-layer concurrent allocation | `testConcurrentFunding` (`pkg/storage/internal/funder/funder_integration_test.go:117`), 16 goroutines | `-tags integration` |
+| Reconciler double-release race | `TestReconciler_ConcurrentDoublePass_NoDoubleRelease` (`pkg/storage/reconciler_test.go:740`) | untagged |
 
-Mint N coins into one basket. Launch W ≫ N goroutines all calling the claim path
-simultaneously. Assert:
+So the property you would most want — *"two workers cannot claim the same
+UTXO"* — is tested today at both the store and the `CreateAction` layer. What
+follows is only what is genuinely missing.
 
-- **no outpoint is ever returned to two claimants** — the core invariant;
-- exactly `min(N, W)` claims succeed and the rest get "none" (or, on Aerospike,
-  `ErrContention` after its CAS budget), never a phantom coin;
-- every claimed row carries a `reserved_by` matching its claimant;
-- run under `-race`.
-
-Repeat for each backend, and for the exact-match, smallest-sufficient and
-largest-insufficient variants, since each has its own statement.
+### 3.1 The single highest-value missing test
 
 ```
-TestClaimUnderContentionNeverBlocksIndefinitely
+TestRejectedActionReleasesItsInputsAndTheCoinCanBeSpentAgain
 ```
 
-`SKIP LOCKED` should mean a loser moves to another coin rather than queueing.
-Assert bounded wall-clock for W goroutines against N coins.
+**The two halves of this loop are each tested, and nothing joins them.**
+`process_test.go:74` asserts inputs are *not* released on rejection (correct —
+release is the reconciler's job). `reconciler_test.go:305` asserts the coin
+becomes claimable. But the hermetic reconciler harness **never calls
+`CreateAction`** — it hand-seeds `known_txs` rows via `seedKnownTx` — and the one
+test that does drive the real path (`reconciler_integration_test.go:37`, PG-only)
+stops at "claimable" and never spends the coin again.
 
-### 3.2 A rejection always returns its inputs
+So write the join, untagged and hermetic:
 
-```
-TestRejectedTransactionReleasesItsInputsAndTheyCanBeClaimedAgain
-```
+1. real `CreateAction` → `ProcessAction`, coin claimed;
+2. oracle scripted to return `REJECTED`; deliver the status;
+3. assert inputs still held — phase 1 is deliberate;
+4. advance the injected clock past `grace`, run `VerifyAndReleaseSuspects`;
+5. **`CreateAction` again and assert it succeeds, spending that same coin.**
 
-The loop the application depends on, end to end and offline:
+Step 5 is the assertion nothing currently makes, and it is precisely the loop the
+application depends on to keep building.
 
-1. claim a coin, build and "broadcast" a transaction through a stub oracle;
-2. deliver `REJECTED`;
-3. assert inputs are **still held** — the deliberate phase-1 behaviour
-   (`pkg/storage/status_updates.go:98-105`), so the test documents it rather than
-   being surprised by it;
-4. advance the injected clock past `DefaultSuspectGrace`, run
-   `VerifyAndReleaseSuspects`;
-5. assert the coin is claimable again **and** a fresh claim succeeds.
+*Blocker to clear first:* `conformance.FakeOracle.GetTx` hardcodes
+`ErrTxNotFound` (`pkg/storage/conformance/fakes.go:48`), so the exported harness
+cannot script a `REJECTED` verdict at all. Either give `FakeOracle` a scriptable
+`GetTxFunc` — worth doing, it is the exported seam other applications get — or
+use the package-local `fakeOracle` (`status_updates_test.go:43`), which already
+has the hook that `reconStack` drives via `scriptTx`.
 
-Step 4 must use the existing clock seam, not `time.Sleep` — a test that waits 90
-seconds will be deleted by the first person in a hurry.
+### 3.2 Claim racing release — nothing races heterogeneous operations
 
-```
-TestRecoveredRejectionReleasesNothing
-TestSpendConflictReleasesOnlyTheLosingInputs
-TestQuarantinedSuspectIsReportedRatherThanSilentlyStuck
-```
-
-The third is a gap worth closing: after 24 h a suspect becomes terminal `stuck`
-and never auto-releases. That is defensible, but it must be *loud*.
-
-### 3.3 Leaked reservations are reclaimed
+Every concurrency test in the module races *homogeneous* operations: many
+claimers, or many releasers. Nothing races a claimer against a releaser.
 
 ```
-TestReservationLeakedByANeverSignedActionIsSwept
-TestSweepDoesNotYankInputsFromARedrivableTransaction
+TestSweepDoesNotReclaimAReservationACreateActionIsMidFlightOn
+TestAbortDoesNotRaceAConcurrentClaimOfTheSameCoin
+TestReconcilerReleaseRacingAFreshClaimNeverDoubleAllocates
 ```
 
-`SweepStaleReservations` rides the `fail_abandoned` task at a **15-minute**
-TTL (`pkg/monitor/monitor.go:26-29`) with no config key. Both tests use the
-injected clock. The second guards `reservationResendable`
-(`pkg/storage/status_updates.go:1083`) — sweeping a transaction that
-`SendWaiting` is about to re-drive would manufacture the double-spend the sweep
-exists to prevent.
+This is a real safety question rather than a hypothetical: `SweepStaleReservations`
+guards it with `reservationResendable` (`pkg/storage/status_updates.go:1083`), and
+that guard has no concurrent test. Sweeping a reservation that `SendWaiting` is
+about to re-drive would manufacture the exact double-spend the sweep exists to
+prevent.
+
+### 3.3 Leak recovery is barely tested, and the existing tests sidestep the clock
+
+`SweepStaleReservations` has exactly one test
+(`pkg/storage/status_updates_test.go:756`) and `AbortAbandoned` exactly one
+(`:540`). Both are single-threaded, and both cheat by passing
+`time.Now().Add(time.Hour)` as the cutoff rather than driving a fake clock.
+
+```
+TestReservationLeakedByANeverSignedActionIsSwept   // real clock injection
+TestSweptCoinIsImmediatelyClaimableAgain
+```
+
+**Trap to avoid:** all three hermetic provider harnesses build the utxostore as
+bare `memstore.New()` with **no clock injected** (`reconciler_test.go:110`,
+`status_updates_test.go:147`, `provider_test.go:114`). The provider and metastore
+clocks are fakeable; reservation timestamps are not. A test asserting on
+reservation *age* must construct `memstore.New(memstore.WithClock(clock.Now))`
+itself — copy the pattern at `pkg/utxostore/memstore/memstore_test.go:28-44`.
+
+### 3.4 Dimensions the existing concurrency tests do not reach
+
+Cheap to add on top of `contentionClaim` rather than beside it:
+
+- **an under-supplied pool** — demand deliberately exceeding supply, on an
+  exact-selection backend (today only the approximate-selection path sees this);
+- **N ≫ 12** — the current test is n=12, which is not 256;
+- **more than one basket and tier at once** — the automaton uses two (`fuel` and
+  the cell basket), and their separation is load-bearing (see 3.5);
+- **`-race`** — see below.
+
+### 3.5 Two defects in the toolbox's own test plumbing
+
+Found while surveying, and both worth a fix regardless of this plan:
+
+- **`-race` is never actually run.** `docs/storage.md:213` states the conformance
+  suites "run under `-race`" and `utxostoretest/suite.go:69` says "Run it under
+  -race" — but no Makefile target, CI workflow or lint config passes the flag
+  anywhere in the module. Every concurrency property above is currently asserted
+  without the detector that would catch the memory races underneath it. Add
+  `test-race` and wire it into CI.
+- **`make test-conformance` selects almost nothing.** It filters
+  `-run 'TestConformance'`, but the tests are named `TestProviderConformance_*`,
+  `TestMemStoreConformance` and `TestAerostore_Conformance`. Go's `-run` is an
+  unanchored per-segment regex, so only the Aerospike one matches; the provider
+  and memstore conformance suites are silently skipped by the target that exists
+  to run them.
+
+### 3.6 Worth raising with the toolbox team
+
+Not blockers, but they force applications to infer things they should be told:
+
+- there is **no** typed spend-conflict error and **no** "inputs released, safe to
+  retry" signal — an application can only notice that `CreateAction` stopped
+  returning `ErrNotEnoughFunds`;
+- `staleReservationTTL` (15 min, `pkg/monitor/monitor.go:26-29`) has no config key;
+- after `DefaultMaxQuarantine` = 24 h a suspect becomes terminal `stuck` and is
+  never auto-released — defensible, but it must be loud;
+- the known-unfixed funder gap: `FundArgs` has no exclusion list, so a
+  caller-provided input that is also claimable in the funding basket can be
+  selected twice (`docs/rejection-hardening-audit.md:344-366`). We are safe only
+  because cell outputs live in a different basket from fuel — which earns a test
+  of its own on our side (§2.7).
 
 ### 3.4 Worth raising with the toolbox team
 
@@ -334,15 +424,30 @@ applies to a whole ring at once.
 
 ## Verification
 
+This application:
+
 ```
 go vet ./...
 go test ./... -race                 # CI already runs exactly this
 go test ./... -race -tags smoke     # adds the fake-arcade smoke test
 ```
 
-Nothing above contacts a live arcade, a live node, or the network. The existing
-CI workflow (`.github/workflows/ci.yml:52`) picks up every unit test with no
-change; the smoke test is added as a separate tagged job so its runtime is
+The toolbox:
+
+```
+make test                                   # untagged; includes the conformance
+                                            # contention test that already exists
+go test -race ./pkg/storage/... ./pkg/utxostore/...   # by hand today — see 3.5
+make test-integration                       # testcontainers; Postgres + Aerospike
+```
+
+Nothing above contacts a live arcade, a live node, or the network. The toolbox
+gates its Postgres and Aerospike tests on `//go:build integration` plus runtime
+detection of a container engine (`internal/testenv/testenv.go:73` skips rather
+than fails), so a machine without podman/docker simply runs the hermetic subset.
+
+Our CI workflow (`.github/workflows/ci.yml:52`) picks up every new unit test with
+no change; the smoke test is added as a separate tagged job so its runtime is
 visible rather than hidden inside the unit suite.
 
 **Acceptance for the whole plan, stated as one property:** there is no sequence
@@ -355,9 +460,15 @@ make them pass for the right reasons.
 1. 1.1 (checked gate release) + 2.3 — smallest change, most likely cause.
 2. 2.1 and 2.2 written **first and failing**, so the fix is measured against them.
 3. 1.2 and 1.3, until 2.1 and 2.2 pass; Part 4 rewrites land with them.
-4. 3.1 and 3.2 — the toolbox properties, independent of the above.
-5. 2.6, the smoke harness.
-6. 1.4, then re-run the depth ladder on a fresh wallet.
+4. 2.7 — one cheap assertion, no dependencies.
+5. 3.1 — the reject→release→**respend** join, the toolbox's biggest gap. Needs the
+   `FakeOracle` scripting hook first.
+6. 3.5 — add a `-race` target and fix the conformance `-run` filter. Small, and
+   everything else in Part 3 is worth less without it.
+7. 2.6, the smoke harness (option 2), with the request to promote `mockarcade`
+   raised in parallel.
+8. 3.2 and 3.3 — claim-vs-release racing and leak recovery.
+9. 1.4, then re-run the depth ladder on a fresh wallet.
 
 Performance work — Aerospike versus Postgres, and the storage-provider question —
 comes after this, and by then it will have contention numbers to justify it
