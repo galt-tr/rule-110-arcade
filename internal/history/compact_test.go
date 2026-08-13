@@ -31,7 +31,7 @@ func seed(t *testing.T, s *Store, gens int, cells int) {
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(t.Context(), "", t.TempDir())
+	s, err := Open(t.Context(), "", t.TempDir(), 0)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
