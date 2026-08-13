@@ -432,6 +432,19 @@ func (e *Engine) noteRefusalLocked(cell int, generation uint64, txid, status, re
 		return
 	}
 
+	// Is this cell failing, or is everything failing? Record the refusal first,
+	// then ask — a burst is a property of the ring, not of the message.
+	now := time.Now()
+	e.refusedAt[cell] = now
+	if e.refusalBurstLocked(now) {
+		// Environmental. Rebuild, but spend no budget: whatever is wrong is not
+		// this cell's chain, and a cell must not be stalled for the network's
+		// condition. This is the guard whose absence cost 248 of 256 cells.
+		e.needsRepair[cell] = true
+		e.perf.refusalsInBursts.Inc()
+		return
+	}
+
 	st := e.retries[cell]
 	if st.generation != generation {
 		st = retryState{generation: generation, first: time.Now()}
@@ -446,18 +459,18 @@ func (e *Engine) noteRefusalLocked(cell int, generation uint64, txid, status, re
 	// inside one bad second; time alone would halt a cell that refused once an
 	// hour ago and has been fine since.
 	if st.attempts > maxRetries && time.Since(st.first) >= minHaltWindow {
-		// Halt. Its successor UTXO does not exist, so every later generation
-		// would try to spend a phantom output and fail with "utxo already
-		// spent" — noise that hides the original rejection.
-		e.halted[cell] = true
-		// The reason, which this path used to drop: it set halted and left
-		// haltReason empty, so the UI and /metrics reported a halted cell with
-		// nothing to say about it.
-		e.haltReason[cell] = reason
-		delete(e.needsRepair, cell)
-		e.logger.Warn("cell halted by rejection",
+		// STALL, not halt. This used to be terminal — the cell stopped and only
+		// `rule110 recover` could restart it — and that is what turned a passing
+		// burst into 248 permanently lost cells. A rejection is the network
+		// saying "not this, not now"; it is never a reason to need a human.
+		//
+		// The cell keeps its place and keeps trying, at a cadence that slows
+		// until whatever is wrong has had time to clear. See stallLocked.
+		e.stallLocked(cell, reason)
+		e.logger.Warn("cell stalled by repeated rejection; it will keep retrying",
 			"cell", cell, "generation", generation, "txid", txid,
-			"status", status, "attempts", st.attempts)
+			"status", status, "attempts", st.attempts,
+			"retry_in", time.Until(e.stalledUntil[cell]).Round(time.Second))
 		return
 	}
 
@@ -465,6 +478,113 @@ func (e *Engine) noteRefusalLocked(cell int, generation uint64, txid, status, re
 	e.logger.Warn("cell refused, scheduling a rebuild",
 		"cell", cell, "generation", generation, "txid", txid,
 		"status", status, "attempt", st.attempts, "of", maxRetries)
+}
+
+const (
+	// burstWindow is how recently a refusal counts towards deciding that the
+	// whole ring is in trouble rather than one cell.
+	//
+	// The 2026-08-13 burst delivered 2,420 rejections in its first minute across
+	// essentially every cell, so any window of a few seconds separates it from
+	// the ordinary case — an isolated refusal, roughly 2 per 16,000 transactions,
+	// with nothing else failing anywhere near it.
+	burstWindow = 15 * time.Second
+
+	// burstShare is the fraction of live cells that must be refusing inside
+	// burstWindow before refusals are treated as environmental, expressed as a
+	// reciprocal: 4 means a quarter.
+	//
+	// A quarter is deliberately well above what any credible per-cell fault
+	// produces — cells fail independently, so a quarter of the ring failing
+	// together is not a coincidence — and well below the ~100% a real outage
+	// produces, so the guard engages long before the ring is lost.
+	burstShare = 4
+
+	// burstMinCells is the floor under that fraction, and it is not a detail: on
+	// a small ring one cell IS a quarter. Without it a two-cell deployment
+	// classified every single-cell fault as environmental and never attributed a
+	// refusal to anything, which is the opposite failure — a genuinely broken
+	// chain retrying for ever with nothing recorded against it.
+	burstMinCells = 4
+)
+
+// refusalBurstLocked reports whether refusals are currently ring-wide rather
+// than particular to one cell. Callers must hold the write lock.
+func (e *Engine) refusalBurstLocked(now time.Time) bool {
+	live := 0
+	for cell := range e.deployment.Cells {
+		if !e.halted[cell] {
+			live++
+		}
+	}
+	if live == 0 {
+		return false
+	}
+	recent := 0
+	for _, at := range e.refusedAt {
+		if now.Sub(at) <= burstWindow {
+			recent++
+		}
+	}
+	return recent >= burstMinCells && recent*burstShare >= live
+}
+
+const (
+	// stallBase is the first backoff a stalled cell waits, and stallMax the
+	// longest it ever waits.
+	//
+	// The cap is the whole point: a backoff that grows without bound is a halt
+	// wearing a friendlier name. At five minutes a cell that is wrong for a
+	// reason that never clears costs 12 attempts an hour — enough to notice in
+	// the metrics, cheap enough to leave running for days — and a cell that is
+	// wrong for a reason that DOES clear resumes without anyone being woken.
+	stallBase = 2 * time.Second
+	stallMax  = 5 * time.Minute
+)
+
+// stallLocked backs a cell off and schedules its rebuild. Callers must hold the
+// write lock.
+//
+// It never gives up. That is the difference between this and the halt it
+// replaced, and it is the property the whole recovery design now rests on: no
+// sequence of rejections, however long, leaves a cell that only an operator can
+// restart.
+func (e *Engine) stallLocked(cell int, reason string) {
+	e.stallStreak[cell]++
+	wait := stallBase << min(e.stallStreak[cell]-1, 16)
+	if wait > stallMax || wait <= 0 {
+		wait = stallMax
+	}
+	e.stalledUntil[cell] = time.Now().Add(wait)
+	e.stallReason[cell] = reason
+	// Still scheduled for repair: the backoff decides WHEN it rebuilds, not
+	// whether. A stalled cell with no repair pending would never move again.
+	e.needsRepair[cell] = true
+	e.perf.stalls.Inc()
+}
+
+// clearStallLocked forgets a cell's backoff. Callers must hold the write lock.
+func (e *Engine) clearStallLocked(cell int) {
+	delete(e.stalledUntil, cell)
+	delete(e.stallStreak, cell)
+	delete(e.stallReason, cell)
+}
+
+// stalledCountLocked is how many cells are currently inside a backoff.
+func (e *Engine) stalledCountLocked() int {
+	now, n := time.Now(), 0
+	for cell := range e.stalledUntil {
+		if e.stalledLocked(cell, now) {
+			n++
+		}
+	}
+	return n
+}
+
+// stalledLocked reports whether a cell is still inside its backoff.
+func (e *Engine) stalledLocked(cell int, now time.Time) bool {
+	until, ok := e.stalledUntil[cell]
+	return ok && now.Before(until)
 }
 
 // clearRetries forgets a cell's refusal count once it has advanced past the
@@ -478,6 +598,11 @@ func (e *Engine) clearRetriesLocked(cell int, generation uint64) {
 	if st, ok := e.retries[cell]; ok && generation > st.generation {
 		delete(e.retries, cell)
 	}
+	// The cell got past the generation it was stuck on, so the backoff has done
+	// its job and must not be carried forward. Leaving the streak set would make
+	// the next unrelated refusal, hours later, resume at a five-minute wait.
+	e.clearStallLocked(cell)
+	delete(e.refusedAt, cell)
 }
 
 // fetchRejectionReason asks arcade why a transaction was rejected, when the

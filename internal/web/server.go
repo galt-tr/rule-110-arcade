@@ -473,6 +473,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		{"rule110_transactions_total", "Cell transitions broadcast since startup.", "counter", float64(snap.TotalTx)},
 		{"rule110_cells", "Cells in the ring.", "gauge", float64(snap.Cells)},
 		{"rule110_halted_cells", "Cells that can never advance again until their tip is recovered.", "gauge", float64(snap.HaltedCells)},
+		{"rule110_stalled_cells", "Cells backed off after repeated rejection. They are still retrying on their own, at a slowing cadence — watch this, do not rescue it.", "gauge", float64(snap.StalledCells)},
 		{"rule110_proved_cells", "Cells of the newest generation whose transition the network accepted. Not a measure of cross-cell agreement, which Script does not check.", "gauge", float64(snap.ProvedCells)},
 		{"rule110_failed_cells", "Failures in the newest generation.", "gauge", float64(snap.FailedCells)},
 		{"rule110_lag_generations", "How far the clock has run ahead of the slowest cell.", "gauge", float64(snap.Lag)},

@@ -42,22 +42,26 @@ func newTestEngineOpts(t *testing.T, cells int, startWriter bool, gens ...uint64
 	t.Cleanup(func() { _ = store.Close() })
 
 	e := &Engine{
-		chain:       &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
-		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		deployment:  &chain.Deployment{Cells: cells},
-		tips:        make([]chain.CellChain, cells),
-		store:       store,
-		mode:        ModePaused,
-		rate:        1,
-		changed:     make(chan struct{}),
-		txIndex:     map[string]txLoc{},
-		halted:      map[int]bool{},
-		haltReason:  map[int]string{},
-		lastMined:   map[int]uint64{},
-		lastSeen:    map[int]uint64{},
-		unseenSince: make([]atomic.Int64, cells),
-		needsRepair: map[int]bool{},
-		retries:     map[int]retryState{},
+		chain:        &chain.Chain{Config: chain.Config{ArcadeURL: "http://arcade.invalid"}},
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		deployment:   &chain.Deployment{Cells: cells},
+		tips:         make([]chain.CellChain, cells),
+		store:        store,
+		mode:         ModePaused,
+		rate:         1,
+		changed:      make(chan struct{}),
+		txIndex:      map[string]txLoc{},
+		halted:       map[int]bool{},
+		haltReason:   map[int]string{},
+		lastMined:    map[int]uint64{},
+		lastSeen:     map[int]uint64{},
+		refusedAt:    map[int]time.Time{},
+		stalledUntil: map[int]time.Time{},
+		stallStreak:  map[int]int{},
+		stallReason:  map[int]string{},
+		unseenSince:  make([]atomic.Int64, cells),
+		needsRepair:  map[int]bool{},
+		retries:      map[int]retryState{},
 		// Persistence is asynchronous now, so the tests run the real writer
 		// rather than a stand-in — otherwise they would assert against a queue
 		// nothing ever drains. Assertions on the store go through
@@ -388,9 +392,15 @@ func TestHaltNeedsTimeNotJustAttempts(t *testing.T) {
 	}
 }
 
-// ...but a fault that persists past the window is real, and the cell must
-// still halt rather than retrying for ever.
-func TestHaltStillHappensOnceTheWindowHasPassed(t *testing.T) {
+// ...but a fault that persists past the window is real, and the cell must slow
+// down rather than rebuild flat out.
+//
+// This test used to assert that the cell HALTED here — terminally, recoverable
+// only by `rule110 recover`. That was the behaviour that turned a four-minute
+// rejection burst into 248 of 256 cells permanently lost, so the assertion is
+// inverted deliberately: a persistent fault now backs the cell off and keeps it
+// retrying. Slowing down is a decision the program can make; giving up is not.
+func TestAPersistentFaultStallsTheCellWithoutEndingIt(t *testing.T) {
 	e := newTestEngine(t, 4, 1)
 	const generic = "PROCESSING (4): [ProcessTransaction][abc] failed to validate transaction"
 
@@ -404,14 +414,71 @@ func TestHaltStillHappensOnceTheWindowHasPassed(t *testing.T) {
 		e.noteRefusalLocked(0, 7, "tx", "REJECTED", generic)
 	}
 	halted := e.halted[0]
-	reason := e.haltReason[0]
+	until := e.stalledUntil[0]
+	reason := e.stallReason[0]
+	repair := e.needsRepair[0]
 	e.mu.Unlock()
 
-	if !halted {
-		t.Fatal("a fault that persisted past the window never halted the cell")
+	if halted {
+		t.Fatal("the cell halted. A rejection is the network saying 'not this, not now'; " +
+			"it is never a reason to need a human")
+	}
+	if until.IsZero() || !until.After(time.Now()) {
+		t.Errorf("stalledUntil = %v, want a future time: a persistent fault has to slow "+
+			"the rebuilds down, or one bad cell rebuilds flat out for ever", until)
 	}
 	if reason == "" {
-		t.Error("the cell halted with nothing to say about why")
+		t.Error("the cell stalled with nothing to say about why")
+	}
+	if !repair {
+		t.Error("a stalled cell must still be scheduled for repair — the backoff decides " +
+			"WHEN it rebuilds, not whether")
+	}
+}
+
+// The backoff has to end somewhere, or it is a halt wearing a friendlier name.
+func TestTheStallBackoffGrowsAndIsCapped(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+
+	// Rounded to the millisecond: the value is derived from time.Until, so at the
+	// cap successive reads differ by nanoseconds of wall clock and an exact
+	// comparison would measure scheduler jitter rather than the backoff.
+	var last time.Duration
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range 40 {
+		e.stallLocked(0, "because")
+		wait := time.Until(e.stalledUntil[0]).Round(time.Millisecond)
+		if i > 0 && wait < last {
+			t.Errorf("backoff %d (%v) shrank from %v", i, wait, last)
+		}
+		if wait > stallMax {
+			t.Fatalf("backoff %d reached %v, past the %v cap; an unbounded backoff is a "+
+				"halt nobody labelled as one", i, wait, stallMax)
+		}
+		last = wait
+	}
+	if last != stallMax {
+		t.Errorf("backoff settled at %v, want the %v cap after 40 failures", last, stallMax)
+	}
+}
+
+// A cell that gets past the generation it was stuck on must forget its streak,
+// or an unrelated refusal hours later resumes at a five-minute wait.
+func TestAdvancingClearsTheStall(t *testing.T) {
+	e := newTestEngine(t, 4, 1)
+
+	e.mu.Lock()
+	e.retries[0] = retryState{generation: 7}
+	e.stallLocked(0, "because")
+	e.clearRetriesLocked(0, 8) // advanced past generation 7
+	stalled := e.stalledLocked(0, time.Now())
+	streak := e.stallStreak[0]
+	e.mu.Unlock()
+
+	if stalled || streak != 0 {
+		t.Errorf("stalled=%v streak=%d after advancing; the backoff outlived the fault "+
+			"it was pacing", stalled, streak)
 	}
 }
 

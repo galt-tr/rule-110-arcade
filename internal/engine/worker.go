@@ -195,11 +195,17 @@ func (e *Engine) turnReady(cell int) bool {
 		timeout   = e.chain.Config.UnseenTimeout
 		leader    = e.leader
 		rederive  = e.needsRederive
+		stalled   = e.stalledLocked(cell, time.Now())
 	)
 	e.mu.RUnlock()
 
 	if !leader {
 		// Another instance owns these chains. See holdLease.
+		return false
+	}
+	if stalled {
+		// Backed off after repeated rejection. Not halted — the cell is waiting
+		// out a fault, and its worker will rebuild when the backoff expires.
 		return false
 	}
 	if rederive {
@@ -363,7 +369,20 @@ const depthPoll = 250 * time.Millisecond
 func (e *Engine) wakeupDelay(cell int, depthGated bool) time.Duration {
 	d := e.unseenWakeup(cell)
 	if depthGated && (d <= 0 || depthPoll < d) {
-		return depthPoll
+		d = depthPoll
+	}
+	// A stalled cell must wake for the end of its own backoff. Nothing else will
+	// wake it: a stall follows a rejection, and the next thing to happen to a
+	// stalled cell is by definition itself trying again.
+	e.mu.RLock()
+	until, stalled := e.stalledUntil[cell]
+	e.mu.RUnlock()
+	if stalled {
+		if left := time.Until(until); left > 0 && (d <= 0 || left < d) {
+			d = left
+		} else if left <= 0 {
+			return time.Millisecond // already due; re-test promptly
+		}
 	}
 	return d
 }

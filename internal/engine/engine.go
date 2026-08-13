@@ -122,6 +122,14 @@ type Snapshot struct {
 	// whether the ring is being eroded.
 	HaltedCells int `json:"haltedCells"`
 
+	// StalledCells is how many cells are backed off after repeated rejection.
+	//
+	// Distinct from HaltedCells and the distinction is the point: a stalled cell
+	// is still trying, on its own, at a slowing cadence. It needs watching, not
+	// rescuing. A number that stays high while HaltedCells is zero means the
+	// network is refusing work the automaton will keep offering until it stops.
+	StalledCells int `json:"stalledCells"`
+
 	// Starved reports that the automaton has stopped for want of funding, with
 	// the address to send coin to. It resumes unattended once coin arrives.
 	Starved        bool   `json:"starved"`
@@ -366,6 +374,28 @@ type Engine struct {
 	// Config.MaxUnseenDepth.
 	lastSeen map[int]uint64
 
+	// refusedAt[cell] is when that cell last had a transition refused, and it
+	// exists to tell one broken cell apart from a broken network.
+	//
+	// A refusal that arrives alone is evidence about that cell. The same refusal
+	// arriving for most of the ring inside a few seconds is evidence about
+	// something else entirely — arcade, the node, or our own restart — and
+	// charging it against per-cell budgets converts a fault that clears by itself
+	// into 256 cells that never do. That is not hypothetical: it is how 248 of
+	// 256 cells were lost on 2026-08-13 to a burst that had already passed.
+	refusedAt map[int]time.Time
+
+	// stalledUntil[cell] is when a backed-off cell may try again, and
+	// stallStreak[cell] is how many times running it has had to. Together they
+	// replace the halt that used to be terminal.
+	//
+	// A stalled cell is NOT a halted cell: it keeps its place, keeps retrying at
+	// a slowing cadence, and needs nobody. Halt is now reserved for the one thing
+	// no amount of retrying fixes — see Engine.Halt.
+	stalledUntil map[int]time.Time
+	stallStreak  map[int]int
+	stallReason  map[int]string
+
 	// unseenSince[cell] is when the acceptance gate first refused this cell a
 	// turn, as Unix nanoseconds, or 0 while it is not refusing one. Past
 	// Config.UnseenTimeout the cell is let through anyway, so a status that never
@@ -577,6 +607,10 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		rate:           startRate(opts),
 		lastMined:      make(map[int]uint64, d.Cells),
 		lastSeen:       make(map[int]uint64, d.Cells),
+		refusedAt:      make(map[int]time.Time, d.Cells),
+		stalledUntil:   make(map[int]time.Time),
+		stallStreak:    make(map[int]int),
+		stallReason:    make(map[int]string),
 		unseenSince:    make([]atomic.Int64, d.Cells),
 		changed:        make(chan struct{}),
 		txIndex:        make(map[string]txLoc),
@@ -851,6 +885,7 @@ func (e *Engine) snapshot(limit int) Snapshot {
 		Leader:         e.leader,
 		Locked:         e.opts.LockControls,
 		HaltedCells:    len(e.halted),
+		StalledCells:   e.stalledCountLocked(),
 		Lag:            e.target - min(e.target, frontier),
 		Depth:          e.deepestLocked(),
 		UnseenDepth:    e.deepestUnseenLocked(),

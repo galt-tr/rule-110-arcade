@@ -3,6 +3,7 @@ package engine
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
 
@@ -148,7 +149,15 @@ func TestRepairClearsTheWholeDoomedRun(t *testing.T) {
 
 // TestRepairStopsAfterMaxRetries bounds the rebuild. A transition that cannot be
 // made to work must halt for a human rather than rebuild for ever.
-func TestRepairStopsAfterMaxRetries(t *testing.T) {
+// TestRepairSlowsAfterMaxRetries: rebuilds are paced, not abandoned.
+//
+// This test used to be TestRepairStopsAfterMaxRetries and asserted that the
+// cell HALTED — terminally, needing `rule110 recover`. That is the behaviour
+// that lost 248 of 256 cells to a rejection burst which had already passed, so
+// the assertion is inverted on purpose. What survives unchanged is everything
+// about WHEN the budget is spent: three rebuilds inside one bad second still say
+// nothing, and the refusals must span minHaltWindow before they count.
+func TestRepairSlowsAfterMaxRetries(t *testing.T) {
 	f := newFixture(t)
 	e := engineOn(t, f)
 	const cell = 6
@@ -159,10 +168,11 @@ func TestRepairStopsAfterMaxRetries(t *testing.T) {
 	for i := 1; i <= maxRetries; i++ {
 		refuse(t, f, e, cell, refused, aRefusal)
 		e.mu.RLock()
-		halted := e.halted[cell]
+		stalled := e.stalledLocked(cell, time.Now())
 		e.mu.RUnlock()
-		if halted {
-			t.Fatalf("cell halted on attempt %d of %d", i, maxRetries)
+		if stalled {
+			t.Fatalf("cell backed off on attempt %d of %d, before its budget was spent",
+				i, maxRetries)
 		}
 	}
 
@@ -172,10 +182,10 @@ func TestRepairStopsAfterMaxRetries(t *testing.T) {
 	// Backdate them, as a genuine outage would.
 	refuse(t, f, e, cell, refused, aRefusal)
 	e.mu.RLock()
-	early := e.halted[cell]
+	early := e.stalledLocked(cell, time.Now())
 	e.mu.RUnlock()
 	if early {
-		t.Fatal("cell halted on refusals that all landed in the same instant")
+		t.Fatal("cell backed off on refusals that all landed in the same instant")
 	}
 
 	e.mu.Lock()
@@ -184,22 +194,29 @@ func TestRepairStopsAfterMaxRetries(t *testing.T) {
 	e.retries[cell] = st
 	e.mu.Unlock()
 
-	// Now a refusal of the SAME generation, past the window, is the one that halts.
+	// Now a refusal of the SAME generation, past the window, is the one that
+	// paces the cell.
 	refuse(t, f, e, cell, refused, aRefusal)
 
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if !e.halted[cell] {
-		t.Fatalf("cell rebuilt past %d consecutive refusals of generation %d",
+	if !e.stalledLocked(cell, time.Now()) {
+		t.Fatalf("cell rebuilt past %d consecutive refusals of generation %d without "+
+			"backing off; one persistently refused cell would rebuild flat out",
 			maxRetries, refused.Generation)
 	}
-	if e.needsRepair[cell] {
-		t.Error("a halted cell still has a rebuild scheduled")
+	if e.halted[cell] {
+		t.Error("the cell halted. Pacing a fault is a decision the program can make; " +
+			"giving up on the cell is not")
 	}
-	// The reason has to survive: this path used to set halted and leave
-	// haltReason empty, so the UI reported a halted cell with nothing to say.
-	if !strings.Contains(e.haltReason[cell], "REJECTED") {
-		t.Errorf("halt reason = %q, want arcade's own words", e.haltReason[cell])
+	if !e.needsRepair[cell] {
+		t.Error("a stalled cell must keep its rebuild scheduled — the backoff decides " +
+			"WHEN it rebuilds, not whether")
+	}
+	// The reason has to survive: the halt path this replaced once set halted and
+	// left haltReason empty, so the UI reported a stopped cell with nothing to say.
+	if !strings.Contains(e.stallReason[cell], "REJECTED") {
+		t.Errorf("stall reason = %q, want arcade's own words", e.stallReason[cell])
 	}
 }
 

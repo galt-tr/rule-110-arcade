@@ -66,6 +66,15 @@ type perf struct {
 	// nor the poll can see a transaction we are holding a cell for.
 	unseenProbes           *metrics.Counter
 	unseenProbesUnanswered *metrics.Counter
+
+	// stalls counts cells backed off after repeated rejection, and
+	// refusalsInBursts counts refusals attributed to the ring rather than to a
+	// cell. Neither is an error: a stall is the automaton absorbing a fault it
+	// cannot fix, and a burst is it declining to blame 256 cells for one event.
+	// Both climbing together is the signature of a bad network rather than a bad
+	// chain.
+	stalls           *metrics.Counter
+	refusalsInBursts *metrics.Counter
 }
 
 func newPerf() *perf {
@@ -117,6 +126,10 @@ func newPerf() *perf {
 			"Acceptance-gate deadlines that expired and sent us to ask arcade directly. Above zero means the status stream is failing to deliver statuses arcade holds."),
 		unseenProbesUnanswered: r.Counter("rule110_unseen_probes_unanswered_total",
 			"Probes arcade could not answer, where the cell kept waiting rather than advancing. Alarm on this: neither the stream nor the poll can see a transaction a cell is held for."),
+		stalls: r.Counter("rule110_cell_stalls_total",
+			"Cells backed off after repeated rejection. They keep retrying at a slowing cadence and need no operator; this is the automaton absorbing a fault rather than stopping for it."),
+		refusalsInBursts: r.Counter("rule110_refusals_in_bursts_total",
+			"Refusals attributed to the ring rather than to a cell, because a quarter or more of live cells were refusing at once. These deliberately spend no per-cell retry budget."),
 	}
 }
 
