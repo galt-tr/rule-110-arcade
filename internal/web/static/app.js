@@ -106,7 +106,18 @@ const pinnedBox = document.getElementById('pinned');
 // off-screen behind a horizontal scrollbar. Zooming in is a deliberate act;
 // having to zoom out to see anything is not.
 let cellPx = 4;       // driven by the zoom control, not the viewport
-let follow = true;    // auto-scroll only while pinned to the newest row
+// Off by default, and the page still OPENS at the live edge — the two are
+// different things. Landing on the newest generation is what someone arriving
+// at a running automaton expects; being dragged to it once a second afterwards
+// is what makes the history unreadable the moment they scroll back. "Go to
+// bottom" covers the case this used to cover by force.
+let follow = false;   // auto-scroll only while pinned to the newest row
+
+/** Whether the one-time landing on the newest generation is still owed.
+ *
+ * Cleared by taking it, and by anything that says where to look instead — a
+ * #gen= deep link, or a jump. */
+let openAtLiveEdge = true;
 
 /** Everything the client holds.
  *
@@ -510,6 +521,16 @@ function draw() {
   wanted = { base: Math.max(state.extent.oldest, base - OVERSCAN), rows: rows + 2 * OVERSCAN };
   scheduleFetch();
 
+  // The one-time landing, taken now that reflow has given the spacer its real
+  // height. Deliberately not the same thing as following: it puts the viewer at
+  // the newest generation once, and leaves them free to scroll away.
+  if (openAtLiveEdge && !state.extent.empty && state.rows.size) {
+    openAtLiveEdge = false;
+    wrap.scrollTop = wrap.scrollHeight;
+    scheduleRender();   // the window moved; draw where it now is
+    return;
+  }
+
   // Only chase the leading edge when the viewer is already there. Scrolling
   // them back down while they are reading history is worse than losing the
   // live edge, which the follow toggle restores in one click.
@@ -648,10 +669,29 @@ zoom.oninput = () => {
 };
 
 const followBox = document.getElementById('follow');
+// The checkbox is the authority at startup, not the initial value of `follow`:
+// a browser restores a checkbox across a reload, so reading it here keeps the
+// two from disagreeing about a box the viewer can see.
+follow = followBox.checked;
 followBox.onchange = () => {
   follow = followBox.checked;
-  if (follow) wrap.scrollTop = wrap.scrollHeight;
+  if (follow) toBottom();
 };
+
+/** Put the newest generation in view and stay there.
+ *
+ * Both halves, because "catch me up" and "keep me caught up" are the same wish
+ * at the live edge: arriving at the newest row only to drift off it a second
+ * later would leave the button to be pressed again every generation. The
+ * checkbox is set too, so the page never claims to be doing something
+ * different from what it is doing. */
+function toBottom() {
+  follow = true;
+  followBox.checked = true;
+  wrap.scrollTop = wrap.scrollHeight;
+  scheduleRender();
+}
+document.getElementById('toBottom').onclick = toBottom;
 
 // Scrolling away from the bottom releases follow, so reading history is not a
 // fight with the renderer; scrolling back re-arms it.
@@ -968,11 +1008,45 @@ async function detailFor(number, cell) {
   }
 }
 
-canvas.onclick = async (ev) => {
+/** Arcade's status page for a transaction.
+ *
+ * This function was lost in the move to virtualized history while its call site
+ * survived, so every click threw a ReferenceError. Inside an async handler that
+ * surfaces as an unhandled rejection — nothing in the page, nothing in the way
+ * of feedback, just a cell that advertises itself as clickable and then does
+ * nothing at all. */
+function arcadeTxURL(txid) {
+  const base = (state.snap && state.snap.arcadeUrl) || '';
+  return base.replace(/\/+$/, '') + '/tx/' + txid;
+}
+
+canvas.onclick = (ev) => {
   const hit = cellAt(ev);
   if (!hit || hit.stateChar === '-') return;
-  const d = await detailFor(hit.number, hit.index);
-  if (d && d.txid) window.open(arcadeTxURL(d.txid), '_blank', 'noopener');
+
+  // The tab has to be opened INSIDE the click. A browser honours window.open
+  // only while the user gesture is still live, and awaiting a lookup outlives
+  // it — so this handler is deliberately not async. Hovering populates the
+  // cache, which on a pointer device has almost always happened by the time the
+  // click lands, and then the open is straightforwardly synchronous.
+  const cached = txCache.get(hit.number + ':' + hit.index);
+  if (cached !== undefined) {
+    if (cached && cached.txid) window.open(arcadeTxURL(cached.txid), '_blank', 'noopener');
+    return;
+  }
+
+  // Nothing cached — a touch device, where there is no hover, or a click faster
+  // than the lookup. Claim the tab now while the gesture still counts and point
+  // it at the transaction when the id arrives. Opened without 'noopener'
+  // because that form returns null, leaving nothing to navigate; the opener is
+  // severed by hand instead, which is the same protection.
+  const tab = window.open('', '_blank');
+  if (tab) tab.opener = null;
+  detailFor(hit.number, hit.index).then((d) => {
+    if (!tab) return;
+    if (d && d.txid) tab.location = arcadeTxURL(d.txid);
+    else tab.close();
+  });
 };
 
 canvas.onmousemove = (ev) => {
@@ -1061,6 +1135,9 @@ async function refreshExtent(force) {
 function jumpTo(n) {
   if (state.extent.empty) return;
   const clamped = Math.min(Math.max(n, state.extent.oldest), state.extent.newest);
+  // Someone has said where to look, so the landing is no longer owed; without
+  // this it would fire afterwards and throw the view to the live edge.
+  openAtLiveEdge = false;
   follow = false;
   followBox.checked = false;
   wrap.scrollTop = (clamped - state.extent.oldest) * cellPx;
@@ -1094,7 +1171,13 @@ refreshExtent(true)
     // expects to see. Scrolling back is the new capability; landing at
     // generation 0 of a 20,000-generation run would be a regression dressed as
     // a feature.
-    wrap.scrollTop = wrap.scrollHeight;
+    //
+    // Recorded as an intent rather than done here, because the spacer has not
+    // been sized yet: scrollHeight is still a placeholder until draw() has both
+    // the extent and a snapshot, so setting scrollTop now scrolls to the bottom
+    // of nothing. This used to be covered by follow being on, which pinned the
+    // view a moment later; with follow off by default there is nothing to fall
+    // back on and the page opened at generation 0.
     scheduleRender();
   })
   .catch(() => {});
@@ -1113,6 +1196,7 @@ if (typeof module !== 'undefined' && module.exports) {
     setFundTarget(t) { fundTarget = t; },
     setExtent(e) { state.extent = e; },
     setFollow(f) { follow = f; },
+    setOpenAtLiveEdge(v) { openAtLiveEdge = v; },
     setAwaitingFuel(a) { awaitingFuel = a; },
     wanted: () => wanted,
     view: () => view,

@@ -117,6 +117,13 @@ global.fetch = (url) => {
     }
     return Promise.resolve({ ok: true, json: () => Promise.resolve({ from, generations: gens })});
   }
+  if (url.startsWith('/api/tx')) {
+    const g = Number(/generation=(\d+)/.exec(url)[1]);
+    const c = Number(/cell=(\d+)/.exec(url)[1]);
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({
+      generation: g, cell: c, txid: 'ab'.repeat(32), status: 'mined',
+    })});
+  }
   return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
 };
 // wallet.js in the browser; the panel only calls into it on a click, which
@@ -532,6 +539,7 @@ test('the bootstrap fuel phase also spins', () => {
 test('no spinner when nothing is being minted', () => {
   app.setFundTarget(FUND_TARGET);
   app.setAwaitingFuel(null);
+  app.setOpenAtLiveEdge(false);
   apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10 }));
   flushFrames();
   assert.strictEqual(byId('fundSpin').hidden, true, 'the spinner runs when nothing is happening');
@@ -615,6 +623,170 @@ test('ordinary growth does not count as a restart', async () => {
 
 // Async-aware: the extent is re-read over the network, so the tests that cover
 // a restart have to be able to await it.
+
+// --- opening a cell's transaction ------------------------------------------
+//
+// These cover a live failure: cells advertised themselves as clickable, the
+// cursor changed, the tooltip offered "click to open in arcade" — and clicking
+// did nothing whatsoever. arcadeTxURL had been lost in the move to virtualized
+// history while its call site survived, so every click threw a ReferenceError
+// inside an async handler, where it surfaced as an unhandled rejection and no
+// feedback of any kind.
+
+
+/** Point at a cell in the first visible row. Cell index counts from the RIGHT
+ *  (c = CELLS-1-floor(x/cellPx)), so x must stay inside CELLS*cellPx.
+ *
+ * Each test takes a DIFFERENT cell on purpose: the transaction-id cache is
+ * module state that outlives a test, so reusing one cell would let a later test
+ * quietly take the cached path and assert nothing it meant to. */
+const at = (x) => ({ clientX: x, clientY: 2 });
+
+test('clicking a cell opens its transaction in arcade', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+
+  // Hover first, which is what a pointer device does and what caches the id.
+  app.canvas.onmousemove(at(200));
+  await settle();
+
+  const opened = [];
+  window.open = (url) => { opened.push(url); return null; };
+  app.canvas.onclick(at(200));
+
+  assert.strictEqual(opened.length, 1, 'the click opened nothing at all');
+  assert.ok(/\/tx\/[0-9a-f]{64}$/.test(opened[0]),
+    `opened ${opened[0]}, which is not an arcade transaction URL`);
+});
+
+test('the tab is claimed during the click, not after the lookup', () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+
+  // Nothing hovered, so the id is not cached and has to be fetched. The open
+  // must still happen synchronously inside the handler: a browser honours
+  // window.open only while the user gesture is live, and a tab opened after an
+  // awaited fetch is silently blocked as a popup.
+  let openedSynchronously = false;
+  window.open = () => { openedSynchronously = true; return { opener: {}, close() {} }; };
+  app.canvas.onclick(at(204));
+
+  assert.ok(openedSynchronously,
+    'window.open ran after an await, where the browser blocks it as a popup');
+});
+
+test('a click with nothing cached still reaches the transaction', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+
+  const tab = { location: null, opener: {}, closed: false, close() { this.closed = true; } };
+  window.open = () => tab;
+  app.canvas.onclick(at(208));
+  await settle();
+
+  assert.ok(tab.location && /\/tx\/[0-9a-f]{64}$/.test(String(tab.location)),
+    `the claimed tab went to ${tab.location} instead of the transaction`);
+  assert.ok(!tab.closed, 'the tab was closed even though the lookup succeeded');
+});
+
+test('a cell with no transaction opens nothing', () => {
+  atArchive(0, 200);
+  // '-' is the archive's "no record for this cell".
+  const n = app.view().base;
+  state.rows.set(n, { number: n, row: 'aa'.repeat(CELLS / 8), s: '-'.repeat(CELLS) });
+
+  let opened = 0;
+  window.open = () => { opened++; return null; };
+  app.canvas.onclick(at(212));
+
+  assert.strictEqual(opened, 0, 'a cell with no transaction opened a tab anyway');
+});
+
+// --- following, and getting back to the end ---------------------------------
+
+// Following being off must not change WHERE THE PAGE OPENS. Those were the same
+// thing by accident: with follow on, the initial view was pinned to the live
+// edge a moment after load. Turning the default off removed that and the page
+// opened at generation 0 of the whole run — caught in a browser, not here,
+// which is why it is pinned here now.
+test('the page opens at the live edge even though following is off', () => {
+  app.setExtent({ oldest: 0, newest: 5000, count: 5001, empty: false });
+  setArchive({ oldest: 0, newest: 5000 });
+  app.setFollow(false);
+  byId('follow').checked = false;
+
+  // As the page starts: the landing is owed, and nothing has been scrolled.
+  app.setOpenAtLiveEdge(true);
+  const wrap = byId('canvas-wrap');
+  wrap.scrollTop = 0;
+  wrap.scrollHeight = 5001 * 4;
+
+  apply(snapshot(tail(4993, 5000)));
+  flushFrames();
+
+  assert.ok(wrap.scrollTop > 0,
+    'the page opened at generation 0 of a 5,000-generation run');
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'the landing did not reach the newest generation');
+  assert.strictEqual(byId('follow').checked, false,
+    'landing at the live edge switched following on; it is a landing, not a leash');
+});
+
+test('the diagram is not dragged to the live edge unless following is on', () => {
+  atArchive(0, 1000, 400 * 4);   // parked in history, reading
+  app.setFollow(false);
+  byId('follow').checked = false;
+  const before = byId('canvas-wrap').scrollTop;
+
+  apply(snapshot(tail(1001, 1008)));   // the run advances underneath
+  flushFrames();
+
+  assert.strictEqual(byId('canvas-wrap').scrollTop, before,
+    'a new generation yanked the view away from the history being read');
+});
+
+test('go to bottom reaches the newest generation and starts following', () => {
+  atArchive(0, 1000, 400 * 4);
+  app.setFollow(false);
+  byId('follow').checked = false;
+
+  byId('toBottom').onclick();
+  flushFrames();
+
+  const wrap = byId('canvas-wrap');
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'go to bottom did not reach the newest generation');
+  assert.strictEqual(byId('follow').checked, true,
+    'the checkbox does not show that the view is now following');
+
+  // Arriving at the live edge only to drift off it would leave the button to be
+  // pressed again every generation.
+  apply(snapshot(tail(1001, 1008)));
+  flushFrames();
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'the view fell behind the live edge straight after being sent there');
+});
+
+test('following still chases the live edge when it is switched on', () => {
+  atArchive(0, 1000);            // opens at the live edge
+  byId('follow').checked = true;
+  app.setFollow(true);
+
+  // Nudge off the bottom, as a stray wheel event would, then let the run
+  // advance. The spacer's height is driven by reflow inside draw(), and
+  // atBottom() is read BEFORE that on purpose, so the stub must not pre-grow it.
+  const wrap = byId('canvas-wrap');
+  wrap.scrollTop = wrap.scrollHeight - wrap.clientHeight;
+
+  apply(snapshot(tail(1001, 1008)));
+  flushFrames();
+
+  assert.strictEqual(wrap.scrollTop, wrap.scrollHeight,
+    'following was on but the view did not keep up with the live edge');
+});
+
+// Async-aware: a click leads to a lookup, so the tests that follow it through
+// have to be able to await.
 (async () => {
 for (const [name, fn] of tests) {
   // Each test starts from a clean surface; the module is a singleton.
