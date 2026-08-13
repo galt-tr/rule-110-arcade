@@ -351,7 +351,7 @@ Flags accepted by every subcommand, beyond those five:
 | `-fee-sat-per-kb` | `125` | Above arcade's 100 sat/kB floor. The margin is headroom for a fee committed from a size *estimate* made before the ~2.6 kB unlocking scripts exist, not a correction for the floor being applied to a larger size. See `Config.FeeSatPerKB`. |
 | `-throughput` | `true` | Fund from the denominated fuel pool instead of contending for change. |
 | `-fuel-sats` | `1000` | Value of one fuel coin. Must clear one transition's fee plus the dust floor. |
-| `-fuel-pool` | `20000` | Coins the keeper maintains. |
+| `-fuel-pool` | `20000` | Coins the keeper maintains. Size it for the worst case *including quarantine* — see [rejections lock fuel](#rejections-lock-fuel-for-minutes) below. |
 | `-max-depth` | `0` | How far a cell may run ahead of its newest mined transaction; 0 is unbounded, which is the default because no ancestor limit was found and any bound throttles the rate — see below. |
 | `-max-lag` | `32` | How far the clock may run ahead of the slowest cell. |
 
@@ -373,6 +373,37 @@ against the real bytes rather than the plan, and it is the check that catches a
 fee committed against a bad size estimate. Set it to the floor the receiving
 arcade enforces if you need to change it — it is the network's policy, not a
 target rate.
+
+### Rejections lock fuel for minutes
+
+A rejection does **not** hand its funding coin straight back, and sizing the
+pool without knowing that is how a burst of rejections turns into a funding
+outage on top of itself.
+
+The toolbox releases in two phases, deliberately. `applyRejected` only marks the
+transaction suspect; nothing is freed. Release needs the reconciler's
+`VerifyAndReleaseSuspects` pass (60 s interval) to re-ask arcade, and then a
+further `DefaultSuspectGrace` of 90 s — realistically **two passes, ~150 s**.
+Meanwhile the change that transaction minted is **frozen**. Past
+`DefaultMaxQuarantine` (24 h) a suspect becomes terminal `stuck` and is never
+released automatically at all.
+
+The two phases are right: a `REJECTED` verdict can be revised — arcade's own
+lifecycle says `SEEN_ON_NETWORK` may recover one — and releasing early would
+hand back a coin whose transaction is about to be accepted. But it means the
+pool must carry the transactions in flight *plus* everything quarantined:
+
+```
+pool ≳ cells × rate × (acknowledgement latency + 150 s × rejection rate)
+```
+
+At 256 cells and 1 gen/s, a minute of sustained rejections quarantines on the
+order of 15,000 coins — which is most of a 20,000-coin pool, and why the default
+is 60,000 here. The toolbox says the same thing more briefly: *"Size fuel pools
+for worst-case quarantine if rejections are common."*
+
+`rule110_funding_shortfalls_total` climbing while the balance looks healthy is
+this, and not a keeper that has stopped working.
 
 ### The acceptance gate
 
