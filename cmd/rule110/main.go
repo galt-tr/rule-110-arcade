@@ -658,9 +658,6 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *pprofAddr != "" {
-		serveProfiles(ctx, *pprofAddr, logger)
-	}
 	// Hand every reader over to the engine. Anyone streaming during the cold
 	// start is holding the bootstrapper's change channel, so Adopt notifies once
 	// — without it they would block on a channel nothing closes again.
