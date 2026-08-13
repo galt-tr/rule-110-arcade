@@ -499,10 +499,18 @@ func (e *Engine) clearRetriesLocked(cell int, generation uint64) {
 // and it must not hold the engine's write lock across a network call.
 // Reported upstream as bsv-blockchain/arcade#301.
 func (e *Engine) fetchRejectionReason(txid string, cell int) {
+	// e.oracle, not e.chain.Oracle. They are the same object in production
+	// (engine.New wires one from the other), but only this one is the seam
+	// chain.TxStatus documents as the thing that must be substitutable — reaching
+	// past it put a live arcade client on a path a test cannot reach, and made
+	// every rejection test panic on a nil client instead of exercising it.
+	if e.oracle == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	rec, err := e.chain.Oracle.GetTx(ctx, txid)
+	rec, err := e.oracle.GetTx(ctx, txid)
 	if err != nil || rec == nil || rec.ExtraInfo == "" {
 		return
 	}

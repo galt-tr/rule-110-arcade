@@ -250,60 +250,88 @@ func (e *Engine) turnReady(cell int) bool {
 	// unsigned integers tip-seen would then wrap to an enormous number and clamp
 	// the cell shut for ever, with nothing anywhere saying why.
 	if maxUnseen > 0 && tip > seen && tip-seen >= maxUnseen {
-		if !e.unseenGateExpired(cell, timeout) {
-			return false
+		// Blocked. Start the clock, if it is not already running, so the worker
+		// knows when to go and ASK rather than keep waiting. The gate itself
+		// never opens on a timer — see probeAcceptance for why.
+		if timeout > 0 {
+			e.unseenSince[cell].CompareAndSwap(0, time.Now().UnixNano())
 		}
-		// Fall through: the acknowledgement is late enough that waiting longer
-		// is no longer telling us anything.
-	} else {
-		// Not gated, so any timer this cell was running is stale.
-		e.unseenSince[cell].Store(0)
+		return false
 	}
+	// Not gated, so any timer this cell was running is stale.
+	e.unseenSince[cell].Store(0)
 	return tip < target
 }
 
-// unseenGateExpired reports whether the acceptance gate has held this cell past
-// its deadline, starting the clock on the first refusal.
+// unseenDeadlinePassed reports whether the acceptance gate has held this cell
+// longer than the deadline. It does NOT release the cell.
 //
-// The gate's whole purpose is to wait for something that is coming. It has no
-// answer for something that is NOT coming, and both halves of the status path
-// can produce that: arcade drops events it cannot fan out fast enough and its
-// catch-up truncates rather than replaying them all, and a backlogged
-// transaction skips the seen statuses entirely on its way to MINED. Either way
-// the cell waits on an acknowledgement no one will ever send.
+// That distinction is the whole of this change. The deadline used to open the
+// gate by itself, on the argument that arriving early costs a retry while
+// waiting for ever costs the cell. The argument was sound and the conclusion
+// was wrong, because it assumed the only reason a status goes missing is that
+// the event was lost. A parent that was genuinely REJECTED produces the same
+// silence, and building on it makes every later generation of that cell invalid
+// too — one blind advance becomes a cascade.
 //
-// Letting it through is the lesser failure. Arcade keys a dependency family to
-// one partition and retries a missing parent rather than rejecting for ordering
-// alone, so arriving early costs a retry; waiting for ever costs the cell.
-//
-// Returning true RESETS the timer, so the next refusal starts a fresh deadline.
-// A cell whose status is genuinely lost then advances once per timeout rather
-// than freewheeling — still gated, just no longer stopped.
-func (e *Engine) unseenGateExpired(cell int, timeout time.Duration) bool {
+// Measured on the live deployment: 119 blind advances preceded 3,962 rejections
+// and 248 of 256 cells halted. So the deadline now only decides WHEN TO ASK.
+func (e *Engine) unseenDeadlinePassed(cell int, timeout time.Duration) bool {
 	if timeout <= 0 {
 		return false // deadline disabled; wait as long as it takes
 	}
-	now := time.Now()
 	since := e.unseenSince[cell].Load()
 	if since == 0 {
-		// First refusal. Start the clock and wait — a CAS rather than a Store so
-		// two concurrent callers cannot restart each other's deadline.
-		e.unseenSince[cell].CompareAndSwap(0, now.UnixNano())
-		return false
+		return false // not blocked, or the clock has not started
 	}
-	if now.Sub(time.Unix(0, since)) < timeout {
-		return false
+	return time.Since(time.Unix(0, since)) >= timeout
+}
+
+// probeAcceptance asks arcade about the transaction the acceptance gate is
+// waiting on, and feeds the answer into the ordinary status path.
+//
+// Three answers, three different right moves:
+//
+//   - a status arcade has (ACCEPTED / SEEN / MINED) releases the gate, because
+//     applyStatus advances lastSeen exactly as a delivered event would. This is
+//     the common case by a wide margin: of the transactions the live deployment
+//     had stuck, 11 of 11 and then 242 of 242 came back ACCEPTED_BY_NETWORK —
+//     the transaction was always fine and only the event was lost.
+//   - REJECTED routes through noteRefusalLocked, which schedules a rebuild. The
+//     cell does not advance onto a parent the network threw away.
+//   - no answer at all — not found, or arcade unreachable — must NOT be read as
+//     yes. The clock is restarted and the cell waits for the next deadline.
+//
+// It runs on the cell's own worker goroutine, which is allowed to block; the
+// same question asked from turnReady would put a network round trip inside a
+// function every cell calls on every notification.
+func (e *Engine) probeAcceptance(ctx context.Context, cell int) {
+	e.mu.RLock()
+	txid := e.tips[cell].TxID
+	e.mu.RUnlock()
+
+	// Whatever happens below, restart the clock: a probe that resolves nothing
+	// must wait another deadline rather than spin.
+	defer e.unseenSince[cell].Store(time.Now().UnixNano())
+
+	if txid == "" {
+		return
 	}
-	if !e.unseenSince[cell].CompareAndSwap(since, 0) {
-		// Someone else took this expiry. One cell, one release.
-		return false
+	e.perf.unseenProbes.Inc()
+
+	rec, err := e.oracle.GetTx(ctx, txid)
+	if err != nil || rec == nil {
+		e.perf.unseenProbesUnanswered.Inc()
+		e.logger.WarnContext(ctx, "acceptance gate expired and arcade could not answer; still waiting",
+			"cell", cell, "txid", txid, "err", err,
+			"why", "'we could not ask' is not 'yes'; advancing here is how a cell "+
+				"builds on a parent the network threw away")
+		return
 	}
-	e.perf.unseenTimeouts.Inc()
-	e.logger.Warn("acceptance gate timed out; advancing without an acknowledgement",
-		"cell", cell, "waited", now.Sub(time.Unix(0, since)).Round(time.Second),
-		"timeout", timeout,
-		"cause", "arcade never delivered a status for this cell's newest transaction")
-	return true
+
+	e.logger.InfoContext(ctx, "acceptance gate expired; arcade answered",
+		"cell", cell, "txid", txid, "status", rec.Status)
+	e.applyStatus(rec.TxID, rec.Status, rec.ExtraInfo)
 }
 
 // depthPoll is how often a cell re-checks its turn when the depth gate is
@@ -407,6 +435,14 @@ func (e *Engine) awaitTurn(ctx context.Context, cell int) bool {
 		}
 		if e.turnReady(cell) {
 			return true
+		}
+
+		// The acceptance gate has held this cell past its deadline. Ask arcade
+		// what became of the parent rather than assuming, then re-test: the
+		// answer either releases the gate or schedules a rebuild.
+		if e.unseenDeadlinePassed(cell, e.chain.Config.UnseenTimeout) {
+			e.probeAcceptance(ctx, cell)
+			continue
 		}
 
 		// nil unless something needs re-checking on a timer, and a nil channel

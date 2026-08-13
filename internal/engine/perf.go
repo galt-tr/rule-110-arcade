@@ -56,10 +56,16 @@ type perf struct {
 	shortfallsTotal  *metrics.Counter
 	statusesTotal    *metrics.Counter
 
-	// unseenTimeouts counts cells the acceptance gate let through without an
-	// acknowledgement. Anything above zero means statuses are being lost rather
-	// than merely delayed, and it is the one number that distinguishes the two.
-	unseenTimeouts *metrics.Counter
+	// unseenProbes counts deadlines that expired and sent us to ask arcade about
+	// the parent; unseenProbesUnanswered counts the subset arcade could not
+	// answer, where the cell keeps waiting.
+	//
+	// The first is how often the status stream failed to deliver something it
+	// had — the number that distinguishes statuses being LOST from merely
+	// delayed. The second is the one to alarm on: it means neither the stream
+	// nor the poll can see a transaction we are holding a cell for.
+	unseenProbes           *metrics.Counter
+	unseenProbesUnanswered *metrics.Counter
 }
 
 func newPerf() *perf {
@@ -107,8 +113,10 @@ func newPerf() *perf {
 			"Transitions that could not claim a coin and backed off."),
 		statusesTotal: r.Counter("rule110_statuses_applied_total",
 			"Arcade status records applied to a cell we own."),
-		unseenTimeouts: r.Counter("rule110_unseen_gate_timeouts_total",
-			"Cells the acceptance gate released without an acknowledgement, because none arrived before the deadline. Above zero means statuses are being lost, not merely delayed."),
+		unseenProbes: r.Counter("rule110_unseen_probes_total",
+			"Acceptance-gate deadlines that expired and sent us to ask arcade directly. Above zero means the status stream is failing to deliver statuses arcade holds."),
+		unseenProbesUnanswered: r.Counter("rule110_unseen_probes_unanswered_total",
+			"Probes arcade could not answer, where the cell kept waiting rather than advancing. Alarm on this: neither the stream nor the poll can see a transaction a cell is held for."),
 	}
 }
 
