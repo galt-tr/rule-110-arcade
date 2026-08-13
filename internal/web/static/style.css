@@ -313,6 +313,55 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   border-left: 3px solid var(--line);
 }
 
+/* At rest, one line.
+ *
+ * The panel is permanent on purpose — see renderFund — but permanent was being
+ * read as three lines of payment copy standing between the header and the
+ * diagram at all times, on a page whose whole subject is below it. Collapsed,
+ * the standing offer and the button that takes it are still there; the
+ * paragraph about fees and the pay-by-hand fallback are a chevron away.
+ *
+ * Only `resting` collapses. low, stopped and working all set their own class
+ * and are excluded, so need still opens the panel without being asked — the
+ * escalation is on the engine's evidence, not on whether anyone clicked. */
+#fund.resting { padding: 6px 18px; }
+#fund.resting:not([data-expanded]) #fundWhy,
+#fund.resting:not([data-expanded]) #fundManual { display: none; }
+/* The coin count that goes with it is not lost: the header carries `fuel` as a
+   standing stat, which is where a number that changes every second belongs. */
+
+/* Deliberately tiny. On a 390px screen the title and the amount-plus-button
+   group together come to within a few pixels of the bar's width, so anything
+   wider than this tips the whole thing onto a second row and costs more height
+   than collapsing the panel saved. */
+#fundToggle {
+  display: none;
+  padding: 0 4px;
+  margin-left: 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  vertical-align: 1px;
+  transition: transform .15s ease;
+}
+/* Only where there is something behind it. In every other state the detail is
+   already on screen and a control that expands what is expanded is furniture. */
+#fund.resting #fundToggle { display: inline-block; }
+/* The message row is the control — see index.html — so it carries the pointer
+   and, on a touchscreen, the height that makes it hittable. The chevron itself
+   stays 17px wide: taking 44 out of this row would come straight out of the
+   title, and there is nothing spare in it at 390px. */
+#fund.resting .fund-msg { cursor: pointer; }
+@media (pointer: coarse) {
+  #fund.resting .fund-msg { min-height: 44px; }
+}
+#fund.resting[data-expanded] #fundToggle { transform: rotate(180deg); }
+@media (prefers-reduced-motion: reduce) {
+  #fundToggle { transition: none; }
+}
+
 #fund.low {
   border-left-color: var(--fund-warn);
   background: var(--fund-warn-bg);
@@ -786,6 +835,7 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   /* ...which needs room around each case, or neighbouring hit areas overlap and
      the top half of one bit belongs to the bit above it. */
   .rule-table { gap: 20px 12px; }
+
 }
 
 /* ---------------------------------------------------------------------------
@@ -829,12 +879,32 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   .fund-bar { gap: 8px; }
   .fund-act { flex-shrink: 1; min-width: 0; }
   #fund input[type=number] { width: 9ch; min-width: 0; }
-  /* Resting, the panel is one line: a title and the button. The reason and the
-     pay-by-hand fallback appear when it actually needs money, which is the same
-     escalation the colours already do — urgency changes what is on screen,
-     presence does not. */
-  #fund:not(.low):not(.stopped) #fundWhy,
-  #fund:not(.low):not(.stopped) #fundManual { display: none; }
+  #fund.resting { padding: 5px 12px; }
+  .fund-btn-tail { display: none; }
+  #fund input[type=number] { width: 8ch; }
+  .fund-act { gap: 6px; }
+  /* The whole saving depends on this staying one row, and at 360px the title,
+     the chevron and the amount-plus-button group do not fit in the bar's width.
+     Left to wrap they cost more height than collapsing the panel saved, and
+     they wrap in three different places — the bar, the title against the
+     chevron, and the words inside the button. So nothing here wraps, and the
+     title is the one thing allowed to give way. A clipped word is a smaller
+     loss than the row it prevents. */
+  #fund.resting:not([data-expanded]) .fund-bar { flex-wrap: nowrap; }
+  #fund.resting:not([data-expanded]) .fund-msg {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+  }
+  #fund.resting:not([data-expanded]) #fundTitle {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #fund.resting:not([data-expanded]) #fundToggle { flex: 0 0 auto; }
+  /* "Fund it" is two words and the button is the last thing with room. */
+  .fund-act button { white-space: nowrap; }
 
   #canvas-wrap { padding: 6px 0; }
   /* Eight characters at 6px was neither readable nor cheap: ~37px of a 390px

@@ -950,11 +950,44 @@ function renderFund(s) {
     return;
   }
 
-  panel.className = '';
+  // `resting`, rather than no class at all. The other three states each say
+  // what they are, and the quiet one needs to as well now that it is the state
+  // that collapses to a single line — a stylesheet cannot hang a rule on the
+  // absence of every class it does not have without listing them all.
+  panel.className = 'resting';
   title.textContent = 'Keep it running';
   why.textContent =
     `Every one of the ${s.cells} cells pays a fee to advance. ${s.poolCoins.toLocaleString()} ` +
     `coins in hand. Anyone can top it up, any time.`;
+}
+
+/* The chevron beside the title.
+ *
+ * Expansion is the viewer's and it sticks: someone who opened the panel to read
+ * why it is asking has said they want that on screen, and re-collapsing it under
+ * them on the next push — which arrives several times a second — would be the
+ * page arguing with them. Need still overrides it in the other direction, since
+ * low and stopped are shown by their own class regardless of this attribute. */
+const fundToggle = document.getElementById('fundToggle');
+function setFundExpanded(open) {
+  const panel = document.getElementById('fund');
+  if (!panel) return;
+  if (open) panel.setAttribute('data-expanded', '');
+  else panel.removeAttribute('data-expanded');
+  if (fundToggle) fundToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+// Bound to the message rather than the chevron: the chevron is a child, so a
+// press on it — by finger, mouse or keyboard — arrives here by bubbling, and
+// binding both would toggle twice and land back where it started.
+const fundMsg = document.getElementById('fundMsg');
+if (fundMsg) {
+  fundMsg.onclick = () => {
+    const panel = document.getElementById('fund');
+    // Only where there is something to reveal. low, stopped and working are
+    // already showing everything they have.
+    if (!panel || !panel.classList.contains('resting')) return;
+    setFundExpanded(!panel.hasAttribute('data-expanded'));
+  };
 }
 
 /** Whether the pool can still fund a whole generation.
@@ -1002,6 +1035,11 @@ document.getElementById('fundBtn').onclick = async () => {
     fundSay('Looking for a wallet…');
     if (!await Wallet.probe()) {
       fundSay(Wallet.explain(new Error('none')), 'bad');
+      // Expand first. In the resting state the pay-by-hand block is collapsed,
+      // so opening the <details> inside it would put the address and the txid
+      // box behind a display:none — an error telling the viewer to pay by hand
+      // with no visible way to do it.
+      setFundExpanded(true);
       document.getElementById('fundManual').open = true;
       return;
     }
