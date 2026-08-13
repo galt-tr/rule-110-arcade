@@ -52,8 +52,19 @@ function newElement(tag) {
     scrollTop: 0,
     scrollHeight: 0,
     clientHeight: 600,
+    // Width matters now: fitCellPx shrinks the zoom when the ring is wider than
+    // the pane, and it measures the gutter to know how much of the pane is
+    // actually the diagram. A desktop-shaped default, so the fit is a no-op
+    // unless a test says otherwise.
+    clientWidth: 1200,
+    offsetWidth: 0,
+    offsetHeight: 0,
     append(...kids) { el.children.push(...kids); },
-    setAttribute() {},
+    attrs: {},
+    setAttribute(k, v) { el.attrs[k] = v; },
+    removeAttribute(k) { delete el.attrs[k]; },
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(el.attrs, k); },
+    contains() { return false; },
     addEventListener() {},
     getBoundingClientRect() { return { top: 0, left: 0 }; },
   };
@@ -85,11 +96,17 @@ global.document = {
   documentElement: {},
   getElementById: byId,
   createElement: newElement,
+  // The footer's overflow sheet closes on a click anywhere else and on Escape,
+  // and both listeners are registered at load time.
+  addEventListener() {},
 };
 global.getComputedStyle = () => ({ getPropertyValue: () => '' });
 global.window = {
   addEventListener() {},
+  // A desktop by default, so isNarrow() is false and the phone paths stay out
+  // of the way of tests that are not about them.
   innerWidth: 1200,
+  innerHeight: 900,
   open() {},
 };
 global.EventSource = class {
@@ -785,6 +802,193 @@ test('following still chases the live edge when it is switched on', () => {
     'following was on but the view did not keep up with the live edge');
 });
 
+/* --- fitting the ring to a narrow viewport --------------------------------
+ *
+ * The zoom used to be a constant 4px whatever the viewport, so a 256-cell ring
+ * opened a 1024px canvas — two and a half screens wide on a phone, landing the
+ * viewer in the middle of a pattern with nothing to say the rest existed. */
+
+test('a viewport wide enough for the ring keeps the zoom it was given', () => {
+  app.setZoomChosen(false);
+  byId('canvas-wrap').clientWidth = 1200;   // CELLS(128) * 4px = 512, fits easily
+
+  assert.strictEqual(app.fitCellPx(CELLS), null,
+    'the fit moved a zoom on a viewport that had room for the ring');
+});
+
+test('a viewport too narrow for the ring shrinks the cells until it fits', () => {
+  app.setZoomChosen(false);
+  byId('canvas-wrap').clientWidth = 390;    // a phone; 128 * 4px = 512, overflows
+
+  const fit = app.fitCellPx(CELLS);
+  assert.ok(fit !== null, 'the ring overflowed the viewport and the zoom did not move');
+  assert.ok(fit * CELLS <= 390, `${fit}px cells still need ${fit * CELLS}px of a 390px pane`);
+  assert.strictEqual(fit, 3, `expected the largest size that fits, got ${fit}px`);
+});
+
+test('the gutter is charged against the width the ring gets', () => {
+  app.setZoomChosen(false);
+  byId('canvas-wrap').clientWidth = 390;
+  byId('gutter').offsetWidth = 134;         // 390 - 134 = 256, exactly 2px a cell
+
+  assert.strictEqual(app.fitCellPx(CELLS), 2,
+    'the fit spent the gutter’s column on cells and would have overflowed');
+  byId('gutter').offsetWidth = 0;
+});
+
+test('a narrow viewport moves the zoom slider it is overriding', () => {
+  app.setZoomChosen(false);
+  byId('canvas-wrap').clientWidth = 390;
+  atArchive(0, 200);
+
+  assert.ok(app.cellPx() < 4, `the cells stayed at ${app.cellPx()}px on a 390px pane`);
+  assert.strictEqual(byId('zoom').value, String(app.cellPx()),
+    'the diagram and the slider disagree about the zoom');
+});
+
+test('a zoom the viewer chose is not overridden by the fit', () => {
+  // The reset before each test moves the slider, which is what "chosen" means.
+  byId('canvas-wrap').clientWidth = 390;
+  atArchive(0, 200);
+
+  assert.strictEqual(app.cellPx(), 4,
+    'the fit overrode a zoom the viewer had set by hand');
+  byId('canvas-wrap').clientWidth = 1200;
+});
+
+/* --- tapping a cell --------------------------------------------------------
+ *
+ * #canvas-wrap scrolls in both axes, so on a touchscreen a pan and a tap begin
+ * identically. Everything below is about telling them apart. */
+
+const touchAt = (x, y = 2) => ({ clientX: x, clientY: y, pointerType: 'touch' });
+
+test('a tap on a cell opens the sheet a phone has instead of a tooltip', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+
+  app.canvas.onpointerdown(touchAt(220));
+  app.canvas.onpointerup(touchAt(224));       // 4px of travel: a finger, not a drag
+  await settle();
+
+  assert.strictEqual(byId('cellsheet').hidden, false,
+    'a tap on a cell showed nothing at all');
+  assert.ok(/cell \d+/.test(byId('cellsheetBody').innerHTML),
+    `the sheet says ${byId('cellsheetBody').innerHTML}, which does not name a cell`);
+});
+
+test('a drag across the diagram is a pan, not a tap', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+  byId('cellsheet').hidden = true;
+
+  app.canvas.onpointerdown(touchAt(220));
+  app.canvas.onpointerup(touchAt(220 + app.TAP_SLOP_PX + 1));
+  await settle();
+
+  assert.strictEqual(byId('cellsheet').hidden, true,
+    'panning the diagram sideways opened a cell sheet');
+});
+
+test('a touch the browser takes for a scroll leaves nothing pending', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+  byId('cellsheet').hidden = true;
+
+  // A touch that becomes a scroll is cancelled, never released — so the next
+  // pointerup belongs to a different gesture and must not be paired with it.
+  app.canvas.onpointerdown(touchAt(220));
+  app.canvas.onpointercancel(touchAt(220));
+  app.canvas.onpointerup(touchAt(220));
+  await settle();
+
+  assert.strictEqual(byId('cellsheet').hidden, true,
+    'a cancelled touch was still treated as a tap on the cell it started on');
+});
+
+test('a tap away from any cell puts the sheet away', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+
+  app.canvas.onpointerdown(touchAt(220));
+  app.canvas.onpointerup(touchAt(220));
+  await settle();
+  assert.strictEqual(byId('cellsheet').hidden, false, 'the sheet never opened');
+
+  // Past the right-hand end of the ring: cellAt returns null there.
+  const beyond = CELLS * app.cellPx() + 40;
+  app.canvas.onpointerdown(touchAt(beyond));
+  app.canvas.onpointerup(touchAt(beyond));
+
+  assert.strictEqual(byId('cellsheet').hidden, true,
+    'tapping off the diagram left the sheet up with nowhere to dismiss it');
+});
+
+test('a tap does not also open the arcade tab a click would', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+
+  let opened = 0;
+  window.open = () => { opened++; return null; };
+  app.canvas.onpointerdown(touchAt(228));
+  app.canvas.onpointerup(touchAt(228));
+  // The browser synthesises a click after every tap; the handler has to know it
+  // has already been served, or the sheet is replaced by a navigation.
+  app.canvas.onclick(touchAt(228));
+  await settle();
+
+  assert.strictEqual(opened, 0,
+    'a tap opened the block explorer and left the sheet it had just filled in');
+});
+
+test('a mouse still gets the tooltip and the click-through it always had', async () => {
+  atArchive(0, 200);
+  seedRows(app.view().base, 4);
+
+  app.canvas.onpointerdown({ clientX: 232, clientY: 2, pointerType: 'mouse' });
+  app.canvas.onpointerup({ clientX: 232, clientY: 2, pointerType: 'mouse' });
+  await settle();
+  assert.strictEqual(byId('cellsheet').hidden, true,
+    'a mouse got the touch sheet instead of the tooltip');
+
+  app.canvas.onmousemove(at(232));
+  await settle();
+  const opened = [];
+  window.open = (url) => { opened.push(url); return null; };
+  app.canvas.onclick(at(232));
+
+  assert.strictEqual(opened.length, 1, 'a mouse click stopped opening the transaction');
+});
+
+test('the tooltip stays on screen on a viewport narrower than it is', () => {
+  atArchive(0, 200);
+  // Enough rows that the bottom of the canvas is a cell and not empty space:
+  // the clamp is only reached when there is something down there to hover.
+  seedRows(app.view().base, 160);
+
+  // The clamp was `innerWidth - 440`, which on any phone is a negative left and
+  // put the whole box off the side of the screen. There was no bottom clamp at
+  // all, so a pointer low down pushed it under the fold.
+  window.innerWidth = 390;
+  window.innerHeight = 664;
+  byId('tip').offsetWidth = 320;
+  byId('tip').offsetHeight = 90;
+  app.canvas.onmousemove({ clientX: 380, clientY: 596 });
+
+  assert.strictEqual(byId('tip').hidden, false,
+    'nothing was hovered, so the placement below is measuring a stale tooltip');
+
+  const left = parseFloat(byId('tip').style.left);
+  const top = parseFloat(byId('tip').style.top);
+  assert.ok(left >= 0 && left + 320 <= 390,
+    `the tooltip spans ${left}..${left + 320} on a 390px screen`);
+  assert.ok(top >= 0 && top + 90 <= 664,
+    `the tooltip spans ${top}..${top + 90} on a 664px screen`);
+
+  window.innerWidth = 1200;
+  window.innerHeight = 900;
+});
+
 // Async-aware: a click leads to a lookup, so the tests that follow it through
 // have to be able to await.
 (async () => {
@@ -802,8 +1006,13 @@ for (const [name, fn] of tests) {
   paint.cells = null;
   paint.drawn.clear();
   paint.sig.clear();
+  // The touch sheet stays up until it is dismissed, which is the behaviour the
+  // page wants and a leak between tests here.
+  byId('cellsheet').hidden = true;
   // 4px: the shipped default, and the zoom the virtualization arithmetic in
-  // these tests assumes.
+  // these tests assumes. Setting it through oninput also marks the zoom as
+  // viewer-chosen, so fitZoom stays out of the way of tests that are not about
+  // it; the ones that are call setZoomChosen(false) themselves.
   byId('zoom').value = '4';
   byId('zoom').oninput();
   // Drain rather than discard. app.js keeps a "a frame is already queued" flag,

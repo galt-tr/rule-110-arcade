@@ -366,6 +366,16 @@ renderBits();
 const deep = /(?:^|#|&)explain=(script|rule110)/.exec(currentHash());
 if (deep) openExplainer(deep[1]);
 
+// drawPattern sizes its bitmap from the element's measured width and is called
+// only on open and on a rule change, so rotating a phone with the dialog open
+// left a canvas built for the old width stretched across the new one. Guarded
+// because the explainer tests run this file under a DOM stub with no window.
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('resize', () => {
+    if (dlgRule110 && dlgRule110.open) drawPattern();
+  });
+}
+
 // Exposed for the test harness, which drives this file under a DOM stub. Not
 // used by the page itself.
 if (typeof module !== 'undefined' && module.exports) {

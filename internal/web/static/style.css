@@ -26,9 +26,40 @@
   --fund-warn-bg: #241f14;
   --fund-bad: var(--failed);
   --fund-bad-bg: #2a1519;
+
+  /* This page is a hand-rolled dark theme, but the controls in it are not: both
+     range sliders, both checkboxes, the number spinners and every <details>
+     marker are drawn by the browser, and without this it draws them for a light
+     page — white tracks and grey boxes on a #0b0e14 background. Barely
+     noticeable on a desktop, where the footer is a thin strip; impossible to
+     miss on a phone, where those controls are most of what you can see. */
+  color-scheme: dark;
+  accent-color: var(--accent);
 }
 
 * { box-sizing: border-box; }
+
+/* The whole page is one unscrollable shell, so a touch that runs off the end of
+   the diagram has nowhere to go and the browser gives it to the document
+   instead — which on a phone means pull-to-refresh, i.e. scrolling up through
+   history far enough reloads the page. Contained here rather than on <body>
+   because it is the inner scrollers that overscroll. */
+#canvas-wrap, .explainer article { overscroll-behavior: contain; }
+
+/* Hover states are for devices that can hover. On a touchscreen the browser
+   fakes :hover on the last thing tapped and leaves it there, so a tapped button
+   keeps an accent border until something else is tapped — an element that looks
+   focused and is not. */
+@media (hover: hover) {
+  button:hover { border-color: var(--accent); }
+  #fundBtn:hover:not(:disabled) { filter: brightness(1.1); }
+  .explain-card:hover { border-color: var(--accent); background: #1a2234; }
+  .explain-card:hover .explain-go { color: var(--accent); }
+  .explain-close button:hover { color: var(--text); border-color: var(--accent); }
+  .explainer summary:hover { color: var(--accent); }
+  .linkish:hover { color: var(--mined); }
+  .rule-out:hover { border-color: var(--accent); }
+}
 
 /* [hidden] has to win, and by default it does not.
  *
@@ -54,6 +85,17 @@ body {
      became scrollable — which capped the visible history at roughly one
      screenful. */
   height: 100vh;
+  /* svh, and specifically not dvh. On a phone `vh` is the LARGE viewport —
+     measured with the browser toolbars retracted — so the footer was laid out
+     underneath the URL bar, and since this element is overflow:hidden there was
+     no way to scroll down to it. Every clock and zoom control on the page was
+     simply unreachable.
+     dvh would also fix that, but it tracks the toolbar as it retracts, and each
+     change reflows main, re-runs windowRows() and reallocates the canvas. This
+     document never scrolls, so the toolbar has nothing to retract in response
+     to: dvh would buy a resize hazard and no pixels. svh is the toolbars-shown
+     height, which is the one that is always true here. */
+  height: 100svh;
   overflow: hidden;
 }
 
@@ -61,6 +103,10 @@ header, footer {
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   padding: 12px 18px;
+  /* Clear of the notch in landscape. env() is 0 everywhere else, so max() keeps
+     the 18px this has always had. */
+  padding-left: max(18px, env(safe-area-inset-left));
+  padding-right: max(18px, env(safe-area-inset-right));
 }
 footer {
   border-bottom: none;
@@ -70,6 +116,8 @@ footer {
   gap: 16px;
   align-items: center;
   justify-content: space-between;
+  /* And of the home indicator. */
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
 }
 
 header {
@@ -133,6 +181,21 @@ canvas { display: block; image-rendering: pixelated; }
 #empty[hidden] { display: none; }
 
 .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* display:contents, so above the breakpoint #more contributes its children
+   straight to .controls and this element has no layout of its own — the footer
+   is laid out exactly as it was before the wrapper existed. Below the
+   breakpoint the same element becomes a sheet; see the phone block. */
+.more { display: contents; }
+.more-toggle { display: none; }
+/* Its own row, as it has always had: at every width the controls alone are
+   wider than half the footer, so the legend wrapped anyway. Saying so directly
+   keeps that true now that it is inside .controls rather than beside it.
+   The margin makes up the difference between .controls' 8px row gap and the
+   16px the footer used to put between the two of them, so the footer is laid
+   out to the pixel it was before #more existed. */
+.legend { flex-basis: 100%; margin-top: 8px; }
+
 button {
   background: #1d2434;
   color: var(--text);
@@ -142,7 +205,6 @@ button {
   cursor: pointer;
   font: inherit;
 }
-button:hover { border-color: var(--accent); }
 button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-color: var(--accent); }
 
 .zoom { display: flex; gap: 8px; align-items: center; color: var(--muted); }
@@ -193,13 +255,43 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   padding: 8px 10px;
   font-size: 12px;
   pointer-events: none;
-  max-width: 420px;
+  /* Was a flat 420px, which is wider than the phone it would have to fit in. */
+  max-width: min(420px, calc(100vw - 16px));
   word-break: break-all;
   box-shadow: 0 6px 18px rgba(0,0,0,.5);
 }
 #tip b { color: var(--accent); }
 
 #tip .hint { color: var(--muted); }
+
+/* The touch counterpart of #tip.
+   Anchored to the bottom rather than to the cell: a panel that follows the tap
+   sits under the finger that made it, and the thing a reader most wants to see
+   after tapping a cell is the cell. */
+#cellsheet {
+  position: fixed;
+  z-index: 30;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 12px 14px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  background: #0f141f;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+  line-height: 1.55;
+  word-break: break-all;
+  box-shadow: 0 -8px 24px rgba(0,0,0,.5);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+#cellsheet b { color: var(--accent); }
+#cellsheet .hint { color: var(--muted); }
+#cellsheet .err { color: var(--failed); }
+.cellsheet-act { display: flex; gap: 10px; align-items: center; }
+#cellsheetOpen { flex: 1; min-height: 44px; }
+#cellsheetClose { min-width: 44px; min-height: 44px; }
 
 /* ---------------------------------------------------------------------------
    Funding
@@ -290,7 +382,6 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   border-color: var(--accent);
   font-weight: 600;
 }
-#fundBtn:hover:not(:disabled) { filter: brightness(1.1); }
 #fund.stopped #fundBtn { background: var(--fund-bad); border-color: var(--fund-bad); color: #fff; }
 
 .fund-row {
@@ -375,20 +466,37 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   cursor: pointer;
   font: inherit;
 }
-.explain-card:hover { border-color: var(--accent); background: #1a2234; }
 .explain-card b { color: var(--accent); font-weight: 600; }
 .explain-card .muted { line-height: 1.4; }
 .explain-go { color: var(--muted); font-size: 11px; align-self: flex-end; margin-top: 2px; }
-.explain-card:hover .explain-go { color: var(--accent); }
 
-/* Below this the cards would each be two words wide, so they stack — and the
-   hook line goes, because on a phone the strip is competing with the diagram
-   for a viewport that is mostly diagram. */
+/* On a phone the strip is competing with the diagram for a viewport that is
+   mostly diagram, so the hook line goes and each card becomes a single row.
+
+   An earlier version of this block said the cards "stack" here. They never did
+   — nothing set flex-direction, and .explain-card keeps `flex: 1 1 0` — so the
+   result was two half-width boxes with their explanation deleted. Laying them
+   out as rows on purpose is cheaper in height than either.
+
+   .explain-go stays. It was hidden here, which took the only "this is a link"
+   cue away from precisely the devices that cannot hover to find the other
+   one. */
 @media (max-width: 640px) {
   #explain { gap: 8px; padding: 8px 12px; }
-  .explain-card { padding: 7px 10px; }
+  .explain-card {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
   .explain-card .muted { display: none; }
-  .explain-go { display: none; }
+  /* The arrow alone. Half a card's width at this size is about seventeen
+     monospace characters, and "What is Rule 110?" is exactly that — so the word
+     in front of the arrow is what pushed the title onto a second line and cost
+     the diagram a row it could not spare. The arrow still says "link". */
+  .explain-go { align-self: center; margin: 0 0 0 auto; }
+  .go-word { display: none; }
 }
 
 /* The dialogs themselves. Native <dialog>, so the focus trap, Esc and the
@@ -437,7 +545,6 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   line-height: 1.4;
   color: var(--muted);
 }
-.explain-close button:hover { color: var(--text); border-color: var(--accent); }
 
 .explainer h2 {
   margin: 0 0 4px;
@@ -513,7 +620,6 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   color: var(--muted);
   font-size: 13px;
 }
-.explainer summary:hover { color: var(--accent); }
 .explainer details p:last-child { margin-bottom: 12px; }
 
 /* A button that reads as a link, for the cross-reference at the foot of each
@@ -529,7 +635,6 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   text-decoration: underline;
   text-underline-offset: 3px;
 }
-.linkish:hover { color: var(--mined); }
 
 /* --- The demos ----------------------------------------------------------- */
 
@@ -587,7 +692,6 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   cursor: pointer;
 }
 .rule-out.on { background: var(--mined); border-color: var(--mined); }
-.rule-out:hover { border-color: var(--accent); }
 .rule-out:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .rule-readout {
@@ -621,3 +725,218 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 .bit-out .bit-v { color: var(--seen); }
 .bit-out .bit-hi { color: var(--mined); font-weight: 600; }
 .bit-out hr { border: none; border-top: 1px solid var(--line); margin: 9px 0; }
+
+/* ---------------------------------------------------------------------------
+   Touch
+
+   Keyed on the POINTER, not on the width. A 15px control is just as hard to hit
+   on an 11-inch tablet as on a phone, and a mouse on a 500px window has no
+   trouble with either — so these two axes get two sets of rules and this is the
+   one about fingers. 44px is the figure both platform guidelines land on.
+   --------------------------------------------------------------------------- */
+
+@media (pointer: coarse) {
+  button { min-height: 44px; padding: 10px 14px; }
+
+  /* Under 16px, iOS zooms the whole page in when the field takes focus and
+     leaves it zoomed — on a layout with no room to spare, that is a page the
+     reader now has to pan around by hand.
+     Spelled out per field rather than as a bare `input`, because every one of
+     these already has a rule setting its size and a media query adds no
+     specificity: `input { font-size: 16px }` loses to `.jump input` and changes
+     nothing at all. Each selector below matches the weight of the rule it is
+     overriding, and wins by coming later. */
+  .jump input,
+  #fund input[type=number],
+  #fund input[type=text],
+  .demo-note input[type="number"] { font-size: 16px; }
+
+  /* Height, which is a separate problem: a range input is 16px tall and a
+     checkbox 13px, so the controls a phone most needs — zoom and follow — were
+     the two hardest things on the page to hit. */
+  input[type=range] { height: 44px; }
+  input[type=checkbox] { width: 22px; height: 22px; }
+  .jump input, #fund input { min-height: 44px; }
+  /* The label is the target for a checkbox, so it is the label that has to be
+     big enough. */
+  .follow, .demo-note { min-height: 44px; display: flex; align-items: center; }
+
+  .explain-close button { min-width: 44px; min-height: 44px; }
+
+  /* Disclosure triangles are the smallest targets on the page after the rule
+     bits, and both of these sit in the middle of prose where a missed tap
+     selects a word instead. */
+  #fund summary, .explainer summary { min-height: 44px; display: flex; align-items: center; }
+
+  .linkish { display: inline-block; padding: 11px 0; }
+
+  /* The rule bits stay 15px. The demo's whole claim is that the rule IS these
+     eight squares, and a square scaled up to thumb size stops reading as one
+     bit of a number — so the hit area grows and the paint does not. */
+  .rule-out { position: relative; }
+  .rule-out::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
+  /* ...which needs room around each case, or neighbouring hit areas overlap and
+     the top half of one bit belongs to the bit above it. */
+  .rule-table { gap: 20px 12px; }
+}
+
+/* ---------------------------------------------------------------------------
+   Phones
+
+   The chrome used to take 656 of a 664px viewport — header, explainers, funding
+   bar and footer all sized for a desktop, with `main` the only item able to
+   shrink. The diagram, which is the entire point of the page, was left with
+   8px. Everything below is about giving that space back.
+   --------------------------------------------------------------------------- */
+
+@media (max-width: 640px) {
+  /* Title and stats share one row, and the stats scroll inside what is left of
+     it. All seven numbers survive — they are the run's vital signs — but four
+     stacked rows of them cost 110px of a screen with none to give. */
+  header {
+    padding: 8px 12px;
+    flex-wrap: nowrap;
+    gap: 12px;
+    align-items: center;
+  }
+  h1 { font-size: 15px; }
+  /* The one thing here a reader does not need twice: the explainer card
+     directly below says the same in more words. */
+  .sub { display: none; }
+  .title { flex: 0 0 auto; }
+  .stats {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 14px;
+    /* Without this the stats refuse to shrink below their content and push the
+       title off the side instead of scrolling. */
+    min-width: 0;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .stats::-webkit-scrollbar { display: none; }
+  .stat { flex: 0 0 auto; }
+
+  #fund { padding: 8px 12px; }
+  .fund-bar { gap: 8px; }
+  .fund-act { flex-shrink: 1; min-width: 0; }
+  #fund input[type=number] { width: 9ch; min-width: 0; }
+  /* Resting, the panel is one line: a title and the button. The reason and the
+     pay-by-hand fallback appear when it actually needs money, which is the same
+     escalation the colours already do — urgency changes what is on screen,
+     presence does not. */
+  #fund:not(.low):not(.stopped) #fundWhy,
+  #fund:not(.low):not(.stopped) #fundManual { display: none; }
+
+  #canvas-wrap { padding: 6px 0; }
+  /* Eight characters at 6px was neither readable nor cheap: ~37px of a 390px
+     screen spent on a column nobody could make out. Narrower and legible. */
+  #gutter { padding-right: 4px; }
+
+  footer { padding: 8px 12px; gap: 8px; padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+  .controls { row-gap: 8px; font-size: 13px; }
+  /* The clock and the zoom, on one row. Everything here is about the width that
+     row has: a desktop's 12px button padding and a 110px slider add up to more
+     than a phone is wide, and the overflow lands as a second row of footer that
+     comes straight out of the diagram. */
+  .controls > button { padding: 8px 10px; }
+  .zoom { gap: 6px; }
+  .zoom input { width: 84px; }
+  /* The slider position is the readout. The number beside it was saying the
+     same thing again in a place with no room to say anything twice. */
+  #zoomOut { display: none; }
+  .more-toggle { display: inline-flex; align-items: center; margin-left: auto; }
+
+  /* The seven remaining control groups and the legend, as a sheet. Fixed rather
+     than in flow so raising it costs the diagram nothing, and translated rather
+     than display:none so it can slide. */
+  .more {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 25;
+    padding: 14px;
+    padding-bottom: max(14px, env(safe-area-inset-bottom));
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    box-shadow: 0 -8px 24px rgba(0,0,0,.5);
+    transform: translateY(110%);
+    visibility: hidden;
+    transition: transform .18s ease, visibility .18s;
+  }
+  .more[data-open] { transform: none; visibility: visible; }
+  .more .jump, .more .follow, .more .rate { width: 100%; }
+  .more .rate input { flex: 1; width: auto; }
+  .more .jump input { flex: 1; width: auto; }
+  .legend { gap: 10px 14px; margin-top: 0; }
+
+  /* Full-bleed. A centred dialog on a 390px screen spends its margins, its
+     border radius and 68px of article padding on being a box, and what is
+     inside it is three thousand words that need the width. */
+  .explainer {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100vh;
+    height: 100svh;
+    max-height: none;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+  }
+  /* [open], and not the bare element. A <dialog> is hidden by the UA's
+     `dialog:not([open]) { display: none }`, which is an ordinary rule any author
+     `display` outranks — so `.explainer { display: flex }` would put both
+     explainers permanently on the page. Same trap as the [hidden] rule at the
+     top of this file. */
+  .explainer[open] { display: flex; flex-direction: column; }
+  /* A real header bar rather than a zero-height sticky overlay, so the close
+     control is a 44px target with somewhere to sit instead of a 27px glyph
+     printed on top of the first paragraph.
+     Note it is a SIBLING of <article>, not a child: it is already the full
+     width of the dialog, and pulling it out to the article's padding edge with
+     a negative margin put it 16px off the side of the screen. */
+  .explain-close {
+    position: static;
+    height: auto;
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 6px 10px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .explain-close button { top: 0; right: 0; }
+  /* The article is the only part that scrolls, so it takes what the bar leaves
+     rather than a viewport height of its own — svh minus a header is not a
+     length CSS can spell without hard-coding the header. */
+  .explainer article {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+    height: auto;
+    padding: 14px 16px 32px;
+    padding-bottom: max(32px, env(safe-area-inset-bottom));
+    font-size: 16px;
+  }
+
+  .explainer h2 { font-size: 20px; }
+  .explainer h3 { font-size: 14px; margin-top: 24px; }
+  .lede { font-size: 16px; }
+  .demo { padding: 10px; }
+  /* space-between on a wrapped row leaves the last line ragged and the gaps
+     uneven; there is no longer enough width for the tidiness it was buying. */
+  .rule-table { justify-content: flex-start; }
+  /* 17ch of label in a 390px viewport leaves nothing for the value it labels. */
+  .bit-out .bit-k { min-width: 0; }
+}

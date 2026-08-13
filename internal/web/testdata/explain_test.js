@@ -99,6 +99,10 @@ global.document = {
   getElementsByClassName: classList,
 };
 global.getComputedStyle = () => ({ getPropertyValue: () => '' });
+// drawPattern measures its container, so it has to be redrawn after a rotation.
+// explain.js guards the registration, but stubbing it here is what proves the
+// guard is not the only thing standing between this file and a ReferenceError.
+global.window = { addEventListener() {} };
 
 let FETCHED = null;
 global.fetch = (url) => {

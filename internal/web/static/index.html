@@ -2,7 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- viewport-fit=cover so the safe-area insets below are non-zero on a notched
+     phone and the chrome can pad itself clear of the notch and home indicator.
+     Deliberately NO user-scalable=no and NO maximum-scale: the diagram is a
+     field of small squares, and pinch-zoom is the one tool a reader has for
+     looking closely at it. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Matches --bg, so the browser's own chrome does not frame a dark page in
+     white on a phone. -->
+<meta name="theme-color" content="#0b0e14">
 <title>Rule 110 on BSV</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -28,13 +36,13 @@
     <b>What is Rule&nbsp;110?</b>
     <span class="muted">Eight yes/no answers, written as one number. It is
       enough to compute anything a computer can.</span>
-    <span class="explain-go">read&nbsp;→</span>
+    <span class="explain-go"><span class="go-word">read&nbsp;</span>→</span>
   </button>
   <button class="explain-card" id="openScript" type="button" aria-haspopup="dialog">
     <b>Inside one transaction</b>
     <span class="muted">Every cell is a coin, and the coin will only be spent
       if the new bit is the one the rule demands.</span>
-    <span class="explain-go">read&nbsp;→</span>
+    <span class="explain-go"><span class="go-word">read&nbsp;</span>→</span>
   </button>
 </section>
 
@@ -94,10 +102,23 @@
 </main>
 
 <footer>
+  <!-- One flex row on a desktop, exactly as it has always been. On a phone the
+       seven control groups and the seven-key legend wrap to some 270px, which
+       is most of the screen — so everything past the clock and the zoom moves
+       into #more, which becomes a sheet the ⋯ button raises.
+
+       #more is display:contents above the breakpoint, so its children are laid
+       out as direct children of .controls and the desktop footer is unchanged.
+       That is the whole reason the secondary controls are wrapped in an element
+       rather than moved by script: no DOM surgery on a resize, and nothing to
+       get wrong when a tablet crosses the breakpoint sideways. -->
   <div class="controls">
-    <button id="play"  title="Run continuously">▶︎ Play</button>
-    <button id="pause" title="Stop the clock">❚❚ Pause</button>
-    <button id="step"  title="Advance exactly one generation">▶| Step</button>
+    <!-- aria-label rather than title: a title is a hover tooltip, and the
+         devices that most need the explanation are the ones that cannot
+         hover. The visible text already carries it for everyone else. -->
+    <button id="play"  aria-label="Run continuously">▶︎ Play</button>
+    <button id="pause" aria-label="Stop the clock">❚❚ Pause</button>
+    <button id="step"  aria-label="Advance exactly one generation">▶| Step</button>
     <label class="zoom">
       <!-- 1..8, not 1..16. Canvas cost is width x height, and width is now
            cells x cellPx with a 256-cell ring: at 16px that is 4096px wide
@@ -107,43 +128,67 @@
       <input id="zoom" type="range" min="1" max="8" step="1" value="4">
       <output id="zoomOut">4px</output>
     </label>
-    <label class="jump">
-      <span>go to</span>
-      <input id="jump" type="number" min="0" step="1" placeholder="generation">
-      <button id="jumpBtn" type="button">go</button>
-    </label>
-    <!-- Catch up to the newest generation and keep up with it. Following is off
-         by default, so this is how someone who scrolled back into history gets
-         home; it arms the checkbox beside it rather than drifting off the edge
-         a second later and needing pressing again. -->
-    <button id="toBottom" type="button">go to bottom and follow</button>
-    <!-- Unchecked by default: following means the view is pulled to the newest
-         row on every generation, which yanks the diagram out from under anyone
-         reading history. Opt in to it. -->
-    <label class="follow">
-      <input id="follow" type="checkbox">
-      <span>follow</span>
-    </label>
-    <label class="rate" id="rateLabel">
-      <span>rate</span>
-      <input id="rate" type="range" min="0.05" max="10" step="0.05" value="1">
-      <output id="rateOut">1.00 gen/s</output>
-    </label>
-  </div>
+    <!-- Only ever visible below the breakpoint; see .more-toggle. -->
+    <button id="moreBtn" class="more-toggle" type="button"
+            aria-expanded="false" aria-controls="more">⋯ more</button>
 
-  <div class="legend">
-    <span class="key"><i class="sw dead"></i>dead</span>
-    <span class="key"><i class="sw pending"></i>pending</span>
-    <span class="key"><i class="sw broadcast"></i>broadcast</span>
-    <span class="key"><i class="sw seen"></i>seen</span>
-    <span class="key"><i class="sw mined"></i>mined</span>
-    <span class="key"><i class="sw failed"></i>failed</span>
-    <span class="key"><i class="sw failed-dead"></i>failed (dead cell)</span>
+    <div id="more" class="more">
+      <label class="jump">
+        <span>go to</span>
+        <input id="jump" type="number" min="0" step="1" placeholder="generation">
+        <button id="jumpBtn" type="button">go</button>
+      </label>
+      <!-- Catch up to the newest generation and keep up with it. Following is off
+           by default, so this is how someone who scrolled back into history gets
+           home; it arms the checkbox beside it rather than drifting off the edge
+           a second later and needing pressing again. -->
+      <button id="toBottom" type="button">go to bottom and follow</button>
+      <!-- Unchecked by default: following means the view is pulled to the newest
+           row on every generation, which yanks the diagram out from under anyone
+           reading history. Opt in to it. -->
+      <label class="follow">
+        <input id="follow" type="checkbox">
+        <span>follow</span>
+      </label>
+      <label class="rate" id="rateLabel">
+        <span>rate</span>
+        <input id="rate" type="range" min="0.05" max="10" step="0.05" value="1">
+        <output id="rateOut">1.00 gen/s</output>
+      </label>
+
+      <div class="legend">
+        <span class="key"><i class="sw dead"></i>dead</span>
+        <span class="key"><i class="sw pending"></i>pending</span>
+        <span class="key"><i class="sw broadcast"></i>broadcast</span>
+        <span class="key"><i class="sw seen"></i>seen</span>
+        <span class="key"><i class="sw mined"></i>mined</span>
+        <span class="key"><i class="sw failed"></i>failed</span>
+        <span class="key"><i class="sw failed-dead"></i>failed (dead cell)</span>
+      </div>
+    </div>
   </div>
 </footer>
 
 <div id="err" hidden></div>
 <div id="tip" hidden></div>
+
+<!-- What #tip is for a mouse, this is for a finger.
+     Everything a cell knows — its index, its generation, whether it is alive,
+     what became of its transaction — lived only in a mousemove handler, which
+     is to say it did not exist on a phone at all. A tap there opened the block
+     explorer instead, so the one gesture a touch device has spent itself
+     leaving the page.
+     Not the same element as #tip because the two want opposite things: a
+     tooltip must not take pointer events or it fights the cursor it follows,
+     and this must take them or its button cannot be pressed. They share the
+     text through cellSummary(). -->
+<div id="cellsheet" hidden>
+  <div id="cellsheetBody"></div>
+  <div class="cellsheet-act">
+    <button id="cellsheetOpen" type="button" hidden>open in arcade →</button>
+    <button id="cellsheetClose" type="button" aria-label="Close">✕</button>
+  </div>
+</div>
 
 <!-- The explainers live at the bottom of the document so the part of this file
      that describes the PAGE stays readable at the top. They are native
