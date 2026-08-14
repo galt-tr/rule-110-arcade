@@ -21,8 +21,10 @@
 // Secure Contexts spec, so it is not blocked as mixed content), but Chrome's
 // Private Network Access additionally requires the wallet to answer a CORS
 // preflight with Access-Control-Allow-Private-Network, and browsers disagree on
-// the details. When the substrate cannot be reached the UI must fall back to
-// showing an address to pay by hand — see the manual panel in index.html.
+// the details. There is no fallback behind this: a BRC-100 wallet is the only
+// way a visitor can fund the deployment, so a substrate that cannot be reached
+// means that browser cannot pay at all. That is why probe() has to fail fast
+// and why explain() is worth the care — the message is all the viewer gets.
 
 const Wallet = (() => {
 
@@ -178,7 +180,8 @@ async function settle(txid) {
  * situations they are in, because each has a different next step. */
 function explain(err) {
   if (err instanceof WalletError && err.kind === 'none') {
-    return 'No BRC-100 wallet found. Install one, or pay the address below by hand.';
+    return 'No BRC-100 wallet found. One is the only way to fund this deployment — ' +
+      'install a wallet, or open this page in a browser that has one.';
   }
   const text = String(err?.message ?? err).toLowerCase();
   if (text.includes('reject') || text.includes('denied') || text.includes('cancel')) {

@@ -38,7 +38,6 @@ func (f *funder) Target() (web.FundingTarget, error) {
 		return web.FundingTarget{}, err
 	}
 	return web.FundingTarget{
-		Address:           target.Address,
 		LockingScriptHex:  target.LockingScriptHex,
 		Network:           f.network,
 		MinSatoshis:       f.min,
@@ -48,11 +47,6 @@ func (f *funder) Target() (web.FundingTarget, error) {
 
 func (f *funder) Accept(ctx context.Context, beef []byte) (web.Accepted, error) {
 	res, err := f.chain.AcceptPayment(ctx, beef, f.min)
-	return accepted(res), translate(err)
-}
-
-func (f *funder) AcceptTxID(ctx context.Context, txid string) (web.Accepted, error) {
-	res, err := f.chain.AcceptPaymentByTxID(ctx, txid)
 	return accepted(res), translate(err)
 }
 

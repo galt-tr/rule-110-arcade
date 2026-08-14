@@ -102,10 +102,12 @@ Starting a new deployment takes one command:
 
 An empty data directory is not an error. run serves the UI, shows its funding
 address, and mints fuel and creates generation 0 by itself once a payment lands.
-With -public-funding the page carries a Fund button any BRC-100 wallet can use.
+With -public-funding the page carries a Fund button any BRC-100 wallet can use,
+and a wallet is the only way a visitor can pay: the page does not print the
+address or take a transaction id.
 
 The same sequence by hand, which is still what to reach for when a payment is
-already on chain:
+already on chain, and is the operator's route rather than a visitor's:
 
   1  rule110 address                 print the funding address (offline; needs no arcade)
   2  send coin to that address       from any wallet
