@@ -215,6 +215,8 @@ function bitsOf(gen, cells) {
 function ingest(s) {
   state.snap = s;
   const cells = s.cells || 0;
+  /** The newest generation the tail carries; -1 when it carries none. */
+  let top = -1;
   for (const g of s.history || []) {
     const genCells = g.cells || [];
     let chars = '';
@@ -223,16 +225,40 @@ function ingest(s) {
       chars += c && c.state ? c.state[0] : 'p';
     }
     state.rows.set(g.number, { number: g.number, row: g.row, s: chars });
+    if (g.number > top) top = g.number;
   }
   // The stream is the authority on how far the run has got — and, crucially, on
   // whether it is still the same run. Ratcheting `newest` upward is right while
   // a run grows and wrong the moment one restarts: see forgetRun.
-  if (typeof s.generation === 'number') {
-    if (s.generation > state.extent.newest) {
-      state.extent.newest = s.generation;
+  //
+  // The tail's HIGHEST NUMBER, and deliberately not `s.generation`. The two
+  // measure different cells. `s.generation` is the frontier — the SLOWEST cell,
+  // engine.frontierLocked — while `extent.newest` is MAX(number) FROM
+  // generations, and that row is written by whichever cell reached the
+  // generation FIRST. Cells run up to chain MaxLag (32) apart, so on a healthy
+  // ring the frontier sits far enough below the extent to trip the restart test
+  // below, whose threshold is 2. It did, on nearly every push: the cache was
+  // cleared several times a second, the canvas blanked, and the archive refilled
+  // it just in time for the next push to blank it again. Measured live —
+  // /api/state said generation 219 while /api/extent said newest 251.
+  //
+  // The tail's top is the RIGHT side of that comparison because it is the same
+  // quantity: the newest entry of the engine's history is created by the same
+  // ensureGeneration call that writes the generations row the extent reads. It
+  // rises monotonically within a run (the rolling window drops from the front,
+  // never the top) and collapses on a re-genesis, which is exactly the signal
+  // forgetRun wants.
+  //
+  // A deployment that has never run sends no history at all, so there is no
+  // position to read and neither branch is taken — falling back to
+  // `s.generation` here would reintroduce the bug at the one moment it looks
+  // safest.
+  if (top >= 0) {
+    if (top > state.extent.newest) {
+      state.extent.newest = top;
       state.extent.count = state.extent.newest - state.extent.oldest + 1;
       state.extent.empty = false;
-    } else if (s.generation < state.extent.newest - RESTART_DROP) {
+    } else if (top < state.extent.newest - RESTART_DROP) {
       forgetRun();
     }
   }
@@ -243,14 +269,33 @@ function ingest(s) {
  *  rather than jitter at the frontier. */
 const RESTART_DROP = 2;
 
+/** How long after forgetting a run before another forget is believed.
+ *
+ * A run restarts once, so a second forget four pushes later is not a second
+ * restart — it is whatever the detector above got wrong. The two failure modes
+ * are not comparable, which is why this guard is unconditional rather than
+ * tuned: refusing to forget costs one stale window, corrected by the next extent
+ * read a moment later, while forgetting on a loop empties the cache faster than
+ * the archive can refill it and the diagram strobes. Comfortably more than
+ * engine.PublishInterval, so an ordinary push can never be the thing that
+ * releases it. */
+const FORGET_COOLDOWN_MS = 2000;
+let forgotAt = 0;
+
 /** The run went backwards, so it is not the run we have been drawing.
  *
  * Generation numbers are reused from zero by the next run, so every cached row
  * now describes a different automaton that happens to share numbering — keeping
  * them would draw one run's history under another's. The archive is re-read
  * rather than adjusted by guesswork, because believing an unchecked number is
- * what broke the page in the first place. */
+ * what broke the page in the first place.
+ *
+ * Rate-limited, because everything below this line is destructive and the cost
+ * of doing it when it was not warranted is a blank canvas. */
 function forgetRun() {
+  const now = Date.now();
+  if (now - forgotAt < FORGET_COOLDOWN_MS) return;
+  forgotAt = now;
   state.rows.clear();
   state.inflight.clear();
   paint.drawn.clear();
@@ -426,19 +471,23 @@ function reflow(base, rows, cells) {
     paint.sig.clear();
     fillBackground();
   } else if (shift !== 0 || resized) {
-    let carry = null;
-    if (canvas.width > 0 && canvas.height > 0) {
-      carry = document.createElement('canvas');
-      carry.width = canvas.width;
-      carry.height = canvas.height;
-      carry.getContext('2d').drawImage(canvas, 0, 0);
-    }
+    // The dimensions of what is being carried, taken BEFORE the resize below
+    // wipes the bitmap. The blit back uses them as an explicit source rectangle,
+    // because the scratch canvas is generally larger than this frame's content
+    // and the whole-image form would drag the leftovers of a previous, bigger
+    // frame in with it.
+    const carriedW = canvas.width;
+    const carriedH = canvas.height;
+    const carry = carriedW > 0 && carriedH > 0 ? carryFrom(canvas) : null;
     if (resized) {
       canvas.width = w;
       canvas.height = h;
     }
     fillBackground();
-    if (carry) ctx.drawImage(carry, 0, -shift * cellPx);
+    if (carry) {
+      ctx.drawImage(carry, 0, 0, carriedW, carriedH,
+                    0, -shift * cellPx, carriedW, carriedH);
+    }
   }
 
   canvas.style.width = w + 'px';
@@ -461,6 +510,44 @@ function reflow(base, rows, cells) {
   paint.rows = rows;
   paint.cellPx = cellPx;
   paint.cells = cells;
+}
+
+/** The scratch bitmap reflow carries already-painted rows on, kept across
+ *  frames.
+ *
+ * reflow runs on every frame where the window moves — every frame of a scrollbar
+ * drag, and once per generation at the live edge, since `base` advances with the
+ * archive whether or not anyone is following it. Allocating a full-size canvas
+ * each time is about 2.8MB per frame at 256 cells, which is megabytes of garbage
+ * a second for a bitmap that is read once and dropped; the collector pauses that
+ * buys arrive as dropped frames in the middle of the drag.
+ *
+ * Grown to fit and never shrunk. The sizes it sees are already bounded by
+ * MAX_CANVAS_AREA, so the high-water mark is bounded too, and a scratch that is
+ * merely too big costs nothing — reflow blits an explicit source rectangle out
+ * of it rather than the whole image. */
+let carryCanvas = null;
+let carryCtx = null;
+function carryFrom(src) {
+  if (!carryCanvas) {
+    carryCanvas = document.createElement('canvas');
+    carryCtx = carryCanvas.getContext('2d');
+    // `copy`, not the default `source-over`, and set once because this context
+    // draws nothing else. It makes the scratch EQUAL the source rather than the
+    // source composited over whatever the last frame left, so a palette with any
+    // alpha in it — --dead is opaque today, and nothing here should depend on
+    // that staying true — cannot ghost the previous frame through this one.
+    carryCtx.globalCompositeOperation = 'copy';
+  }
+  if (carryCanvas.width < src.width || carryCanvas.height < src.height) {
+    // Assigning either dimension clears the bitmap, which is fine here — it is
+    // about to be overwritten — but it is why both are raised in one go rather
+    // than one at a time.
+    carryCanvas.width = Math.max(carryCanvas.width, src.width);
+    carryCanvas.height = Math.max(carryCanvas.height, src.height);
+  }
+  carryCtx.drawImage(src, 0, 0);
+  return carryCanvas;
 }
 
 function fillBackground() {
@@ -990,14 +1077,69 @@ if (fundMsg) {
   };
 }
 
-/** Whether the pool can still fund a whole generation.
+/** How much headroom counts as out of trouble, as a multiple of `cells`.
+ *
+ * Entering `low` and leaving it are deliberately different thresholds. Sharing
+ * one means the panel changes state every time the pool crosses it, and the
+ * pool crosses it constantly: coins are spent a generation at a time and minted
+ * in batches, so `poolCoins` oscillates around `cells` for as long as the keeper
+ * is keeping up. A generation and a half in hand is the first point at which
+ * saying "running low" would be overstating it. */
+const LOW_CLEAR_RATIO = 1.5;
+
+/** How many healthy renders it takes to put the warning away.
+ *
+ * The deadband above handles the pool sawtoothing across the threshold;
+ * this handles waitingOnCoin, which is a count of cells retrying RIGHT NOW and
+ * can read zero for a single push in the middle of a genuine shortage. Ten
+ * renders is about five seconds at engine.PublishInterval.
+ *
+ * Counted in renders rather than measured on the clock because renders are what
+ * actually resize the panel, and because a page whose stream has stopped should
+ * hold whatever it last said rather than quietly recovering on a timer while no
+ * new evidence arrives. */
+const LOW_CLEAR_PUSHES = 10;
+
+/** Whether the panel is currently reporting a fuel shortfall, and how many
+ *  consecutive healthy renders have argued for taking that back. */
+let lowLatched = false;
+let clearRun = 0;
+
+/** Whether the pool can still fund a whole generation — damped.
  *
  * One coin funds one cell transition, so fewer coins than cells means the next
- * generation cannot complete — which is the honest definition of "low" here and
+ * generation cannot complete, which is the honest definition of "low" here and
  * is visible well before the engine declares starvation. waitingOnCoin catches
- * the same thing from the other side: cells already retrying a shortfall. */
+ * the same thing from the other side: cells already retrying a shortfall.
+ *
+ * That answer is honest and, undamped, unusable. Both inputs move on every push,
+ * so the panel flipped between `low` and `resting` several times a second — and
+ * those two states are 38px apart in a layout where the diagram's pane absorbs
+ * the difference, so every flip reallocated the canvas and jumped the whole
+ * diagram. Measured in a browser at 1400x900: the canvas went 472px to 508px and
+ * back on a one-coin change.
+ *
+ * The escalation itself is unchanged. `low` is still entered the moment the
+ * engine's own numbers say so, which is what makes it a leading indicator; only
+ * the release is damped. */
 function isLowOnFuel(s) {
-  return s.waitingOnCoin > 0 || (s.poolCoins || 0) < s.cells;
+  const short = s.waitingOnCoin > 0 || (s.poolCoins || 0) < s.cells;
+  if (short) {
+    lowLatched = true;
+    clearRun = 0;
+    return true;
+  }
+  if (!lowLatched) return false;
+  // Over the line but not clear of it: the next push can put it back, so this
+  // is not evidence of anything yet.
+  if ((s.poolCoins || 0) < s.cells * LOW_CLEAR_RATIO) {
+    clearRun = 0;
+    return true;
+  }
+  if (++clearRun < LOW_CLEAR_PUSHES) return true;
+  lowLatched = false;
+  clearRun = 0;
+  return false;
 }
 
 /** Say something to the payer, and leave it said. */
@@ -1475,6 +1617,14 @@ if (typeof module !== 'undefined' && module.exports) {
     setFollow(f) { follow = f; },
     setOpenAtLiveEdge(v) { openAtLiveEdge = v; },
     setAwaitingFuel(a) { awaitingFuel = a; },
+    // The restart guard is deliberately a wall-clock cooldown — see
+    // FORGET_COOLDOWN_MS — so tests that restart a run several times in a row
+    // need the page's "this has not happened yet" state back between them.
+    resetRestartGuard() { forgotAt = 0; },
+    // Same reason: the fuel warning latches across pushes, so a test that wants
+    // a panel in no particular state has to say so.
+    resetFuelLatch() { lowLatched = false; clearRun = 0; },
+    LOW_CLEAR_PUSHES,
     wanted: () => wanted,
     view: () => view,
     canvas,
