@@ -303,9 +303,10 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 /* ---------------------------------------------------------------------------
    Funding
 
-   Always present, directly under the header and above the diagram. What changes
-   is urgency, not visibility: `low` and `stopped` are set by app.js from the
-   engine's own numbers. See renderFund for why this is not conditional.
+   Always present, the first thing under the header and above both the
+   explainers and the diagram. What changes is urgency, not visibility: `low`
+   and `stopped` are set by app.js from the engine's own numbers. See renderFund
+   for why this is not conditional.
    --------------------------------------------------------------------------- */
 
 #fund {
@@ -326,14 +327,13 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
  * read as three lines of payment copy standing between the header and the
  * diagram at all times, on a page whose whole subject is below it. Collapsed,
  * the standing offer and the button that takes it are still there; the
- * paragraph about fees and the pay-by-hand fallback are a chevron away.
+ * paragraph about fees is a chevron away.
  *
  * Only `resting` collapses. low, stopped and working all set their own class
  * and are excluded, so need still opens the panel without being asked — the
  * escalation is on the engine's evidence, not on whether anyone clicked. */
 #fund.resting { padding: 6px 18px; }
-#fund.resting:not([data-expanded]) #fundWhy,
-#fund.resting:not([data-expanded]) #fundManual { display: none; }
+#fund.resting:not([data-expanded]) #fundWhy { display: none; }
 /* The coin count that goes with it is not lost: the header carries `fuel` as a
    standing stat, which is where a number that changes every second belongs. */
 
@@ -440,50 +440,21 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
 }
 #fund.stopped #fundBtn { background: var(--fund-bad); border-color: var(--fund-bad); color: #fff; }
 
-.fund-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-  margin: 8px 0;
-}
-
 .muted { color: var(--muted); font-size: 12px; }
 
-#fund input[type="number"],
-#fund input[type="text"] {
+#fund input[type="number"] {
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 4px;
   padding: 5px 8px;
   font: inherit;
-}
-#fund input[type="number"] { width: 12ch; }
-#fund input[type="text"] { flex: 1 1 32ch; min-width: 0; }
-
-/* The address is the fallback path's whole payload, so it has to survive being
-   selected, copied and read aloud. Wrapping beats truncation. */
-.addr {
-  display: inline-block;
-  padding: 4px 8px;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  color: var(--accent);
-  word-break: break-all;
+  width: 12ch;
 }
 
 .fund-status { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
 .fund-status.good { color: var(--fund-good); }
 .fund-status.bad { color: var(--fund-bad); }
-
-#fund summary {
-  cursor: pointer;
-  color: var(--muted);
-  font-size: 12px;
-  margin-top: 8px;
-}
 
 #fund button:disabled {
   opacity: 0.5;
@@ -659,9 +630,10 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
    the content and the commentary as the margin. */
 .explainer .cm { color: var(--muted); font-style: italic; }
 
-/* Disclosure blocks: the same idiom as #fundManual, which is already how this
-   application says "there is more here if you want it". Everything genuinely
-   technical lives in one of these, so the main thread stays readable. */
+/* Disclosure blocks: the same idiom as the funding bar's chevron, which is
+   already how this application says "there is more here if you want it".
+   Everything genuinely technical lives in one of these, so the main thread
+   stays readable. */
 .explainer details {
   margin: 0 0 16px;
   background: var(--bg);
@@ -804,7 +776,6 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
      overriding, and wins by coming later. */
   .jump input,
   #fund input[type=number],
-  #fund input[type=text],
   .demo-note input[type="number"] { font-size: 16px; }
 
   /* Height, which is a separate problem: a range input is 16px tall and a
@@ -820,9 +791,9 @@ button[aria-pressed="true"] { background: var(--accent); color: #07101c; border-
   .explain-close button { min-width: 44px; min-height: 44px; }
 
   /* Disclosure triangles are the smallest targets on the page after the rule
-     bits, and both of these sit in the middle of prose where a missed tap
-     selects a word instead. */
-  #fund summary, .explainer summary { min-height: 44px; display: flex; align-items: center; }
+     bits, and these sit in the middle of prose where a missed tap selects a
+     word instead. */
+  .explainer summary { min-height: 44px; display: flex; align-items: center; }
 
   .linkish { display: inline-block; padding: 11px 0; }
 

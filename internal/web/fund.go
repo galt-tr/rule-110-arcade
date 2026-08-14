@@ -21,8 +21,6 @@ type Funder interface {
 	Target() (FundingTarget, error)
 	// Accept takes a BEEF a browser wallet produced.
 	Accept(ctx context.Context, beef []byte) (Accepted, error)
-	// AcceptTxID takes the id of a payment already on chain.
-	AcceptTxID(ctx context.Context, txid string) (Accepted, error)
 }
 
 // FundingTarget is the payment instruction handed to a browser.
@@ -30,7 +28,6 @@ type Funder interface {
 // Declared here rather than reused from the chain package so a test fake needs
 // no chain import — the same instinct as Automaton.
 type FundingTarget struct {
-	Address           string `json:"address"`
 	LockingScriptHex  string `json:"lockingScript"`
 	Network           string `json:"network"`
 	MinSatoshis       uint64 `json:"minSatoshis"`
@@ -112,13 +109,18 @@ func (b *bucket) allow() bool {
 	return true
 }
 
-// fundRequest is what a payer posts. Exactly one of the two is used, and beef
-// wins if both are present: it carries strictly more evidence.
+// fundRequest is what a payer posts.
+//
+// A BEEF and nothing else. This endpoint used to take a bare txid as well, for
+// somebody who had sent coin to the funding address by hand, and that path is
+// gone: a transaction fetched by id carries no ancestry, so crediting one meant
+// waiting for it to be mined and trusting an oracle for the merkle proof. A
+// BEEF carries its own proof of where the money came from, which is the whole
+// reason a BRC-100 wallet can be paid from and believed in one step.
 type fundRequest struct {
 	// BEEF is base64 because the browser gets a byte array from the wallet
 	// substrate, and base64 is half the size of hex on the wire.
 	BEEF string `json:"beef,omitempty"`
-	TxID string `json:"txid,omitempty"`
 }
 
 func (s *Server) handleFundingTarget(w http.ResponseWriter, _ *http.Request) {
@@ -177,24 +179,17 @@ func (s *Server) handleFund(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), fundTimeout)
 	defer cancel()
 
-	var (
-		res Accepted
-		err error
-	)
-	switch {
-	case req.BEEF != "":
-		raw, decodeErr := base64.StdEncoding.DecodeString(req.BEEF)
-		if decodeErr != nil {
-			http.Error(w, "the payment is not valid base64", http.StatusBadRequest)
-			return
-		}
-		res, err = s.funder.Accept(ctx, raw)
-	case req.TxID != "":
-		res, err = s.funder.AcceptTxID(ctx, req.TxID)
-	default:
-		http.Error(w, "send either a beef or a txid", http.StatusBadRequest)
+	if req.BEEF == "" {
+		http.Error(w, "send a beef: this deployment is funded from a BRC-100 wallet",
+			http.StatusBadRequest)
 		return
 	}
+	raw, decodeErr := base64.StdEncoding.DecodeString(req.BEEF)
+	if decodeErr != nil {
+		http.Error(w, "the payment is not valid base64", http.StatusBadRequest)
+		return
+	}
+	res, err := s.funder.Accept(ctx, raw)
 	if err != nil {
 		s.writeFundError(w, err)
 		return

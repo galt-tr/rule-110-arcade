@@ -2,10 +2,8 @@ package chain
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -152,72 +150,4 @@ func (c *Chain) AcceptPayment(ctx context.Context, beefBytes []byte, minSatoshis
 	}
 	return c.internalizeOutputs(ctx, atomic, tx, indices, satoshis,
 		"public funding via "+txid[:16])
-}
-
-// AcceptPaymentByTxID credits a payment somebody made without the button.
-//
-// Mined payments only, and that is a limit of the evidence rather than a
-// policy: fetched by txid there is no ancestry, so a merkle proof is the only
-// thing that can establish the transaction is real. An unmined one has to come
-// back later.
-func (c *Chain) AcceptPaymentByTxID(ctx context.Context, txid string) (*InternalizeResult, error) {
-	txid = strings.ToLower(strings.TrimSpace(txid))
-	if raw, err := hex.DecodeString(txid); err != nil || len(raw) != 32 {
-		return nil, fmt.Errorf("%w: %q is not a transaction id", ErrBadPayment, txid)
-	}
-
-	acceptMu.Lock()
-	defer acceptMu.Unlock()
-
-	known, err := c.KnowsTx(ctx, txid)
-	if err != nil {
-		return nil, err
-	}
-	if known {
-		return nil, fmt.Errorf("%w: %s", ErrPaymentKnown, txid)
-	}
-
-	rec, err := c.Oracle.GetTx(ctx, txid)
-	if err != nil {
-		return nil, fmt.Errorf("%w: arcade has no record of %s: %v", ErrBadPayment, txid, err)
-	}
-	if rec == nil || len(rec.RawTx) == 0 {
-		return nil, fmt.Errorf("%w: arcade has no bytes for %s", ErrBadPayment, txid)
-	}
-	if len(rec.MerklePath) == 0 {
-		return nil, fmt.Errorf("%w: %s is not mined yet; a transaction fetched by id carries no "+
-			"ancestry, so nothing but a merkle proof can prove it is real. Try again once it is mined",
-			ErrBadPayment, txid)
-	}
-
-	tx, err := transaction.NewTransactionFromBytes(rec.RawTx)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrBadPayment, err)
-	}
-	mp, err := transaction.NewMerklePathFromBinary(rec.MerklePath)
-	if err != nil {
-		return nil, fmt.Errorf("%w: parse BUMP: %v", ErrBadPayment, err)
-	}
-	if err := tx.AddMerkleProof(mp); err != nil {
-		return nil, fmt.Errorf("%w: attach merkle proof: %v", ErrBadPayment, err)
-	}
-
-	target, err := FundingAddress(c.Identity, c.Config.Network)
-	if err != nil {
-		return nil, err
-	}
-	indices, satoshis := MatchFundingOutputs(tx, target)
-	if len(indices) == 0 {
-		return nil, ErrNoPaymentOutput
-	}
-	if satoshis < c.Config.MinPaymentSatoshis {
-		return nil, fmt.Errorf("%w: %d satoshis, minimum is %d",
-			ErrPaymentTooSmall, satoshis, c.Config.MinPaymentSatoshis)
-	}
-
-	atomic, err := tx.AtomicBEEF(false)
-	if err != nil {
-		return nil, fmt.Errorf("%w: build atomic BEEF: %v", ErrBadPayment, err)
-	}
-	return c.internalizeOutputs(ctx, atomic, tx, indices, satoshis, "public funding via "+txid[:16])
 }

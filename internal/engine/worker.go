@@ -526,7 +526,12 @@ func (e *Engine) enterStarvation(ctx context.Context, cell int) {
 		return
 	}
 	e.mode = ModeStarved
-	e.lastError = "out of funds — waiting for a payment to " + e.fundingAddress
+	// No address in the message. lastError is painted on the public page, and
+	// the page can no longer act on one: a visitor funds this from a BRC-100
+	// wallet through the funding bar, which is already sitting above this text
+	// wearing its stopped colours. The address goes to the log instead, where
+	// the operator — who still funds by address, from the CLI — will find it.
+	e.lastError = "out of funds — waiting for a payment"
 	addr := e.fundingAddress
 	e.notify()
 	e.mu.Unlock()

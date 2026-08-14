@@ -26,12 +26,10 @@ type fakeFunder struct {
 	err      error
 	accepted int
 	lastBEEF []byte
-	lastTxID string
 }
 
 func (f *fakeFunder) Target() (FundingTarget, error) {
 	return FundingTarget{
-		Address:           "mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U",
 		LockingScriptHex:  "76a914aabbccddeeff0011223344556677889900aabbcc88ac",
 		Network:           "ttn",
 		MinSatoshis:       10_000,
@@ -51,17 +49,6 @@ func (f *fakeFunder) Accept(_ context.Context, beef []byte) (Accepted, error) {
 		return Accepted{}, f.err
 	}
 	return Accepted{TxID: "abc123", Satoshis: 500_000, Outputs: []uint32{2}}, nil
-}
-
-func (f *fakeFunder) AcceptTxID(_ context.Context, txid string) (Accepted, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.accepted++
-	f.lastTxID = txid
-	if f.err != nil {
-		return Accepted{}, f.err
-	}
-	return Accepted{TxID: txid, Satoshis: 1_000, Mined: true}, nil
 }
 
 func (f *fakeFunder) calls() int {
@@ -105,7 +92,7 @@ func TestFundingRoutesAreAbsentWithoutAFunder(t *testing.T) {
 		t.Errorf("GET /api/funding = %d with no funder, want 404", res.StatusCode)
 	}
 
-	post := postFund(t, srv.URL, `{"txid":"aa"}`)
+	post := postFund(t, srv.URL, `{"beef":"AAAA"}`)
 	if post.StatusCode != http.StatusNotFound {
 		t.Errorf("POST /api/fund = %d with no funder, want 404", post.StatusCode)
 	}
@@ -124,8 +111,8 @@ func TestFundingTargetIsServed(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Address == "" || got.LockingScriptHex == "" {
-		t.Error("the payer was given no address and no script to pay")
+	if got.LockingScriptHex == "" {
+		t.Error("the payer was given no script to pay")
 	}
 	if got.MinSatoshis == 0 {
 		t.Error("no minimum was published, so a payer cannot know what will be refused")
@@ -233,25 +220,30 @@ func TestFundingErrorsReachThePayerAsSomethingActionable(t *testing.T) {
 	}
 }
 
-// A txid-only request routes to the by-id path, and a request carrying both
-// prefers the BEEF: it is strictly more evidence.
-func TestFundRoutesByWhatItWasGiven(t *testing.T) {
-	byID := &fakeFunder{}
-	srv := fundServer(t, byID)
-	if res := postFund(t, srv.URL, `{"txid":"deadbeef"}`); res.StatusCode != http.StatusOK {
-		t.Fatalf("txid request = %d", res.StatusCode)
+// A BEEF is the only thing this endpoint takes.
+//
+// The txid form is not merely undocumented, it is refused: it used to credit a
+// payment somebody had sent to the funding address by hand, and this deployment
+// is funded from a BRC-100 wallet or not at all. A txid that quietly still
+// worked would be the removed path surviving in the one place nobody looks.
+func TestFundTakesOnlyABeef(t *testing.T) {
+	f := &fakeFunder{}
+	srv := fundServer(t, f)
+
+	if res := postFund(t, srv.URL, `{"beef":"AAAA"}`); res.StatusCode != http.StatusOK {
+		t.Fatalf("beef request = %d, want 200", res.StatusCode)
 	}
-	if byID.lastTxID != "deadbeef" {
-		t.Errorf("txid path saw %q", byID.lastTxID)
+	if len(f.lastBEEF) == 0 {
+		t.Error("the beef never reached the funder")
 	}
 
-	both := &fakeFunder{}
-	srv2 := fundServer(t, both)
-	if res := postFund(t, srv2.URL, `{"beef":"AAAA","txid":"deadbeef"}`); res.StatusCode != http.StatusOK {
-		t.Fatalf("combined request = %d", res.StatusCode)
+	if res := postFund(t, srv.URL, `{"txid":"deadbeef"}`); res.StatusCode != http.StatusBadRequest {
+		t.Errorf("txid request = %d, want 400: paying by address is no longer supported",
+			res.StatusCode)
 	}
-	if both.lastTxID != "" || len(both.lastBEEF) == 0 {
-		t.Error("a request carrying both did not prefer the BEEF")
+	if f.calls() != 1 {
+		t.Errorf("the funder was called %d times, want 1: the txid request reached the wallet",
+			f.calls())
 	}
 }
 

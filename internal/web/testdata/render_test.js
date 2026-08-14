@@ -448,7 +448,6 @@ test('an unlocked deployment offers the clock controls', () => {
 });
 
 const FUND_TARGET = {
-  address: 'mpz7rAwYignR5bybEGP4aZQbeikjxiRQ2U',
   lockingScript: '76a914aa88ac',
   network: 'ttn',
   minSatoshis: 10000,
@@ -1061,7 +1060,7 @@ test('an expanded panel stays expanded across the pushes that follow', () => {
     'a render put the panel away while the viewer had it open');
 });
 
-test('a missing wallet opens the panel it is telling you to use', async () => {
+test('a missing wallet opens the panel that is explaining why', async () => {
   app.setFundTarget(FUND_TARGET);
   apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
   flushFrames();
@@ -1070,14 +1069,14 @@ test('a missing wallet opens the panel it is telling you to use', async () => {
     'the panel was already expanded, so what follows would pass without the fix');
 
   // Wallet.probe resolves null in this harness, which is the no-wallet path.
-  // Collapsed, the address and the txid box are behind a display:none, so
-  // without the expand this reports "pay by hand" and shows no way to.
+  // There is no fallback to offer any more — a BRC-100 wallet is the only way
+  // to pay this — so the whole answer is the message, and the message is in the
+  // half of the panel that is collapsed at rest.
   await byId('fundBtn').onclick();
 
   assert.ok(byId('fund').hasAttribute('data-expanded'),
-    'the pay-by-hand fallback was opened inside a collapsed panel');
-  assert.strictEqual(byId('fundManual').open, true,
-    'the manual payment block stayed shut');
+    'the refusal was written into a panel that was still collapsed');
+  assert.ok(!byId('fundStatus').hidden, 'the payer was told nothing at all');
 });
 
 /* --- fitting the ring to a narrow viewport --------------------------------
@@ -1291,7 +1290,6 @@ for (const [name, fn] of tests) {
   // so it also survives into the next test unless it is cleared. It has already
   // made one test pass that should have failed.
   byId('fund').removeAttribute('data-expanded');
-  byId('fundManual').open = false;
   // 4px: the shipped default, and the zoom the virtualization arithmetic in
   // these tests assumes. Setting it through oninput also marks the zoom as
   // viewer-chosen, so fitZoom stays out of the way of tests that are not about

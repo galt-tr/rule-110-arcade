@@ -1155,8 +1155,6 @@ async function loadFundTarget() {
   if (!res.ok) return; // public funding is off; the panel stays hidden forever
   fundTarget = await res.json();
 
-  document.getElementById('fundAddress').textContent = fundTarget.address;
-  document.getElementById('fundNetwork').textContent = fundTarget.network;
   const amount = document.getElementById('fundAmount');
   amount.value = String(fundTarget.suggestedSatoshis || fundTarget.minSatoshis || 0);
   amount.min = String(fundTarget.minSatoshis || 0);
@@ -1177,12 +1175,11 @@ document.getElementById('fundBtn').onclick = async () => {
     fundSay('Looking for a wallet…');
     if (!await Wallet.probe()) {
       fundSay(Wallet.explain(new Error('none')), 'bad');
-      // Expand first. In the resting state the pay-by-hand block is collapsed,
-      // so opening the <details> inside it would put the address and the txid
-      // box behind a display:none — an error telling the viewer to pay by hand
-      // with no visible way to do it.
+      // Expand, because in the resting state #fundStatus is the only part of
+      // this panel a viewer is looking at and the sentence explaining what a
+      // BRC-100 wallet is for sits collapsed above it. There is nothing else to
+      // offer them: a wallet is now the only way to pay this deployment.
       setFundExpanded(true);
-      document.getElementById('fundManual').open = true;
       return;
     }
 
@@ -1228,38 +1225,6 @@ document.getElementById('fundBtn').onclick = async () => {
   } finally {
     btn.disabled = false;
   }
-};
-
-document.getElementById('fundCopy').onclick = async () => {
-  try {
-    await navigator.clipboard.writeText(fundTarget.address);
-    fundSay('Address copied.', 'good');
-  } catch {
-    fundSay('Could not copy; select the address by hand.', 'bad');
-  }
-};
-
-document.getElementById('fundTxidBtn').onclick = async () => {
-  const txid = document.getElementById('fundTxid').value.trim();
-  if (!txid) return;
-  fundSay('Looking that transaction up…');
-  const res = await fetch('/api/fund', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ txid }),
-  });
-  if (!res.ok) {
-    fundSay((await res.text()).trim() || 'That transaction could not be credited.', 'bad');
-    return;
-  }
-  const out = await res.json();
-  fundSay(`Thank you — ${out.satoshis.toLocaleString()} satoshis credited.`, 'good');
-  awaitingFuel = {
-    at: Date.now(),
-    satoshis: out.satoshis,
-    poolAt: (state.snap && state.snap.poolCoins) || 0,
-  };
-  scheduleRender();
 };
 
 /** Which cell is under the pointer, or null. */

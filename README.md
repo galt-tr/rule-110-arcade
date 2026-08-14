@@ -163,6 +163,14 @@ the first fuel and creates generation 0 by itself. With `-public-funding` the
 page carries a Fund button that any BRC-100 wallet can use, so the deployment
 can be started by somebody who has no shell access to it at all.
 
+A wallet is the *only* way a visitor can pay it. The page used to also print the
+funding address and take a transaction id for a payment made by hand, and it no
+longer does: a transaction fetched by its id carries no ancestry, so crediting
+one meant waiting for a block and trusting the arcade for the merkle proof,
+where a BEEF from a wallet proves where the money came from and is credited in
+seconds. The by-hand route below is still there for the operator, who has the
+`keys.json` the address is derived from anyway.
+
 ```sh
 rule110 run -arcade-url https://arcade-v2-ttn-us-1.bsvblockchain.tech \
             -network ttn -data-dir ./data -public-funding
