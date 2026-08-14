@@ -132,7 +132,14 @@ h1 { font-size: 18px; margin: 0; letter-spacing: .04em; }
 .sub { color: var(--muted); font-size: 12px; }
 
 .stats { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; }
-.stat b { color: var(--accent); font-weight: 600; }
+/* tabular-nums because this row is above the diagram in a flex column that is
+   exactly the viewport tall, so anything that changes the header's height comes
+   straight out of the canvas — which is then reallocated and repainted. These
+   numbers change several times a second; proportional digits make the row
+   breathe by a pixel or two on every one of them, and at a wrap boundary that
+   is a whole line of header and a visible jump in the diagram. It does not fix
+   a digit-count change (9,999 to 10,000), which is rarer and left alone. */
+.stat b { color: var(--accent); font-weight: 600; font-variant-numeric: tabular-nums; }
 .stat span { color: var(--muted); }
 
 main { flex: 1; display: flex; min-height: 0; }

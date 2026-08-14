@@ -23,6 +23,11 @@ const assert = require('node:assert');
 
 let rectCount = 0;
 let blitCount = 0;
+/** Every canvas the page has ever asked the document for. reflow needs a
+ *  scratch bitmap to carry already-painted rows across a scroll, and how often
+ *  it ALLOCATES one is the thing worth counting: a full-size bitmap per frame is
+ *  megabytes of garbage per second during a drag. */
+let canvasesCreated = 0;
 
 function newContext(owner) {
   return {
@@ -79,6 +84,7 @@ function newElement(tag) {
     getBoundingClientRect() { return { top: 0, left: 0 }; },
   };
   if (tag === 'canvas') {
+    canvasesCreated++;
     const c = newContext(el);
     el.getContext = () => c;
   }
@@ -228,6 +234,11 @@ function test(name, fn) { tests.push([name, fn]); }
 
 // Put the client in a known place in a known archive.
 function atArchive(oldest, newest, scrollTop = 0) {
+  // A freshly loaded page has never forgotten a run. Without this the restart
+  // guard — a wall-clock cooldown, by design — carries from one test into the
+  // next, and a suite that restarts four runs in a millisecond would see only
+  // the first.
+  app.resetRestartGuard();
   setArchive({ oldest, newest });
   app.setExtent({ oldest, newest, count: newest - oldest + 1, empty: false });
   byId('canvas-wrap').scrollHeight = (newest - oldest + 1) * 4;
@@ -348,6 +359,23 @@ test('prefetch still covers overscan even though the canvas does not', () => {
 
 // A drag across the archive jumps further than the window is wide, so there is
 // nothing to blit and carrying the old bitmap would show stale rows.
+// Dragging the scrollbar shifts the window on every frame, and every shifting
+// frame carries the already-painted rows across on a scratch bitmap. Allocating
+// that scratch per frame is ~2.8MB of garbage per frame at 256 cells — the GC
+// pauses it buys land as dropped frames in the middle of the drag, which is the
+// one moment they are most visible.
+test('scrolling reuses one scratch bitmap instead of allocating per frame', () => {
+  atArchive(0, 100000, 0);
+  seedRows(0, 3000);
+  // The first shifting frame is allowed its allocation; it is the per-frame
+  // repeat that is the defect.
+  scrollTo(4 * 10);
+  const before = canvasesCreated;
+  for (let i = 1; i <= 40; i++) scrollTo(4 * (10 + i));
+  assert.strictEqual(canvasesCreated - before, 0,
+    `${canvasesCreated - before} scratch bitmaps allocated across 40 scrolling frames`);
+});
+
 test('a scroll jump larger than the window repaints rather than blitting', () => {
   atArchive(0, 100000, 0);
   seedRows(0, 1000);
@@ -476,6 +504,52 @@ test('cells waiting on coin also count as running low', () => {
 
   assert.strictEqual(byId('fund').className, 'low',
     'cells were already retrying shortfalls and the page said nothing');
+});
+
+// The panel's HEIGHT is what makes this a rendering test rather than a copy
+// one. `resting` collapses to a single line and the other states do not — 86px
+// against 48px — and the page is 100svh with the diagram's pane as the flex
+// child that absorbs the difference. So every flip between `low` and `resting`
+// changes wrap.clientHeight, changes windowRows, reallocates the bitmap, and
+// jerks the whole diagram 38px up or down.
+//
+// Both halves of the low test are live per-push scalars: waitingOnCoin counts
+// cells retrying a shortfall RIGHT NOW, and poolCoins crosses `cells` over and
+// over as the keeper mints against the drain. Left undamped they flip the panel
+// at the push rate.
+test('a momentary recovery does not collapse the funding panel', () => {
+  app.setFundTarget(FUND_TARGET);
+  app.resetFuelLatch();
+  apply(snapshot(tail(0, 4), { starved: false, poolCoins: 0, waitingOnCoin: 2 }));
+  flushFrames();
+  assert.strictEqual(byId('fund').className, 'low', 'precondition: the shortfall is showing');
+
+  // The keeper mints a handful: over the line, and only just.
+  apply(snapshot(tail(0, 4), { starved: false, poolCoins: CELLS + 1, waitingOnCoin: 0 }));
+  flushFrames();
+
+  assert.strictEqual(byId('fund').className, 'low',
+    'one coin over the line collapsed the panel; the next push takes it back and ' +
+    'the diagram jumps 38px every time');
+});
+
+// The other side of it. Damping that never releases is not damping, it is a
+// panel stuck on a warning that has stopped being true.
+test('a recovery that holds does collapse the funding panel', () => {
+  app.setFundTarget(FUND_TARGET);
+  app.resetFuelLatch();
+  apply(snapshot(tail(0, 4), { starved: false, poolCoins: 0, waitingOnCoin: 2 }));
+  flushFrames();
+  assert.strictEqual(byId('fund').className, 'low', 'precondition: the shortfall is showing');
+
+  for (let i = 0; i < app.LOW_CLEAR_PUSHES; i++) {
+    apply(snapshot(tail(0, 4), { starved: false, poolCoins: CELLS * 10, waitingOnCoin: 0 }));
+    flushFrames();
+  }
+
+  assert.strictEqual(byId('fund').className, 'resting',
+    'the pool has been comfortably full for the whole damping window and the panel ' +
+    'is still asking for money');
 });
 
 test('a starved automaton says so unmistakably', () => {
@@ -646,6 +720,93 @@ test('ordinary growth does not count as a restart', async () => {
   assert.strictEqual(state.extent.newest, 208, 'the frontier should still lead the extent');
   assert.ok(state.rows.size >= before,
     'growing the run threw away the cache, so every scroll would refetch');
+});
+
+// A run restarts once. Twice inside two seconds is not a restart, it is
+// whatever the detector got wrong — and the two failure modes are not
+// comparable. Refusing to forget costs one stale window, corrected by the next
+// extent read; forgetting on a loop empties the cache at the push rate and the
+// diagram strobes. So the guard is unconditional, and it is what keeps a future
+// mistake in the trigger from ever reaching the canvas.
+test('a second forget moments after the first is refused', async () => {
+  atArchive(0, 800);
+  setArchive({ oldest: 0, newest: 100 });
+  apply(snapshot(tail(94, 100)));
+  await settle();
+  assert.strictEqual(state.extent.newest, 100, 'precondition: the restart was taken');
+
+  seedRows(50, 40);
+  const before = state.rows.size;
+  // Whatever the cause — a stale extent, a trigger bug — the client believes
+  // the run is long again and the next push looks like another restart.
+  app.setExtent({ oldest: 0, newest: 800, count: 801, empty: false });
+  apply(snapshot(tail(94, 100)));
+  await settle();
+
+  assert.ok(state.rows.size >= before,
+    `a second forget ${before} rows later emptied the cache again ` +
+    `(now ${state.rows.size}); repeat this at the push rate and the canvas strobes`);
+});
+
+// --- cells spread out, which is not a restart ------------------------------
+//
+// These cover a live failure: the diagram blanked and refilled about twice a
+// second on any deployment whose cells had spread out at all, which is all of
+// them.
+//
+// A push reports two positions and they are NOT the same quantity. `generation`
+// is the frontier — the slowest cell (engine.frontierLocked) — while the
+// extent's `newest` is MAX(number) FROM generations, a row written by whichever
+// cell reached that generation FIRST. Cells run up to chain MaxLag apart, so in
+// a perfectly healthy run the two differ by up to 32 and RESTART_DROP is 2.
+// Comparing them took the restart branch on nearly every push, and forgetRun
+// clears the whole row cache — including the eight generations the push had
+// just delivered — leaving a blank canvas until the archive refilled it 120ms
+// later, at which point the next push blanked it again.
+//
+// Measured on the live deployment: /api/state reported generation 219 while
+// /api/extent reported newest 251, a gap of exactly MaxLag.
+//
+// Every other fixture in this file sets the two numbers equal, which is
+// precisely the conflation that hid this.
+
+/** How far the leading cell may run ahead of the slowest one:
+ *  chain.Config.MaxLag, internal/chain/config.go. */
+const MAX_LAG = 32;
+
+/** A push shaped the way the server really sends one — the tail carries rows up
+ *  to the LEADING generation while `generation` reports the frontier behind
+ *  it. */
+function spreadOut(newest) {
+  return snapshot(tail(newest - 7, newest), { generation: newest - MAX_LAG });
+}
+
+test('cells spread out across the ring is not read as a restart', async () => {
+  atArchive(0, 800);
+  seedRows(640, 161);
+  const before = state.rows.size;
+  assert.ok(before > 8, 'precondition: the window is cached');
+
+  apply(spreadOut(800));
+  await settle();
+
+  assert.ok(state.rows.size >= before,
+    `an ordinary push threw the cache away (${before} rows to ${state.rows.size}) — ` +
+    'the canvas blanks and the archive is re-read on every push');
+});
+
+test('a push with the cells spread out leaves the diagram on the canvas', () => {
+  atArchive(0, 800);
+  seedRows(640, 161);
+  app.draw();
+  const painted = paint.sig.size;
+  assert.ok(painted > 0, 'precondition: rows are on the bitmap');
+
+  apply(spreadOut(800));
+  flushFrames();
+
+  assert.ok(paint.sig.size >= painted,
+    `the bitmap went from ${painted} painted rows to ${paint.sig.size} on an ordinary push`);
 });
 
 // Async-aware: the extent is re-read over the network, so the tests that cover
@@ -820,6 +981,10 @@ test('following still chases the live edge when it is switched on', () => {
 
 test('a healthy panel marks itself resting so it can collapse', () => {
   app.setFundTarget(FUND_TARGET);
+  // A panel that has never seen a shortfall. The fuel warning latches across
+  // pushes on purpose (see isLowOnFuel), so a test that starts from health has
+  // to say so rather than inherit whatever the last test left behind.
+  app.resetFuelLatch();
   apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
   flushFrames();
 
@@ -846,6 +1011,10 @@ test('a panel that needs money never collapses, asked or not', () => {
 // of that is checked against a running instance instead.
 test('pressing the message expands the panel and says that it has', () => {
   app.setFundTarget(FUND_TARGET);
+  // A panel that has never seen a shortfall. The fuel warning latches across
+  // pushes on purpose (see isLowOnFuel), so a test that starts from health has
+  // to say so rather than inherit whatever the last test left behind.
+  app.resetFuelLatch();
   apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
   flushFrames();
 
@@ -875,6 +1044,10 @@ test('pressing the message does nothing in a state that is already open', () => 
 
 test('an expanded panel stays expanded across the pushes that follow', () => {
   app.setFundTarget(FUND_TARGET);
+  // A panel that has never seen a shortfall. The fuel warning latches across
+  // pushes on purpose (see isLowOnFuel), so a test that starts from health has
+  // to say so rather than inherit whatever the last test left behind.
+  app.resetFuelLatch();
   apply(snapshot(tail(0, 4), { poolCoins: CELLS * 10, waitingOnCoin: 0 }));
   flushFrames();
   byId('fundMsg').onclick();
