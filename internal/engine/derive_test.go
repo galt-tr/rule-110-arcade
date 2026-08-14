@@ -55,7 +55,25 @@ type fixture struct {
 	ledger   *countingLedger
 	seed     ca.Row
 	genesis  *transaction.Transaction
+
+	// wreckage is the cascade budget this fixture derives with. Zero means "the
+	// budget a default deployment gets", so a test only sets it when the budget
+	// is the thing under test.
+	wreckage int
 }
+
+// budget is the cascade budget for this fixture's derivations.
+func (f *fixture) budget() int {
+	if f.wreckage > 0 {
+		return f.wreckage
+	}
+	return defaultBudget()
+}
+
+// defaultBudget is what a deployment running the shipped configuration derives
+// with. Tests that size a pile relative to the budget before they have a fixture
+// use this, so they move with the configuration rather than pinning a number.
+func defaultBudget() int { return WreckageBudget(chain.DefaultConfig().MaxUnseenDepth) }
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
@@ -178,7 +196,7 @@ func (f *fixture) genesisTip(cell int) chain.CellChain {
 
 func (f *fixture) derive(t *testing.T) []CellPosition {
 	t.Helper()
-	positions, err := DeriveTips(t.Context(), f.ledger, f.compiled, f.facts, f.store)
+	positions, err := DeriveTips(t.Context(), f.ledger, f.compiled, f.facts, f.store, f.budget())
 	if err != nil {
 		t.Fatalf("DeriveTips: %v", err)
 	}
@@ -346,13 +364,13 @@ func TestDerivationIsBounded(t *testing.T) {
 		}
 	}
 
-	tips, err := f.store.CellTips(ctx, testCells, tipDepth)
+	tips, err := f.store.CellTips(ctx, testCells, tipWindow(f.budget()))
 	if err != nil {
 		t.Fatalf("CellTips: %v", err)
 	}
-	if got := len(tips[0]); got != tipDepth {
+	if want := tipWindow(f.budget()); len(tips[0]) != want {
 		t.Errorf("CellTips returned %d rows for a cell with 20,000, want at most %d — "+
-			"the read must be bounded by depth, not by how long the automaton has run", got, tipDepth)
+			"the read must be bounded by depth, not by how long the automaton has run", len(tips[0]), want)
 	}
 	if got := tips[0][0].Generation; got != 20099 {
 		t.Errorf("newest row is generation %d, want 20099 (newest first)", got)
@@ -509,7 +527,7 @@ func TestDerivationRefusesWhenBytesAreMissing(t *testing.T) {
 	f := newFixture(t)
 	f.ledger.rawErr = errors.New("wallet unreachable")
 
-	if _, err := DeriveTips(t.Context(), f.ledger, f.compiled, f.facts, f.store); err == nil {
+	if _, err := DeriveTips(t.Context(), f.ledger, f.compiled, f.facts, f.store, f.budget()); err == nil {
 		t.Fatal("derived tips without being able to read a single transaction")
 	}
 }
@@ -527,7 +545,7 @@ func TestDerivationRefusesARowDisagreement(t *testing.T) {
 	}
 	f.advance(t, 1, f.genesisTip(1), history.StatusBroadcast)
 
-	_, err := DeriveTips(t.Context(), f.ledger, f.compiled, f.facts, f.store)
+	_, err := DeriveTips(t.Context(), f.ledger, f.compiled, f.facts, f.store, f.budget())
 	if err == nil {
 		t.Fatal("started with the store's rows disagreeing with the seed")
 	}
@@ -548,7 +566,7 @@ func TestUnderivableCellHaltsOnlyItself(t *testing.T) {
 	ctx := t.Context()
 
 	// Cell 7's whole visible history is failures, with nothing broadcast below.
-	for gen := uint64(1); gen <= tipDepth+2; gen++ {
+	for gen := uint64(1); gen <= uint64(tipWindow(f.budget())+2); gen++ {
 		if err := f.store.RecordTx(ctx, history.CellTx{
 			Generation: gen, Cell: 7, Status: history.StatusFailed, Err: "never got out",
 		}); err != nil {
@@ -571,6 +589,142 @@ func TestUnderivableCellHaltsOnlyItself(t *testing.T) {
 	for cell, other := range positions {
 		if cell != 7 && other.Halted {
 			t.Errorf("cell %d halted too; one buried cell must not stop the ring", cell)
+		}
+	}
+}
+
+// buryUnderRejections stacks n failed rows above a cell's tip, each spending the
+// one below it, which is the shape a single late rejection leaves behind.
+func (f *fixture) buryUnderRejections(t *testing.T, cell int, tip chain.CellChain, n int) {
+	t.Helper()
+	doomed := tip
+	for range n {
+		doomed = f.build(t, cell, doomed, 0)
+		if err := f.store.RecordTx(t.Context(), history.CellTx{
+			Generation: doomed.Generation, Cell: cell, TxID: doomed.TxID,
+			Status: history.StatusFailed, Err: "arcade: REJECTED: PROCESSING (4)",
+		}); err != nil {
+			t.Fatalf("record rejection at %d: %v", doomed.Generation, err)
+		}
+	}
+}
+
+// TestAPileTheDepthGateAllowsIsNotACascade is the regression test for the
+// 2026-08-13 halt, and it is about two numbers that were never tied together.
+//
+// MaxUnseenDepth is permission to have that many transitions in flight without a
+// verdict. So when a verdict finally arrives and it is a rejection, EVERY
+// transition built in the meantime is doomed — up to the depth, by construction,
+// for a reason that is completely understood. On the live ring at depth 32 one
+// rejection of generation 398 arrived 106 seconds late and left a pile of 31.
+//
+// The cascade guard was a constant 3, measured when the gate only ever allowed
+// one transition in flight. It read 31 as "a history nobody understands",
+// withheld the cells from repair and halted four of them for a human — which is
+// precisely the state the whole recovery design exists to prevent.
+func TestAPileTheDepthGateAllowsIsNotACascade(t *testing.T) {
+	f := newFixture(t)
+	f.wreckage = WreckageBudget(32)
+
+	const cell, lastGood = 4, 3
+	tip := f.genesisTip(cell)
+	for range lastGood {
+		tip = f.advance(t, cell, tip, history.StatusMined)
+	}
+	f.buryUnderRejections(t, cell, tip, 31)
+
+	got := f.derive(t)[cell]
+
+	if !got.Rejected {
+		t.Errorf("a pile of 31 at depth 32 was withheld from repair as a cascade: %s\n"+
+			"the gate ALLOWS 32 transitions in flight, so 31 doomed descendants of one "+
+			"rejection is the ordinary cost of a late verdict, not an unreadable history",
+			got.HaltReason)
+	}
+	if got.Tip.Generation != lastGood {
+		t.Errorf("derived tip generation %d, want %d — the newest ACCEPTED record is the tip "+
+			"however much wreckage is stacked on it", got.Tip.Generation, lastGood)
+	}
+	if got.Unknown {
+		t.Error("rejections are not ambiguity: the tip is known, so Unknown must stay clear")
+	}
+}
+
+// The guard still has to exist. The same pile under a deployment that allows one
+// transition in flight is NOT ordinary — nothing there could legitimately have
+// built 31 doomed rows — so it stays a cascade and a human decides.
+func TestTheSamePileIsStillACascadeAtDepthOne(t *testing.T) {
+	f := newFixture(t)
+	f.wreckage = WreckageBudget(1)
+
+	const cell, lastGood = 4, 3
+	tip := f.genesisTip(cell)
+	for range lastGood {
+		tip = f.advance(t, cell, tip, history.StatusMined)
+	}
+	f.buryUnderRejections(t, cell, tip, 31)
+
+	got := f.derive(t)[cell]
+
+	if got.Rejected {
+		t.Error("31 rejections at depth 1 were offered to repair; the gate cannot account " +
+			"for that many doomed rows, so it is a cascade")
+	}
+	if !got.Halted {
+		t.Error("a cell under a cascade must not advance")
+	}
+	if got.Tip.Generation != lastGood {
+		t.Errorf("derived tip generation %d, want %d", got.Tip.Generation, lastGood)
+	}
+}
+
+// No configuration buys an unbounded pile. Cells 34, 51, 64 and 91 of the live
+// deployment carry ~170 stacked rejections each over tips near generation 300 —
+// a build that spent phantom outputs for hundreds of generations — and re-creating
+// those chains is a decision about the automaton's history rather than about one
+// refused transaction. The ceiling is what keeps that judgement intact when the
+// depth gate is opened wide, or turned off entirely.
+func TestTheCeilingStillWithholdsARunawayPile(t *testing.T) {
+	for name, maxUnseen := range map[string]uint64{
+		"a very deep gate": 4096,
+		"no gate at all":   0,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.wreckage = WreckageBudget(maxUnseen)
+			if f.wreckage != wreckageCeiling {
+				t.Fatalf("budget %d, want the ceiling %d", f.wreckage, wreckageCeiling)
+			}
+
+			const cell, lastGood = 2, 3
+			tip := f.genesisTip(cell)
+			for range lastGood {
+				tip = f.advance(t, cell, tip, history.StatusMined)
+			}
+			f.buryUnderRejections(t, cell, tip, 170)
+
+			got := f.derive(t)[cell]
+			if got.Rejected {
+				t.Error("a 170-deep pile was offered to repair; no depth setting makes that ordinary")
+			}
+			if !got.Halted {
+				t.Error("a cell under 170 rejections must not advance")
+			}
+		})
+	}
+}
+
+// The two numbers must stay tied: the deep path reads "nothing in the window
+// settled" as proof the pile is over budget WITHOUT counting it, so a window that
+// a within-budget pile could fill would condemn recoverable cells silently.
+func TestTheWindowAlwaysOutrunsTheBudget(t *testing.T) {
+	for _, maxUnseen := range []uint64{0, 1, 2, 8, 32, 64, 4096} {
+		b := WreckageBudget(maxUnseen)
+		if tipWindow(b) <= b {
+			t.Errorf("depth %d: window %d does not exceed budget %d", maxUnseen, tipWindow(b), b)
+		}
+		if b <= 0 {
+			t.Errorf("depth %d: budget %d would call every rejection a cascade", maxUnseen, b)
 		}
 	}
 }

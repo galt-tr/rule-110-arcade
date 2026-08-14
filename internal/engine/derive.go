@@ -12,52 +12,92 @@ import (
 	"github.com/dymurray/rule-110-arcade/internal/history"
 )
 
-// tipDepth is how many records per cell derivation reads.
+// tipWindow is how many records per cell derivation reads, for a given wreckage
+// budget.
 //
 // One is enough in the healthy case. The rest cover a cell whose newest records
 // are a rejection or an unresolved attempt sitting on top of the last good
-// transaction, and a small number is deliberate: a cell buried under more
-// unresolved records than this is one whose history nobody understands, and the
-// right answer there is to stop and say so rather than to dig.
-const tipDepth = 8
-
-// maxWreckage is how many rejections may sit above a cell's tip before the cell
-// is a CASCADE rather than a cell with one broken transition on top of it. Past
-// it no repair is offered for that cell and a human decides.
+// transaction. The window must be strictly larger than the budget, because the
+// deep path below treats "nothing in the window settled" as proof that the pile
+// is over budget WITHOUT counting it. If the window could be filled by a pile
+// the budget still calls ordinary, that shortcut would condemn recoverable
+// cells — which is exactly the bug this pair of numbers had when they were two
+// unrelated constants.
 //
-// This is the guard that used to be spelled "the rejection must be at tip+1".
-// Adjacency was a proxy for it, and a wrong one: it also refused cell 12 of the
-// live deployment, whose two leftover rejections at generations 993 and 994 over
-// a tip at 991 are ordinary wreckage that clears in two passes. What actually
-// distinguishes the cells that must not be touched is the SIZE of the pile.
-// Cells 34, 51, 64 and 91 carry about 170 stacked rejections each over tips near
-// generation 300: those cells were allowed to build on phantom outputs for
-// hundreds of generations, so re-creating their chains is a decision about the
-// automaton's history rather than about one refused transaction. Resuming them
-// would not even help — the rejections underneath the newest would halt the cell
-// again at the next startup.
+// The margin is the old constants' own relationship (a window of 8 over a budget
+// of 3), preserved so that a deployment at the historical depth reads its history
+// exactly as it always did.
+func tipWindow(wreckage int) int { return wreckage + 5 }
+
+// wreckageFloor is the smallest pile that still counts as ordinary wreckage,
+// whatever the depth gate is set to.
+//
+// Three is the largest pile the live deployment's ordinary wreckage showed: cell
+// 12's record was 991 mined and then 992, 993 and 994 all failed — one break, and
+// the two transitions the old build stacked on its phantom output before the cell
+// was noticed. It is a judgement rather than a measurement, so it is stated once
+// here and the count is written into the halt reason, which is where an operator
+// reads what was actually found.
+//
+// # Why a constant 3 was wrong once the depth gate opened
+//
+// Three was measured on a deployment running MaxUnseenDepth=1, where a cell may
+// have at most one unacknowledged transition in flight. There a rejection can
+// only ever doom a row or two, so "more than three" really did mean "something
+// nobody understands".
+//
+// At MaxUnseenDepth=32 the same single rejection dooms up to THIRTY-TWO
+// descendants — every transition built while the verdict was in transit — and
+// they are doomed for a reason that is completely understood: they spend an
+// output that was refused. On 2026-08-13 that is precisely what happened. One
+// unexplained rejection of cell 35's generation 398 arrived 106 seconds late,
+// by which time generations 399-429 had been broadcast on top of it; the pile
+// came to 31 rows, the guard read 31 > 3 as a cascade, and four cells were
+// withheld from repair and halted for a human. The depth gate and this guard
+// were calibrated against different assumptions and nothing tied them together.
+//
+// So the budget is DERIVED from the gate: the pile one rejection can legitimately
+// leave is exactly the number of transitions the gate lets fly unacknowledged.
+const wreckageFloor = 3
+
+// wreckageCeiling is where the derivation stops believing any configuration.
+//
+// It is what keeps the original judgement intact. Cells 34, 51, 64 and 91 of the
+// live deployment carry about 170 stacked rejections each over tips near
+// generation 300 — a build that spent phantom outputs for hundreds of
+// generations, which is a decision about the automaton's history rather than
+// about one refused transition. No depth setting makes a pile that deep
+// ordinary, and an unbounded gate (MaxUnseenDepth=0) must not be read as
+// permission for an unbounded pile.
+const wreckageCeiling = 64
+
+// WreckageBudget is how many rejections may sit above a cell's tip before the
+// cell is a CASCADE rather than a cell with one broken transition on top of it.
+// Past it no repair is offered for that cell and a human decides.
 //
 // It COUNTS the failures above the tip rather than measuring a run upward from
 // tip+1, and that difference is the whole of why the count is trustworthy where
 // adjacency was not. A repair retracts one row per pass, so the bottom of any
 // pile is routinely missing: "consecutive from tip+1" reads cell 12's two
 // leftovers as zero, and — far worse — reads a 169-deep cascade whose bottom row
-// the previous pass retracted as zero too, which would hand exactly the four
-// cells above to recovery.
-//
-// Three is the largest pile the live deployment's ordinary wreckage shows: cell
-// 12's record was 991 mined and then 992, 993 and 994 all failed — one break, and
-// the two transitions the old build stacked on its phantom output before the cell
-// was noticed. It is a judgement rather than a measurement, so it is stated once
-// here and the count is written into the halt reason, which is where an operator
-// reads what was actually found.
-const maxWreckage = 3
-
-// The deep path in DeriveTips leans on this: a cell whose wreckage does not fit
-// inside the derivation window has more rejections above its tip than maxWreckage
-// allows, without anything having to count them. A negative constant here is a
-// compile error, which is the point.
-const _ = uint(tipDepth - maxWreckage - 1)
+// the previous pass retracted as zero too.
+func WreckageBudget(maxUnseen uint64) int {
+	// An unbounded gate gives no number to derive from, so the ceiling is the
+	// only honest answer.
+	if maxUnseen == 0 || maxUnseen > wreckageCeiling {
+		return wreckageCeiling
+	}
+	// The floor is added as MARGIN rather than used as a minimum: the gate bounds
+	// what is in flight when the verdict arrives, and a row or two can still be
+	// recorded between the rejection and the repair reaching the cell.
+	//
+	// At the historical depth of 1 that yields 4 where the old constant was 3.
+	// That is deliberate and the asymmetry is the reason: a budget one too small
+	// loses a cell permanently, while a budget one too large only means a repair
+	// attempts a pile it will then fail to clear — and repairCell is bounded, so
+	// it stops on its own and halts the cell exactly as before.
+	return min(int(maxUnseen)+wreckageFloor, wreckageCeiling)
+}
 
 // CellPosition is one cell's derived position, and why.
 //
@@ -103,7 +143,7 @@ type CellPosition struct {
 	// such a cell has changed.
 	//
 	// It is NOT set when the failures above the tip are a CASCADE; see
-	// maxWreckage, which is where that line is drawn for every rejection path at
+	// WreckageBudget, which is where that line is drawn for every rejection path at
 	// once, and noteRejection, which is the only place it is drawn.
 	//
 	// RejectionErr is the recorded reason — usually arcade's own words for why,
@@ -163,14 +203,19 @@ type CellPosition struct {
 // output that had never existed — forever, once per generation, each rejection
 // looking like a fresh independent failure. Reconstructing the halt from the
 // same rows that carry the tip makes the two impossible to disagree.
+// wreckage is the cascade budget, from WreckageBudget. It is a parameter rather
+// than a constant so that the one number the depth gate implies reaches every
+// reader of this history at once — the engine, `rule110 tips`, `rule110 recover`
+// and the depth probe. When they disagreed about it, the tool told an operator a
+// cell was fine while the engine was refusing to touch it.
 func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compiled,
-	d *chain.Deployment, store *history.Store) ([]CellPosition, error) {
+	d *chain.Deployment, store *history.Store, wreckage int) ([]CellPosition, error) {
 
 	seed, err := d.Seed()
 	if err != nil {
 		return nil, err
 	}
-	records, err := store.CellTips(ctx, d.Cells, tipDepth)
+	records, err := store.CellTips(ctx, d.Cells, tipWindow(wreckage))
 	if err != nil {
 		return nil, err
 	}
@@ -240,9 +285,9 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 			// rejection because an attempt means the tip is unknown.
 			//
 			// That argument is about one crash. It does not hold at this depth: a cell
-			// reaches this branch only when NOTHING in its newest tipDepth records
+			// reaches this branch only when NOTHING in its newest tipWindow records
 			// settled, so a rejection above the tip here is part of a pile deeper than
-			// maxWreckage allows however it is counted. Leaving Unknown set on top of
+			// the budget allows however it is counted. Leaving Unknown set on top of
 			// such a pile would be a way straight round the cascade guard and into
 			// chain.RecoverCell, which walks the WALLET's actions forward — and in a
 			// cascade those link one to the next (every attempt spent the previous
@@ -292,7 +337,7 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 		// message and the decision came apart in the first place.
 		//
 		// The tip being INSIDE the window is what makes the count exact: the window
-		// is the newest tipDepth records, so if the tip is in it then every record
+		// is the newest tipWindow records, so if the tip is in it then every record
 		// above the tip is in it too.
 		var failed, attempt history.Tip
 		failures, attempts := 0, 0
@@ -312,9 +357,9 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 				attempts++
 			}
 		}
-		cascade := failures > maxWreckage
+		cascade := failures > wreckage
 		if failures > 0 {
-			noteRejection(&out[cell], base.Generation, failed, failures)
+			noteRejection(&out[cell], base.Generation, failed, failures, wreckage)
 		}
 		if attempts > 0 && !cascade {
 			// Last, so that its reason wins: Recover dispatches on Unknown before it
@@ -403,7 +448,7 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 // comes from here, so the two cannot come apart again.
 //
 // `above` is how many failures sit above the tip in total, and it is the cascade
-// guard: past maxWreckage, Rejected is left unset and no repair is dispatched for
+// guard: past the wreckage budget, Rejected is left unset and no repair is dispatched for
 // the cell at all. The halt still names the record and the count, because an
 // operator who came to look at one specific cell must find it in the output
 // however it was decided.
@@ -412,15 +457,16 @@ func DeriveTips(ctx context.Context, l chain.Ledger, compiled *cellscript.Compil
 // every rejection path at once — the tip fix, the not-broadcast sentinel, the
 // superseded parent and the opt-in retry all reach chain through
 // CellPosition.Rejected.
-func noteRejection(p *CellPosition, tip uint64, r history.Tip, above int) {
+func noteRejection(p *CellPosition, tip uint64, r history.Tip, above, wreckage int) {
 	p.Halted = true
-	if above > maxWreckage {
+	if above > wreckage {
 		p.HaltReason = fmt.Sprintf(
-			"this cell's chain ends at generation %d with %d rejections stacked above it, the oldest "+
-				"at generation %d: %s. That is a cascade rather than one refused transition — every "+
-				"attempt after the first spent an output that never existed — so recovery will not "+
-				"touch it and a human decides",
-			tip, above, r.Generation, orUnknown(r.Err))
+			"this cell's chain ends at generation %d with %d rejections stacked above it (more than "+
+				"the %d this deployment's unseen depth can account for), the oldest at generation %d: "+
+				"%s. That is a cascade rather than one refused transition — every attempt after the "+
+				"first spent an output that never existed — so recovery will not touch it and a human "+
+				"decides",
+			tip, above, wreckage, r.Generation, orUnknown(r.Err))
 		return
 	}
 	p.Rejected = true

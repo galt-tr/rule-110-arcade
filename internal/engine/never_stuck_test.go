@@ -63,8 +63,8 @@ func TestARingWideRejectionBurstNeverHaltsTheRing(t *testing.T) {
 	}
 
 	// The burst: every cell, refused more times than maxRetries allows and more
-	// deeply than maxWreckage allows, inside one window.
-	for range maxRetries + maxWreckage + 2 {
+	// deeply than the wreckage budget allows, inside one window.
+	for range maxRetries + e.wreckageBudget() + 2 {
 		for cell := range testCells {
 			refuse(t, f, e, cell, refused[cell], aRefusal)
 		}
@@ -112,7 +112,7 @@ func TestNoRejectionSequenceCanPermanentlyHaltACell(t *testing.T) {
 			refused := f.build(t, cell, tip, 7)
 
 			// Well past every budget, and spanning the halt window.
-			for range 4 * (maxRetries + maxWreckage) {
+			for range 4 * (maxRetries + e.wreckageBudget()) {
 				refuse(t, f, e, cell, refused, rej.reason)
 				e.mu.Lock()
 				st := e.retries[cell]

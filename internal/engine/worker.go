@@ -1007,7 +1007,7 @@ func (e *Engine) rederiveIfNeeded(ctx context.Context) {
 		return
 	}
 
-	positions, err := DeriveTips(ctx, e.ledger, e.compiled, e.deployment, e.store)
+	positions, err := DeriveTips(ctx, e.ledger, e.compiled, e.deployment, e.store, e.wreckageBudget())
 	if err != nil {
 		if ctx.Err() != nil {
 			return

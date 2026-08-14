@@ -463,7 +463,7 @@ func cmdStep(args []string) error {
 	}
 	defer d.release()
 
-	positions, err := engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store)
+	positions, err := engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store, d.wreckage())
 	if err != nil {
 		return err
 	}

@@ -259,7 +259,7 @@ func TestWriteAheadSurvivesACrash(t *testing.T) {
 	}
 	// ...and the process dies here, before the result is known.
 
-	tips, err := e.store.CellTips(ctx, 4, tipDepth)
+	tips, err := e.store.CellTips(ctx, 4, tipWindow(e.wreckageBudget()))
 	if err != nil {
 		t.Fatalf("cell tips: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestResolvedAttemptIsNotFlagged(t *testing.T) {
 		}
 	}
 
-	tips, err := e.store.CellTips(ctx, 4, tipDepth)
+	tips, err := e.store.CellTips(ctx, 4, tipWindow(e.wreckageBudget()))
 	if err != nil {
 		t.Fatalf("cell tips: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestRetractedAttemptIsNotFlagged(t *testing.T) {
 	}
 	e.retractAttempt(300, 2)
 
-	tips, err := e.store.CellTips(ctx, 4, tipDepth)
+	tips, err := e.store.CellTips(ctx, 4, tipWindow(e.wreckageBudget()))
 	if err != nil {
 		t.Fatalf("cell tips: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestALocalFailureDoesNotHaltACell(t *testing.T) {
 		t.Errorf("tip = %s at generation %d, want the unchanged %s at %d",
 			p.Tip.TxID, p.Tip.Generation, good.TxID, good.Generation)
 	}
-	tips, err := f.store.CellTips(t.Context(), f.facts.Cells, tipDepth)
+	tips, err := f.store.CellTips(t.Context(), f.facts.Cells, tipWindow(f.budget()))
 	if err != nil {
 		t.Fatalf("cell tips: %v", err)
 	}

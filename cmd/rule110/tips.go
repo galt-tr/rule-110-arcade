@@ -34,6 +34,16 @@ type deployment struct {
 	release  func()
 }
 
+// wreckage is the cascade budget every tool here derives with.
+//
+// It reads the SAME configuration the engine does, which is the point of having
+// it in one place: a tool that judged a pile against a different budget would
+// tell an operator a cell was an unrecoverable cascade while the running engine
+// was quietly repairing it, or the reverse. See engine.WreckageBudget.
+func (d *deployment) wreckage() int {
+	return engine.WreckageBudget(d.chain.Config.MaxUnseenDepth)
+}
+
 // openDeployment connects the wallet and the store, compiles the contract, and
 // takes the writer lease.
 //
@@ -157,7 +167,7 @@ func cmdRecover(args []string) error {
 	defer d.release()
 	go d.holdToolLease(ctx, logger)
 
-	positions, err := engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store)
+	positions, err := engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store, d.wreckage())
 	if err != nil {
 		return err
 	}
@@ -166,7 +176,7 @@ func cmdRecover(args []string) error {
 	}
 
 	_, decisions, err := engine.Recover(ctx, d.chain, d.chain.Oracle, d.compiled, d.facts, d.store,
-		positions, engine.RecoverOptions{Apply: *apply, RetryRefused: *retryRefused})
+		positions, engine.RecoverOptions{Apply: *apply, RetryRefused: *retryRefused, Wreckage: d.wreckage()})
 	if err != nil {
 		return err
 	}
@@ -201,7 +211,7 @@ func cmdRecover(args []string) error {
 	// position already in hand.
 	after := positions
 	if *apply {
-		after, err = engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store)
+		after, err = engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store, d.wreckage())
 		if err != nil {
 			return err
 		}
@@ -343,7 +353,7 @@ func cmdImportTips(args []string) error {
 	//
 	// The floor check itself is deliberately NOT run here. It failing is the
 	// reason to run this command.
-	existing, err := engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store)
+	existing, err := engine.DeriveTips(ctx, d.chain, d.compiled, d.facts, d.store, d.wreckage())
 	if err != nil {
 		return err
 	}

@@ -646,7 +646,7 @@ func New(ctx context.Context, c *chain.Chain, compiled *cellscript.Compiled, d *
 		return nil, err
 	}
 
-	positions, err := DeriveTips(ctx, c, compiled, d, store)
+	positions, err := DeriveTips(ctx, c, compiled, d, store, WreckageBudget(c.Config.MaxUnseenDepth))
 	if err != nil {
 		return nil, err
 	}

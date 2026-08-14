@@ -38,6 +38,20 @@ type RecoverOptions struct {
 	// and "safe but unwarranted, 128 times, unattended, right after a crash" is
 	// not a decision this program should make for a human.
 	RetryRefused bool
+
+	// Wreckage is the cascade budget, from WreckageBudget. Zero means the caller
+	// did not say, and is read as the floor rather than as "no wreckage allowed":
+	// a zero budget would call every single rejection a cascade, which is the
+	// most destructive possible reading of an unset field.
+	Wreckage int
+}
+
+// wreckage is the budget this pass decides with.
+func (o RecoverOptions) wreckage() int {
+	if o.Wreckage <= 0 {
+		return wreckageFloor
+	}
+	return o.Wreckage
 }
 
 // Recover decides what to do with every cell whose tip is unknown, and — when
@@ -136,7 +150,8 @@ func decideCell(ctx context.Context, l chain.Ledger, oracle chain.TxStatus, comp
 
 	switch {
 	case p.Unknown:
-		rec, err = chain.RecoverCell(ctx, l, compiled, p.Tip, p.Attempted, d.Cells, d.Rule, tipDepth)
+		rec, err = chain.RecoverCell(ctx, l, compiled, p.Tip, p.Attempted, d.Cells, d.Rule,
+			tipWindow(opts.wreckage()))
 	case p.Rejected:
 		rec, err = recoverRejected(ctx, l, oracle, compiled, d, store, p, opts)
 	default:
@@ -506,11 +521,17 @@ func (e *Engine) repairCell(ctx context.Context, cell int) {
 	delete(e.needsRepair, cell)
 	e.mu.Unlock()
 
-	// Bounded by what derivation will even offer: past maxWreckage stacked
-	// rejections a cell is a cascade and is withheld, so there is no pile this
-	// can usefully chase further than that.
-	for pass := 0; pass <= maxWreckage; pass++ {
-		positions, err := DeriveTips(ctx, e.ledger, e.compiled, e.deployment, e.store)
+	// Bounded by what derivation will even offer: past the wreckage budget a cell
+	// is a cascade and is withheld, so there is no pile this can usefully chase
+	// further than that.
+	//
+	// The bound is the budget rather than a constant for the same reason the
+	// budget is not one. A pass retracts a single row, so a pile of N needs N
+	// passes; when this was fixed at 3 while the depth gate allowed 32 rows in
+	// flight, a repair could not clear an ordinary pile even in principle.
+	budget := e.wreckageBudget()
+	for pass := 0; pass <= budget; pass++ {
+		positions, err := DeriveTips(ctx, e.ledger, e.compiled, e.deployment, e.store, budget)
 		if err != nil {
 			e.haltRepair(ctx, cell, "re-derive the cell's tip: "+err.Error())
 			return
@@ -522,7 +543,7 @@ func (e *Engine) repairCell(ctx context.Context, cell int) {
 		p := positions[cell]
 
 		rec, considered, err := decideCell(ctx, e.ledger, e.oracle, e.compiled, e.deployment,
-			e.store, p, RecoverOptions{Apply: true, RetryRefused: true})
+			e.store, p, RecoverOptions{Apply: true, RetryRefused: true, Wreckage: budget})
 		if err != nil {
 			e.haltRepair(ctx, cell, "decide the repair: "+err.Error())
 			return
@@ -549,15 +570,26 @@ func (e *Engine) repairCell(ctx context.Context, cell int) {
 	}
 	e.haltRepair(ctx, cell, fmt.Sprintf(
 		"still refused after %d repair passes; the wreckage above this cell's tip is not clearing",
-		maxWreckage+1))
+		budget+1))
+}
+
+// wreckageBudget is the cascade budget this engine derives and repairs with.
+//
+// It comes from the depth gate because the gate is what decides how large a pile
+// one rejection can legitimately leave: every transition the gate allows in
+// flight is a transition that can be built on a verdict still in transit. See
+// WreckageBudget.
+func (e *Engine) wreckageBudget() int {
+	return WreckageBudget(e.chain.Config.MaxUnseenDepth)
 }
 
 // adoptRepaired installs a repaired position and lets the cell run again.
 func (e *Engine) adoptRepaired(ctx context.Context, cell int, p CellPosition) {
-	_ = ctx
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.tips[cell] = p.Tip
+	// Whether this halt is NEW, decided under the lock: a repair that re-derives
+	// an already-halted cell must not re-announce it on every pass.
+	newlyHalted := p.Halted && !e.halted[cell]
 	if p.Halted {
 		e.halted[cell] = true
 		e.haltReason[cell] = p.HaltReason
@@ -567,6 +599,18 @@ func (e *Engine) adoptRepaired(ctx context.Context, cell int, p CellPosition) {
 	}
 	e.generation = e.frontierLocked()
 	e.notify()
+	e.mu.Unlock()
+
+	// This was the ONLY path to a halted cell that said nothing at all. haltRepair
+	// logs; derivation withholding a cell as a cascade came through here and set
+	// the flag silently, so on 2026-08-13 four cells stopped with the reason
+	// recorded in memory, absent from the log, and absent from /api/state — which
+	// reports the COUNT of halted cells and no reason for any of them. An operator
+	// had a number and nowhere to read why.
+	if newlyHalted {
+		e.logger.WarnContext(ctx, "cell halted by derivation; no repair was offered",
+			"cell", cell, "tip_generation", p.Tip.Generation, "reason", p.HaltReason)
+	}
 }
 
 // haltRepair stops a cell that could not be repaired, keeping the reason.

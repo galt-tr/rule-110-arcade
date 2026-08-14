@@ -72,7 +72,7 @@ func cmdDepthProbe(args []string) error {
 	go d.holdToolLease(ctx, logger)
 
 	c, store, compiled := d.chain, d.store, d.compiled
-	positions, err := engine.DeriveTips(ctx, c, compiled, d.facts, store)
+	positions, err := engine.DeriveTips(ctx, c, compiled, d.facts, store, d.wreckage())
 	if err != nil {
 		return err
 	}

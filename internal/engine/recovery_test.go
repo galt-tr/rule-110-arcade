@@ -735,7 +735,7 @@ func TestUnsignedRejectionDeleteIsExact(t *testing.T) {
 		t.Fatalf("DeleteUnsignedRejection: %v", err)
 	}
 
-	left, err := f.store.CellTips(ctx, f.facts.Cells, tipDepth)
+	left, err := f.store.CellTips(ctx, f.facts.Cells, tipWindow(f.budget()))
 	if err != nil {
 		t.Fatalf("cell tips: %v", err)
 	}
@@ -798,7 +798,7 @@ func TestRejectionDeleteIsExact(t *testing.T) {
 		t.Fatalf("DeleteRejection: %v", err)
 	}
 
-	left, err := f.store.CellTips(ctx, f.facts.Cells, tipDepth)
+	left, err := f.store.CellTips(ctx, f.facts.Cells, tipWindow(f.budget()))
 	if err != nil {
 		t.Fatalf("cell tips: %v", err)
 	}
@@ -917,7 +917,7 @@ func TestRetryNeverReachesACascade(t *testing.T) {
 	// The first refusal spent the tip; everything after it spent the refusal.
 	parent := f.build(t, cell, tip, 9)
 	newest := parent
-	for range tipDepth + 4 {
+	for range tipWindow(f.budget()) + 4 {
 		if err := f.store.RecordTx(t.Context(), history.CellTx{
 			Generation: newest.Generation, Cell: cell, TxID: newest.TxID,
 			Status: history.StatusFailed, Err: aRefusal,
@@ -954,7 +954,7 @@ func TestRecoverIgnoresACascadeRejection(t *testing.T) {
 	f := newFixture(t)
 	good := f.advance(t, 1, f.genesisTip(1), history.StatusMined)
 
-	for gen := good.Generation + 1; gen <= good.Generation+tipDepth+2; gen++ {
+	for gen := good.Generation + 1; gen <= good.Generation+uint64(tipWindow(f.budget()))+2; gen++ {
 		if err := f.store.RecordTx(t.Context(), history.CellTx{
 			Generation: gen, Cell: 1, TxID: fmt.Sprintf("%058x%06x", 0, gen),
 			Status: history.StatusFailed,
@@ -989,7 +989,7 @@ func TestRecoverIgnoresACascadeRejection(t *testing.T) {
 // which is exactly the condition chain.RecoverStaleRejection resumes on. The only
 // thing standing between cells 34, 51, 64 and 91 and being resumed automatically
 // is that derivation counts the pile above the tip and refuses to offer one this
-// deep — see maxWreckage — and this pins it.
+// deep — see WreckageBudget — and this pins it.
 //
 // Resuming them would achieve nothing anyway: the 169 rejections underneath the
 // newest one would halt the cell again at the next startup. Untangling that is
@@ -1002,7 +1002,7 @@ func TestCascadeIsNeverOfferedToTheStaleRejectionCheck(t *testing.T) {
 	// The first refusal spent the tip; everything after it spent the refusal.
 	parent := f.build(t, cell, tip, 9)
 	newest := parent
-	for range tipDepth + 4 {
+	for range tipWindow(f.budget()) + 4 {
 		if err := f.store.RecordTx(t.Context(), history.CellTx{
 			Generation: newest.Generation, Cell: cell, TxID: newest.TxID,
 			Status: history.StatusFailed, Err: "arcade: REJECTED: MISSING_INPUTS (13)",
@@ -1102,7 +1102,7 @@ func aRetractedRow(t *testing.T, f *fixture, cell int) (chain.CellChain, chain.C
 // the property, not just what the decision said.
 func failedRows(t *testing.T, f *fixture, cell int) []uint64 {
 	t.Helper()
-	rows, err := f.store.CellTips(t.Context(), f.facts.Cells, tipDepth)
+	rows, err := f.store.CellTips(t.Context(), f.facts.Cells, tipWindow(f.budget()))
 	if err != nil {
 		t.Fatalf("cell tips: %v", err)
 	}
@@ -1229,12 +1229,12 @@ func TestRecoverRefusesAPileTooDeepToBeOneBreak(t *testing.T) {
 
 	// The first refusal spent the tip; every one after it spent the refusal below.
 	doomed := []chain.CellChain{f.build(t, cell, tip, 9)}
-	for range maxWreckage {
+	for range f.budget() {
 		doomed = append(doomed, f.build(t, cell, doomed[len(doomed)-1], 0))
 	}
-	if len(doomed) <= maxWreckage || len(doomed) >= tipDepth {
-		t.Fatalf("this test needs a pile of %d that derivation can still see whole, and tipDepth is %d",
-			len(doomed), tipDepth)
+	if len(doomed) <= f.budget() || len(doomed) >= tipWindow(f.budget()) {
+		t.Fatalf("this test needs a pile of %d that derivation can still see whole, and the window is %d",
+			len(doomed), tipWindow(f.budget()))
 	}
 	for _, d := range doomed {
 		if err := f.store.RecordTx(t.Context(), history.CellTx{
@@ -1301,8 +1301,8 @@ func TestRecoverRefusesAPileTooDeepToBeOneBreak(t *testing.T) {
 // deeper than the window.
 func TestAnAttemptOnTopOfACascadeIsNotAWayRound(t *testing.T) {
 	for name, depth := range map[string]int{
-		"the window sees the whole pile":     maxWreckage + 1,
-		"the pile is deeper than the window": tipDepth + 2,
+		"the window sees the whole pile":     defaultBudget() + 1,
+		"the pile is deeper than the window": tipWindow(defaultBudget()) + 2,
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
@@ -1374,7 +1374,7 @@ func TestABuriedSeenTipIsStillATip(t *testing.T) {
 	tip := f.advance(t, cell, f.genesisTip(cell), history.StatusSeen)
 
 	doomed := f.build(t, cell, tip, 9)
-	for range tipDepth + 2 {
+	for range tipWindow(f.budget()) + 2 {
 		if err := f.store.RecordTx(t.Context(), history.CellTx{
 			Generation: doomed.Generation, Cell: cell, TxID: doomed.TxID,
 			Status: history.StatusFailed, Err: "arcade: REJECTED: MISSING_INPUTS (13)",
